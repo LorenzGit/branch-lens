@@ -90,6 +90,15 @@ enum AppTheme {
         })
     }
 
+    /// Distinct teal for the History “All changes” scope card.
+    static var allChangesTint: Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                ? NSColor(calibratedRed: 0.35, green: 0.82, blue: 0.78, alpha: 1)
+                : NSColor(calibratedRed: 0.05, green: 0.48, blue: 0.46, alpha: 1)
+        })
+    }
+
     static var plainCode: NSColor { .labelColor }
     static var keywordCode: NSColor {
         NSColor(name: nil) { appearance in

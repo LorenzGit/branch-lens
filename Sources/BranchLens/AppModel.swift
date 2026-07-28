@@ -91,6 +91,8 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var searchFocusTarget: SearchFocusTarget = .content
     /// Bumped to force the matching search field to become first responder (⌘F).
     @Published var searchFocusNonce: Int = 0
+    /// Bumped after fetch/reload so inspector views remount with fresh content.
+    @Published var contentRefreshNonce: Int = 0
 
     // Working tree (local staged / unstaged)
     @Published var workingTreeFiles: [WorkingTreeFile] = []
@@ -476,11 +478,9 @@ final class RepoSession: ObservableObject, Identifiable {
         }
     }
 
-    /// Toolbar refresh: fetch remotes, then reload branches + snapshot.
+    /// Toolbar refresh: fetch remotes, then reload History, Changed files, and inspector content.
     func refresh() async {
-        await reloadSnapshot(resetScope: false, fetchFirst: true)
-        await reloadWorktrees()
-        await reloadWorkingTree()
+        await reloadSnapshot(resetScope: false, fetchFirst: true, refreshPanes: true)
         if sidePaneMode == .pullRequests {
             await loadPullRequests()
         }
@@ -489,7 +489,7 @@ final class RepoSession: ObservableObject, Identifiable {
         }
     }
 
-    func reloadWorkingTree() async {
+    func reloadWorkingTree(updateVisibleFiles: Bool = true) async {
         guard let repoPath else {
             workingTreeFiles = []
             return
@@ -504,10 +504,11 @@ final class RepoSession: ObservableObject, Identifiable {
                 workingTreeFiles = files
                 isLoadingWorkingTree = false
                 // Avoid needless list reloads (they jump the Changed files scroller).
+                // Callers that already rebuild panes (refresh / reloadSnapshot) pass false.
                 let scopeNeedsLocal = changeScope == .staged
                     || changeScope == .unstaged
                     || (changeScope == .combined && includeLocalChanges)
-                if scopeNeedsLocal, previous != files {
+                if updateVisibleFiles, scopeNeedsLocal, previous != files {
                     await reloadVisibleFiles()
                 }
             } catch is CancellationError {
@@ -542,7 +543,7 @@ final class RepoSession: ObservableObject, Identifiable {
         statusMessage = nil
     }
 
-    /// Merge COMPARE (`baseBranch`) into the inspected BRANCH.
+    /// Merge COMPARE tip into the inspected BRANCH.
     func updateFromCompare() async {
         guard let repoPath else { return }
         guard !selectedBranch.isEmpty, !baseBranch.isEmpty else { return }
@@ -561,17 +562,14 @@ final class RepoSession: ObservableObject, Identifiable {
             let tip = await git.resolveFreshTip(for: baseBranch, in: repoPath)
             statusMessage = "Updating \(selectedBranch) from \(tip)…"
             try await git.merge(source: tip, into: selectedBranch, in: repoPath)
+            // Keep local COMPARE from staying stale after a successful update.
+            if tip != baseBranch {
+                try? await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
+            }
             await reloadSnapshot(resetScope: true, fetchFirst: false)
             statusMessage = "Updated \(selectedBranch) with \(tip)."
             isUpdatingFromCompare = false
-            // Clear the success toast shortly after.
-            let message = statusMessage
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
-                if statusMessage == message {
-                    statusMessage = nil
-                }
-            }
+            clearStatusEventually(statusMessage)
         } catch {
             errorMessage = error.localizedDescription
             statusMessage = nil
@@ -579,7 +577,51 @@ final class RepoSession: ObservableObject, Identifiable {
         }
     }
 
-    func reloadSnapshot(resetScope: Bool = true, fetchFirst: Bool = false) async {
+    /// Fast-forward local COMPARE (e.g. stale `main`) to its fresh tip without changing BRANCH.
+    func updateLocalCompare() async {
+        guard let repoPath else { return }
+        guard !baseBranch.isEmpty else { return }
+
+        isUpdatingFromCompare = true
+        errorMessage = nil
+        statusMessage = "Updating local \(baseBranch)…"
+
+        do {
+            try? await git.fetchRemotes(in: repoPath)
+            let tip = await git.resolveFreshTip(for: baseBranch, in: repoPath)
+            guard tip != baseBranch else {
+                statusMessage = nil
+                isUpdatingFromCompare = false
+                errorMessage = "No fresher tip than local \(baseBranch)."
+                return
+            }
+            statusMessage = "Fast-forwarding \(baseBranch) to \(tip)…"
+            try await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
+            await reloadSnapshot(resetScope: false, fetchFirst: false)
+            statusMessage = "Updated local \(baseBranch) to \(tip)."
+            isUpdatingFromCompare = false
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+            isUpdatingFromCompare = false
+        }
+    }
+
+    private func clearStatusEventually(_ message: String?) {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if statusMessage == message {
+                statusMessage = nil
+            }
+        }
+    }
+
+    func reloadSnapshot(
+        resetScope: Bool = true,
+        fetchFirst: Bool = false,
+        refreshPanes: Bool = false
+    ) async {
         guard let repoPath else { return }
         guard !selectedBranch.isEmpty, !baseBranch.isEmpty else {
             snapshot = nil
@@ -624,7 +666,13 @@ final class RepoSession: ObservableObject, Identifiable {
                           !snap.commits.contains(where: { $0.hash == hash }) {
                     changeScope = .combined
                 }
+                let shouldRefreshPanes = refreshPanes || fetchFirst
                 clearInspectorCache()
+                if shouldRefreshPanes {
+                    // Drop stale inspector text immediately so panes can't keep pre-fetch content.
+                    clearFileInspector()
+                    isLoadingFile = true
+                }
                 isLoading = false
                 if fetchFirst, errorMessage == nil {
                     statusMessage = nil
@@ -632,11 +680,15 @@ final class RepoSession: ObservableObject, Identifiable {
                     statusMessage = nil
                 }
                 async let worktreesReload: Void = reloadWorktrees()
-                await reloadWorkingTree()
+                // Snapshot path always rebuilds visible files below — skip nested reload.
+                await reloadWorkingTree(updateVisibleFiles: false)
                 await worktreesReload
-                // reloadWorkingTree refreshes visible files for combined/staged/unstaged.
-                if case .commit = changeScope {
-                    await reloadVisibleFiles()
+                guard !Task.isCancelled else { return }
+                // Rebuild Changed files from the fresh snapshot + working tree, and
+                // force-reload file contents after fetch/refresh.
+                await reloadVisibleFiles(forceInspectorReload: shouldRefreshPanes)
+                if shouldRefreshPanes {
+                    contentRefreshNonce &+= 1
                 }
                 notifyStateChange()
             } catch is CancellationError {
@@ -845,7 +897,7 @@ final class RepoSession: ObservableObject, Identifiable {
         searchFocusNonce &+= 1
     }
 
-    func reloadVisibleFiles() async {
+    func reloadVisibleFiles(forceInspectorReload: Bool = false) async {
         guard let snapshot else {
             // Local-only scopes can still show working tree files without a branch snapshot.
             if changeScope == .staged || changeScope == .unstaged {
@@ -888,22 +940,24 @@ final class RepoSession: ObservableObject, Identifiable {
                 guard !Task.isCancelled else { return }
                 let previousSelection = selectedFileID
                 let listChanged = visibleFiles != files
+                // Assign a fresh array so SwiftUI always sees a Combined-files update
+                // even when paths match but stats/content changed after fetch.
                 visibleFiles = files
-                if let current = previousSelection, files.contains(where: { $0.id == current }) {
+                if let current = previousSelection, let file = files.first(where: { $0.id == current }) {
                     selectedFileID = current
-                    // Only reload inspector when the file set or scope content likely changed.
-                    if listChanged {
-                        if let file = files.first(where: { $0.id == current }) {
-                            await loadFileInspector(for: file)
-                        }
-                    }
-                } else {
-                    selectedFileID = files.first?.id
-                    if let file = files.first {
-                        await loadFileInspector(for: file)
-                    } else {
+                    if forceInspectorReload || listChanged {
                         clearFileInspector()
+                        isLoadingFile = true
+                        await loadFileInspector(for: file)
                     }
+                } else if let file = files.first {
+                    selectedFileID = file.id
+                    clearFileInspector()
+                    isLoadingFile = true
+                    await loadFileInspector(for: file)
+                } else {
+                    selectedFileID = nil
+                    clearFileInspector()
                 }
             } catch is CancellationError {
                 // ignore
@@ -1126,6 +1180,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 }
             }
         }
+        await fileTask?.value
     }
 
     private func persistMemory() {

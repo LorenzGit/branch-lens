@@ -88,6 +88,8 @@ public struct BranchSnapshot: Sendable {
     public let compareAheadCount: Int
     /// Revision used for the behind count / update (often `origin/main`, not stale local `main`).
     public let compareTip: String
+    /// Commits on `compareTip` that are missing from the local COMPARE branch name (stale local `main`).
+    public let localCompareBehindCount: Int
     public let aheadOfRemote: Int?
     public let behindRemote: Int?
     public let remoteTrackingBranch: String?
@@ -105,6 +107,7 @@ public struct BranchSnapshot: Sendable {
         files: [ChangedFile],
         compareAheadCount: Int,
         compareTip: String,
+        localCompareBehindCount: Int,
         aheadOfRemote: Int?,
         behindRemote: Int?,
         remoteTrackingBranch: String?
@@ -118,6 +121,7 @@ public struct BranchSnapshot: Sendable {
         self.files = files
         self.compareAheadCount = compareAheadCount
         self.compareTip = compareTip
+        self.localCompareBehindCount = localCompareBehindCount
         self.aheadOfRemote = aheadOfRemote
         self.behindRemote = behindRemote
         self.remoteTrackingBranch = remoteTrackingBranch

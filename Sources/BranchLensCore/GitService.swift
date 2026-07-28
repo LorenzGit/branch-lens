@@ -107,6 +107,39 @@ public actor GitService {
         _ = try await runGit(["merge", "--no-edit", source], in: repo)
     }
 
+    /// Fast-forward a local branch ref to `tip` without switching branches when possible.
+    public func fastForwardLocalBranch(_ branch: String, to tip: String, in repo: URL) async throws {
+        let branchSHA = try await runGit(["rev-parse", branch], in: repo)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let tipSHA = try await runGit(["rev-parse", tip], in: repo)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if branchSHA == tipSHA { return }
+
+        let ancestor = try await ProcessRunner.run(
+            executable: gitURL,
+            arguments: ["merge-base", "--is-ancestor", branch, tip],
+            currentDirectory: repo
+        )
+        guard ancestor.status == 0 else {
+            throw GitError.commandFailed(
+                "Cannot fast-forward “\(branch)” to “\(tip)” — histories have diverged."
+            )
+        }
+
+        let current = try await currentBranch(in: repo)
+        if current == branch {
+            guard try await isWorkingTreeClean(in: repo) else {
+                throw GitError.commandFailed(
+                    "Working tree has uncommitted changes. Commit or stash before updating “\(branch)”."
+                )
+            }
+            _ = try await runGit(["merge", "--ff-only", tip], in: repo)
+        } else {
+            // Update the ref in place so we don't disturb the checked-out feature branch.
+            _ = try await runGit(["update-ref", "refs/heads/\(branch)", tipSHA], in: repo)
+        }
+    }
+
     public func loadSnapshot(
         repo: URL,
         branch: String,
@@ -132,6 +165,12 @@ public actor GitService {
         // not a possibly stale local compare branch.
         let compareTip = await resolveFreshTip(for: baseBranch, in: repo)
         let compareAheadCount = try await commitCount(in: repo, from: branch, to: compareTip)
+        let localCompareBehindCount: Int
+        if compareTip == baseBranch {
+            localCompareBehindCount = 0
+        } else {
+            localCompareBehindCount = (try? await commitCount(in: repo, from: baseBranch, to: compareTip)) ?? 0
+        }
         let remote = try await remoteTrackingInfo(in: repo, branch: branch)
 
         return BranchSnapshot(
@@ -144,6 +183,7 @@ public actor GitService {
             files: files,
             compareAheadCount: compareAheadCount,
             compareTip: compareTip,
+            localCompareBehindCount: localCompareBehindCount,
             aheadOfRemote: remote.ahead,
             behindRemote: remote.behind,
             remoteTrackingBranch: remote.tracking

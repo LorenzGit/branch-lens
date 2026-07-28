@@ -230,6 +230,9 @@ private struct ToolbarView: View {
                         value: model.selectedBranch,
                         options: model.branches,
                         emphasized: true,
+                        badge: upstreamBadge(for: model.snapshot),
+                        badgeHelp: upstreamBadgeHelp(for: model.snapshot),
+                        badgeStyle: upstreamBadgeStyle(for: model.snapshot),
                         helpText: "Branch to inspect"
                     ) { model.selectBranch($0) }
 
@@ -239,6 +242,7 @@ private struct ToolbarView: View {
 
                     if let snapshot = model.snapshot {
                         CompactStats(model: model, snapshot: snapshot)
+                            .layoutPriority(1)
                     }
 
                     Spacer(minLength: 8)
@@ -311,6 +315,61 @@ private struct ToolbarView: View {
             .help(model.showFiles ? "Hide Changed files column" : "Show Changed files column")
         }
     }
+
+    private func upstreamBadge(for snapshot: BranchSnapshot?) -> String? {
+        guard let snapshot, snapshot.remoteTrackingBranch != nil else { return nil }
+        let ahead = snapshot.aheadOfRemote ?? 0
+        let behind = snapshot.behindRemote ?? 0
+        if ahead == 0, behind == 0 { return "✓" }
+        var parts: [String] = []
+        if ahead > 0 { parts.append("↑\(ahead)") }
+        if behind > 0 { parts.append("↓\(behind)") }
+        return parts.joined()
+    }
+
+    private func upstreamBadgeHelp(for snapshot: BranchSnapshot?) -> String? {
+        guard let snapshot, let tracking = snapshot.remoteTrackingBranch else {
+            return "No upstream configured for this branch"
+        }
+        let ahead = snapshot.aheadOfRemote ?? 0
+        let behind = snapshot.behindRemote ?? 0
+        if ahead == 0, behind == 0 {
+            return "In sync with \(tracking)"
+        }
+        var parts: [String] = []
+        if ahead > 0 {
+            parts.append("\(ahead) unpushed commit\(ahead == 1 ? "" : "s") ahead of \(tracking)")
+        }
+        if behind > 0 {
+            parts.append("\(behind) commit\(behind == 1 ? "" : "s") behind \(tracking)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func upstreamBadgeStyle(for snapshot: BranchSnapshot?) -> BranchBadgeStyle {
+        guard let snapshot, snapshot.remoteTrackingBranch != nil else { return .neutral }
+        let ahead = snapshot.aheadOfRemote ?? 0
+        let behind = snapshot.behindRemote ?? 0
+        if behind > 0 { return .warning }
+        if ahead > 0 { return .emphasis }
+        return .success
+    }
+}
+
+private enum BranchBadgeStyle {
+    case neutral
+    case success
+    case emphasis
+    case warning
+
+    var color: Color {
+        switch self {
+        case .neutral: return .secondary
+        case .success: return .secondary
+        case .emphasis: return Color.accentColor
+        case .warning: return .orange
+        }
+    }
 }
 
 private struct CompactStats: View {
@@ -336,9 +395,21 @@ private struct CompactStats: View {
             if let tracking = snapshot.remoteTrackingBranch {
                 let ahead = snapshot.aheadOfRemote ?? 0
                 let behind = snapshot.behindRemote ?? 0
-                Text("↑\(ahead)↓\(behind)")
-                    .foregroundStyle(.secondary)
-                    .help(tracking)
+                HStack(spacing: 2) {
+                    if ahead > 0 {
+                        Text("↑\(ahead)")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    if behind > 0 {
+                        Text("↓\(behind)")
+                            .foregroundStyle(.orange)
+                    }
+                    if ahead == 0, behind == 0 {
+                        Text("↑0↓0")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .help(tracking)
             } else {
                 Image(systemName: "icloud.slash")
                     .foregroundStyle(.tertiary)
@@ -425,8 +496,33 @@ private struct CompareBranchControl: View {
         model.snapshot?.compareAheadCount ?? 0
     }
 
+    private var localCompareBehind: Int {
+        model.snapshot?.localCompareBehindCount ?? 0
+    }
+
     private var compareTip: String {
         model.snapshot?.compareTip ?? model.baseBranch
+    }
+
+    private var badge: String? {
+        guard model.snapshot != nil else { return nil }
+        return behindCount > 0 ? "↓\(behindCount)" : "✓"
+    }
+
+    private var badgeHelp: String? {
+        guard model.snapshot != nil else { return nil }
+        if behindCount > 0 {
+            var text = "\(model.selectedBranch) is \(behindCount) commit\(behindCount == 1 ? "" : "s") behind \(compareTip)."
+            if localCompareBehind > 0, compareTip != model.baseBranch {
+                text += " Local \(model.baseBranch) is also \(localCompareBehind) behind \(compareTip)."
+            }
+            text += " Refresh fetches remotes first."
+            return text
+        }
+        if localCompareBehind > 0, compareTip != model.baseBranch {
+            return "\(model.selectedBranch) includes all commits from \(compareTip). Local \(model.baseBranch) is \(localCompareBehind) commit\(localCompareBehind == 1 ? "" : "s") behind \(compareTip)."
+        }
+        return "\(model.selectedBranch) includes all commits from \(compareTip)"
     }
 
     var body: some View {
@@ -437,16 +533,9 @@ private struct CompareBranchControl: View {
                 value: model.baseBranch,
                 options: model.branches,
                 emphasized: false,
-                badge: model.snapshot == nil
-                    ? nil
-                    : (behindCount > 0 ? "↓\(behindCount)" : "✓"),
-                badgeHelp: {
-                    guard model.snapshot != nil else { return nil }
-                    if behindCount > 0 {
-                        return "\(model.selectedBranch) is \(behindCount) commit\(behindCount == 1 ? "" : "s") behind \(compareTip). Refresh fetches remotes first."
-                    }
-                    return "\(model.selectedBranch) includes all commits from \(compareTip)"
-                }(),
+                badge: badge,
+                badgeHelp: badgeHelp,
+                badgeStyle: behindCount > 0 ? .warning : .success,
                 helpText: "Branch to compare against (merge-base)"
             ) { model.selectBaseBranch($0) }
 
@@ -461,6 +550,22 @@ private struct CompareBranchControl: View {
                 .controlSize(.small)
                 .disabled(model.isLoading || model.isUpdatingFromCompare || model.selectedBranch == model.baseBranch)
                 .help("Merge \(behindCount) commit\(behindCount == 1 ? "" : "s") from \(compareTip) into \(model.selectedBranch)")
+            } else if localCompareBehind > 0, compareTip != model.baseBranch {
+                Text("↓\(localCompareBehind)")
+                    .font(.caption.monospacedDigit().weight(.bold))
+                    .foregroundStyle(.orange)
+                    .help("Local \(model.baseBranch) is \(localCompareBehind) commit\(localCompareBehind == 1 ? "" : "s") behind \(compareTip). Your branch already includes those commits.")
+
+                Button {
+                    Task { await model.updateLocalCompare() }
+                } label: {
+                    Label("Update \(model.baseBranch)", systemImage: "arrow.down.circle")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(model.isLoading || model.isUpdatingFromCompare)
+                .help("Fast-forward local \(model.baseBranch) by \(localCompareBehind) commit\(localCompareBehind == 1 ? "" : "s") to \(compareTip). Your branch already includes those commits.")
             }
         }
     }
@@ -474,6 +579,7 @@ private struct BranchMenu: View {
     let emphasized: Bool
     var badge: String? = nil
     var badgeHelp: String? = nil
+    var badgeStyle: BranchBadgeStyle = .neutral
     var helpText: String = ""
     let onSelect: (String) -> Void
 
@@ -509,7 +615,7 @@ private struct BranchMenu: View {
                         if let badge {
                             Text(badge)
                                 .font(.caption2.monospacedDigit().weight(.bold))
-                                .foregroundStyle(badge.hasPrefix("✓") ? Color.secondary : .orange)
+                                .foregroundStyle(badgeStyle.color)
                                 .fixedSize()
                                 .layoutPriority(1)
                                 .help(badgeHelp ?? badge)
@@ -535,7 +641,13 @@ private struct BranchMenu: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(helpText.isEmpty ? value : "\(helpText)\n\(value)")
+        .help({
+            var lines: [String] = []
+            if !helpText.isEmpty { lines.append(helpText) }
+            if !value.isEmpty { lines.append(value) }
+            if let badgeHelp { lines.append(badgeHelp) }
+            return lines.joined(separator: "\n")
+        }())
         .popover(isPresented: $isOpen, arrowEdge: .bottom) {
             branchPickerPopover
         }
@@ -1006,15 +1118,23 @@ private struct AllChangesCard: View {
     let deletions: Int
     let action: () -> Void
 
+    private var tint: Color { AppTheme.allChangesTint }
+
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Image(systemName: "square.stack.3d.up.fill")
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(tint)
                     Text("All changes")
                         .font(.callout.weight(.semibold))
                     Spacer()
+                    Text("\(fileCount)")
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .foregroundStyle(tint)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(tint.opacity(0.16), in: Capsule())
                 }
                 Text(includeLocal
                      ? "Branch commits plus staged and unstaged local edits."
@@ -1043,11 +1163,11 @@ private struct AllChangesCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.14) : AppTheme.subtleFill)
+                    .fill(isSelected ? tint.opacity(0.18) : tint.opacity(0.08))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.45) : Color.primary.opacity(0.06), lineWidth: isSelected ? 1.5 : 1)
+                    .strokeBorder(isSelected ? tint.opacity(0.60) : tint.opacity(0.28), lineWidth: isSelected ? 1.5 : 1)
             )
         }
         .buttonStyle(.plain)
@@ -1655,6 +1775,7 @@ private struct FileInspectorView: View {
                     path: model.selectedFile?.path ?? "file.txt",
                     searchQuery: model.contentQuery
                 )
+                .id("diff-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .before:
                 CodePane(
@@ -1667,6 +1788,7 @@ private struct FileInspectorView: View {
                     lineCount: model.beforeLineCount,
                     searchQuery: model.contentQuery
                 )
+                .id("before-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .after:
@@ -1680,6 +1802,7 @@ private struct FileInspectorView: View {
                     lineCount: model.afterLineCount,
                     searchQuery: model.contentQuery
                 )
+                .id("after-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .compare:
@@ -1705,6 +1828,7 @@ private struct FileInspectorView: View {
                         searchQuery: model.contentQuery
                     )
                 }
+                .id("compare-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
