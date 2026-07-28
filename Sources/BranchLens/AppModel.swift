@@ -46,6 +46,12 @@ enum InspectorMode: Equatable {
     case fileLog(path: String)
 }
 
+struct MergedIntoCompareInfo: Equatable {
+    var compareLabel: String
+    var commits: [GitCommit]
+    var pullRequest: CommitPullRequestLink?
+}
+
 struct FileInspectorPayload: Sendable {
     var diff: String
     var before: String?
@@ -117,6 +123,12 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var selectedPullRequestID: Int?
     @Published var isLoadingPullRequests = false
     @Published var pullRequestError: String?
+    /// Commit SHA → associated PR for History cards.
+    @Published var commitPullRequests: [String: CommitPullRequestLink] = [:]
+    /// SHAs already queried (including commits with no PR).
+    private var commitPRResolved: Set<String> = []
+    /// When BRANCH has no unique commits vs COMPARE because it was already merged.
+    @Published var mergedIntoCompare: MergedIntoCompareInfo?
 
     private let git = GitService()
     private let github = GitHubService()
@@ -127,8 +139,11 @@ final class RepoSession: ObservableObject, Identifiable {
     private var fileLogTask: Task<Void, Never>?
     private var fileLogDiffTask: Task<Void, Never>?
     private var pullRequestTask: Task<Void, Never>?
+    private var commitPRTask: Task<Void, Never>?
+    private var mergedIntoCompareTask: Task<Void, Never>?
     private var inspectorCache: [String: FileInspectorPayload] = [:]
     private let cacheLimit = 96
+    private let commitPRLookupLimit = 60
 
     init(id: UUID = UUID()) {
         self.id = id
@@ -242,6 +257,13 @@ final class RepoSession: ObservableObject, Identifiable {
         return snapshot.commits.filter { selectedAuthors.contains($0.authorName) }
     }
 
+    /// Commits shown under the “fully merged” History banner (author filter applied).
+    var filteredMergedCommits: [GitCommit] {
+        guard let merged = mergedIntoCompare else { return [] }
+        if selectedAuthors.isEmpty { return merged.commits }
+        return merged.commits.filter { selectedAuthors.contains($0.authorName) }
+    }
+
     var filteredFiles: [ChangedFile] {
         let query = fileNameQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return visibleFiles }
@@ -274,8 +296,11 @@ final class RepoSession: ObservableObject, Identifiable {
         case .commit(let hash):
             return snapshot?.commits.first(where: { $0.hash == hash })
                 ?? filteredCommits.first(where: { $0.hash == hash })
+                ?? mergedIntoCompare?.commits.first(where: { $0.hash == hash })
         case .combined:
-            return filteredCommits.first ?? snapshot?.commits.first
+            return filteredCommits.first
+                ?? snapshot?.commits.first
+                ?? mergedIntoCompare?.commits.first
         case .staged, .unstaged:
             return nil
         }
@@ -375,6 +400,9 @@ final class RepoSession: ObservableObject, Identifiable {
                 contentQuery = ""
                 changeScope = .combined
                 selectedFileID = nil
+                commitPullRequests = [:]
+                commitPRResolved = []
+                mergedIntoCompare = nil
             }
             clearInspectorCache()
             await reloadSnapshot(resetScope: resetTransientState)
@@ -691,12 +719,18 @@ final class RepoSession: ObservableObject, Identifiable {
                     contentRefreshNonce &+= 1
                 }
                 notifyStateChange()
+                // Fill PR badges on History cards in the background (don't block refresh).
+                let commitsForPR = snap.commits
+                let forcePR = shouldRefreshPanes
+                Task { await loadCommitPullRequests(for: commitsForPR, force: forcePR) }
+                Task { await loadMergedIntoCompareIfNeeded(for: snap) }
             } catch is CancellationError {
                 // ignore
             } catch {
                 guard !Task.isCancelled else { return }
                 snapshot = nil
                 visibleFiles = []
+                mergedIntoCompare = nil
                 clearFileInspector()
                 errorMessage = error.localizedDescription
                 statusMessage = nil
@@ -706,6 +740,58 @@ final class RepoSession: ObservableObject, Identifiable {
 
         // Wait for the load task so restore can apply post-load selections.
         await loadTask?.value
+    }
+
+    /// When BRANCH has nothing unique vs COMPARE, surface the already-merged PR commits.
+    private func loadMergedIntoCompareIfNeeded(for snap: BranchSnapshot) async {
+        mergedIntoCompareTask?.cancel()
+        guard snap.commits.isEmpty else {
+            mergedIntoCompare = nil
+            return
+        }
+
+        let branch = snap.branch
+        let compareTip = snap.compareTip
+        let compareLabel = snap.baseBranch
+        let repoPath = snap.repoPath
+
+        mergedIntoCompareTask = Task {
+            let contained = await git.isAncestor(branch, of: compareTip, in: repoPath)
+            guard !Task.isCancelled else { return }
+            guard contained else {
+                mergedIntoCompare = nil
+                return
+            }
+
+            let commits = (try? await git.commitsMergedIntoCompare(
+                branch: branch,
+                compareTip: compareTip,
+                in: repoPath
+            )) ?? []
+            guard !Task.isCancelled else { return }
+
+            var pr = try? await github.mergedPullRequest(headBranch: branch, in: repoPath)
+            if pr == nil, let tip = commits.first {
+                let links = (try? await github.pullRequests(containingCommit: tip.hash, in: repoPath)) ?? []
+                pr = Self.preferredCommitPullRequest(from: links)
+            }
+            guard !Task.isCancelled else { return }
+
+            if let pr {
+                for commit in commits {
+                    commitPullRequests[commit.hash] = pr
+                    commitPRResolved.insert(commit.hash)
+                }
+            }
+
+            mergedIntoCompare = MergedIntoCompareInfo(
+                compareLabel: compareLabel,
+                commits: commits,
+                pullRequest: pr
+            )
+            notifyStateChange()
+        }
+        await mergedIntoCompareTask?.value
     }
 
     func selectFile(_ file: ChangedFile) {
@@ -786,6 +872,79 @@ final class RepoSession: ObservableObject, Identifiable {
     func openPullRequestInBrowser(_ pr: PullRequestSummary) {
         guard let url = URL(string: pr.url) else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    func openCommitPullRequestInBrowser(_ link: CommitPullRequestLink) {
+        guard let url = URL(string: link.url) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func pullRequest(forCommitHash hash: String) -> CommitPullRequestLink? {
+        commitPullRequests[hash]
+    }
+
+    /// Resolve associated PRs for History commits (cached; uses `gh api`).
+    func loadCommitPullRequests(for commits: [GitCommit], force: Bool = false) async {
+        guard let repoPath else { return }
+        guard await github.isAvailable else { return }
+
+        let targets = Array(commits.prefix(commitPRLookupLimit).map(\.hash))
+        let missing = force
+            ? targets
+            : targets.filter { !commitPRResolved.contains($0) }
+        guard !missing.isEmpty else { return }
+
+        if force {
+            for hash in missing {
+                commitPullRequests.removeValue(forKey: hash)
+                commitPRResolved.remove(hash)
+            }
+        }
+
+        commitPRTask?.cancel()
+        let github = self.github
+        commitPRTask = Task {
+            // Bound concurrency so we don't stampede the GitHub API.
+            let chunkSize = 6
+            var index = 0
+            while index < missing.count {
+                guard !Task.isCancelled else { return }
+                let end = min(index + chunkSize, missing.count)
+                let chunk = Array(missing[index..<end])
+                await withTaskGroup(of: (String, CommitPullRequestLink?).self) { group in
+                    for hash in chunk {
+                        group.addTask {
+                            do {
+                                let prs = try await github.pullRequests(
+                                    containingCommit: hash,
+                                    in: repoPath
+                                )
+                                return (hash, Self.preferredCommitPullRequest(from: prs))
+                            } catch {
+                                return (hash, nil)
+                            }
+                        }
+                    }
+                    for await (hash, link) in group {
+                        commitPRResolved.insert(hash)
+                        if let link {
+                            commitPullRequests[hash] = link
+                        }
+                    }
+                }
+                index = end
+            }
+        }
+        await commitPRTask?.value
+    }
+
+    nonisolated private static func preferredCommitPullRequest(
+        from prs: [CommitPullRequestLink]
+    ) -> CommitPullRequestLink? {
+        // Prefer open, then merged, then closed.
+        prs.first(where: { $0.status == "open" })
+            ?? prs.first(where: { $0.status == "merged" })
+            ?? prs.first
     }
 
     func loadPullRequests() async {

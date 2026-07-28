@@ -140,6 +140,60 @@ public actor GitService {
         }
     }
 
+    public func isAncestor(
+        _ maybeAncestor: String,
+        of commit: String,
+        in repo: URL
+    ) async -> Bool {
+        let result = try? await ProcessRunner.run(
+            executable: gitURL,
+            arguments: ["merge-base", "--is-ancestor", maybeAncestor, commit],
+            currentDirectory: repo
+        )
+        return result?.status == 0
+    }
+
+    /// Commits that this branch contributed into `compareTip` when the branch tip is
+    /// already fully contained in COMPARE (typical after a merged PR).
+    public func commitsMergedIntoCompare(
+        branch: String,
+        compareTip: String,
+        in repo: URL
+    ) async throws -> [GitCommit] {
+        guard await isAncestor(branch, of: compareTip, in: repo) else { return [] }
+
+        // Prefer commits brought in by the merge commit on the path to COMPARE.
+        let mergeHash = try await runGit(
+            [
+                "log",
+                "--merges",
+                "--ancestry-path",
+                "--format=%H",
+                "-1",
+                "\(branch)..\(compareTip)",
+            ],
+            in: repo
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !mergeHash.isEmpty {
+            let parentsOutput = try await runGit(
+                ["rev-parse", "\(mergeHash)^1", "\(mergeHash)^2"],
+                in: repo
+            )
+            let parents = parentsOutput
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            if parents.count >= 2 {
+                let merged = try await listCommits(in: repo, range: "\(parents[0])..\(parents[1])")
+                if !merged.isEmpty { return merged }
+            }
+        }
+
+        // Squash / fast-forward fallback: at least show the branch tip.
+        return try await listCommits(in: repo, range: "-1 \(branch)")
+    }
+
     public func loadSnapshot(
         repo: URL,
         branch: String,
@@ -459,11 +513,14 @@ public actor GitService {
 
     private func listCommits(in repo: URL, from mergeBase: String, to branch: String) async throws -> [GitCommit] {
         // Exclusive range: commits reachable from branch but not merge-base.
+        try await listCommits(in: repo, range: "\(mergeBase)..\(branch)")
+    }
+
+    private func listCommits(in repo: URL, range: String) async throws -> [GitCommit] {
         let format = "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%P%x1e"
-        let output = try await runGit(
-            ["log", "--format=\(format)", "\(mergeBase)..\(branch)"],
-            in: repo
-        )
+        // `range` may include flags like "-1 branch" for tip-only fallback.
+        let args = ["log", "--format=\(format)"] + range.split(separator: " ").map(String.init)
+        let output = try await runGit(args, in: repo)
 
         let records = output.split(separator: "\u{1e}", omittingEmptySubsequences: true)
         return records.compactMap { record in

@@ -285,6 +285,42 @@ public struct PullRequestSummary: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Compact PR association for a commit (History cards).
+public struct CommitPullRequestLink: Identifiable, Hashable, Sendable {
+    public var id: Int { number }
+    public let number: Int
+    public let title: String
+    public let url: String
+    public let isDraft: Bool
+    /// open | closed | merged
+    public let status: String
+
+    public init(
+        number: Int,
+        title: String,
+        url: String,
+        isDraft: Bool,
+        status: String
+    ) {
+        self.number = number
+        self.title = title
+        self.url = url
+        self.isDraft = isDraft
+        self.status = status
+    }
+
+    public var badgeLabel: String {
+        if isDraft, status == "open" {
+            return "Draft #\(number)"
+        }
+        switch status {
+        case "open": return "Open #\(number)"
+        case "merged": return "Merged #\(number)"
+        default: return "Closed #\(number)"
+        }
+    }
+}
+
 public enum GitError: LocalizedError, Sendable {
     case notARepository(URL)
     case commandFailed(String)

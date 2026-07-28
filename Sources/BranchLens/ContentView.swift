@@ -1020,7 +1020,42 @@ private struct CommitsPane: View {
                             }
                         }
 
-                        if model.filteredCommits.isEmpty {
+                        if let merged = model.mergedIntoCompare, model.filteredCommits.isEmpty {
+                            MergedIntoCompareCard(
+                                info: merged,
+                                onOpenPullRequest: { link in
+                                    model.openCommitPullRequestInBrowser(link)
+                                }
+                            )
+
+                            if model.filteredMergedCommits.isEmpty {
+                                Text(model.selectedAuthors.isEmpty
+                                      ? "No merged commits to show."
+                                      : "No merged commits from selected authors.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 4)
+                            } else {
+                                LazyVStack(spacing: 8) {
+                                    ForEach(model.filteredMergedCommits) { commit in
+                                        CommitCard(
+                                            commit: commit,
+                                            pullRequest: model.pullRequest(forCommitHash: commit.hash) ?? merged.pullRequest,
+                                            isSelected: {
+                                                if case .commit(let hash) = model.changeScope {
+                                                    return hash == commit.hash
+                                                }
+                                                return false
+                                            }(),
+                                            onSelect: { model.selectCommit(commit) },
+                                            onOpenPullRequest: { link in
+                                                model.openCommitPullRequestInBrowser(link)
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        } else if model.filteredCommits.isEmpty {
                             Text(model.selectedAuthors.isEmpty ? "No commits on this branch." : "No commits from selected authors.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -1030,15 +1065,18 @@ private struct CommitsPane: View {
                                 ForEach(model.filteredCommits) { commit in
                                     CommitCard(
                                         commit: commit,
+                                        pullRequest: model.pullRequest(forCommitHash: commit.hash),
                                         isSelected: {
                                             if case .commit(let hash) = model.changeScope {
                                                 return hash == commit.hash
                                             }
                                             return false
-                                        }()
-                                    ) {
-                                        model.selectCommit(commit)
-                                    }
+                                        }(),
+                                        onSelect: { model.selectCommit(commit) },
+                                        onOpenPullRequest: { link in
+                                            model.openCommitPullRequestInBrowser(link)
+                                        }
+                                    )
                                 }
                             }
                         }
@@ -1223,13 +1261,81 @@ private struct LocalScopeCard: View {
     }
 }
 
-private struct CommitCard: View {
-    let commit: GitCommit
-    let isSelected: Bool
-    let action: () -> Void
+private struct MergedIntoCompareCard: View {
+    let info: MergedIntoCompareInfo
+    let onOpenPullRequest: (CommitPullRequestLink) -> Void
+
+    private var tint: Color { Color(red: 0.55, green: 0.40, blue: 0.90) }
 
     var body: some View {
-        Button(action: action) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundStyle(tint)
+                Text("Fully merged into \(info.compareLabel)")
+                    .font(.callout.weight(.semibold))
+                Spacer(minLength: 0)
+            }
+
+            Text("This branch has no unique commits left versus \(info.compareLabel). Showing the commits that were already merged.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let pr = info.pullRequest {
+                Button {
+                    onOpenPullRequest(pr)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.triangle.pull")
+                            .font(.caption.weight(.bold))
+                        Text(pr.badgeLabel)
+                            .font(.caption.weight(.bold))
+                        Text(pr.title)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 0)
+                        Image(systemName: "safari")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .help("Open \(pr.badgeLabel): \(pr.title)")
+            }
+
+            if !info.commits.isEmpty {
+                Text("\(info.commits.count) merged commit\(info.commits.count == 1 ? "" : "s")")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(tint.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(tint.opacity(0.35), lineWidth: 1)
+        )
+    }
+}
+
+private struct CommitCard: View {
+    let commit: GitCommit
+    let pullRequest: CommitPullRequestLink?
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onOpenPullRequest: (CommitPullRequestLink) -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
             VStack(alignment: .leading, spacing: 7) {
                 Text(commit.subject)
                     .font(.callout.weight(.medium))
@@ -1248,9 +1354,30 @@ private struct CommitCard: View {
                         .lineLimit(1)
                     Spacer(minLength: 0)
                 }
-                Text(commit.authoredDate, style: .relative)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                HStack(spacing: 6) {
+                    Text(commit.authoredDate, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Spacer(minLength: 0)
+                    if let pullRequest {
+                        Button {
+                            onOpenPullRequest(pullRequest)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.triangle.pull")
+                                    .font(.caption2.weight(.bold))
+                                Text(pullRequest.badgeLabel)
+                                    .font(.caption2.weight(.bold))
+                            }
+                            .foregroundStyle(prBadgeColor(for: pullRequest))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(prBadgeColor(for: pullRequest).opacity(0.14), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open \(pullRequest.badgeLabel): \(pullRequest.title)")
+                    }
+                }
             }
             .padding(11)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1265,6 +1392,24 @@ private struct CommitCard: View {
         }
         .buttonStyle(.plain)
         .help("\(commit.shortHash): \(commit.subject)")
+        .contextMenu {
+            if let pullRequest {
+                Button("Open \(pullRequest.badgeLabel)") {
+                    onOpenPullRequest(pullRequest)
+                }
+            }
+        }
+    }
+
+    private func prBadgeColor(for link: CommitPullRequestLink) -> Color {
+        switch link.status {
+        case "open":
+            return link.isDraft ? .secondary : AppTheme.additionText
+        case "merged":
+            return Color(red: 0.55, green: 0.40, blue: 0.90)
+        default:
+            return .secondary
+        }
     }
 }
 
