@@ -14,6 +14,8 @@ struct TabSnapshot: Codable, Equatable {
     var showFiles: Bool
     var selectedAuthors: [String]
     var fileNameQuery: String
+    /// Absent in older snapshots; treat as false.
+    var includeLocalChanges: Bool?
 }
 
 struct WorkspaceSnapshot: Codable, Equatable {

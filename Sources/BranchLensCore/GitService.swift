@@ -68,6 +68,25 @@ public actor GitService {
         return Int(output) ?? 0
     }
 
+    /// Prefer a freshly fetched tip for COMPARE: upstream, then `origin/<branch>`, else local.
+    public func resolveFreshTip(for branch: String, in repo: URL) async -> String {
+        if let upstream = try? await runGit(
+            ["rev-parse", "--abbrev-ref", "\(branch)@{upstream}"],
+            in: repo
+        ).trimmingCharacters(in: .whitespacesAndNewlines),
+           !upstream.isEmpty,
+           (try? await runGit(["rev-parse", "--verify", upstream], in: repo)) != nil {
+            return upstream
+        }
+
+        let originTip = "origin/\(branch)"
+        if (try? await runGit(["rev-parse", "--verify", originTip], in: repo)) != nil {
+            return originTip
+        }
+
+        return branch
+    }
+
     public func isWorkingTreeClean(in repo: URL) async throws -> Bool {
         let status = try await runGit(["status", "--porcelain"], in: repo)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -109,7 +128,10 @@ public actor GitService {
 
         let commits = try await listCommits(in: repo, from: mergeBase, to: branch)
         let files = try await listChangedFiles(in: repo, from: mergeBase, to: branch)
-        let compareAheadCount = try await commitCount(in: repo, from: branch, to: baseBranch)
+        // Behind-COMPARE uses the freshest tip (usually origin/<compare> after fetch),
+        // not a possibly stale local compare branch.
+        let compareTip = await resolveFreshTip(for: baseBranch, in: repo)
+        let compareAheadCount = try await commitCount(in: repo, from: branch, to: compareTip)
         let remote = try await remoteTrackingInfo(in: repo, branch: branch)
 
         return BranchSnapshot(
@@ -121,6 +143,7 @@ public actor GitService {
             commits: commits,
             files: files,
             compareAheadCount: compareAheadCount,
+            compareTip: compareTip,
             aheadOfRemote: remote.ahead,
             behindRemote: remote.behind,
             remoteTrackingBranch: remote.tracking
@@ -169,6 +192,199 @@ public actor GitService {
         return parseChangedFiles(nameStatus: nameStatus, numStat: numStat)
     }
 
+    /// History of commits that touched `path` (follows renames).
+    public func fileHistory(
+        in repo: URL,
+        path: String,
+        limit: Int = 150
+    ) async throws -> [FileLogEntry] {
+        let format = "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%D%x1e"
+        let output = try await runGit(
+            ["log", "--follow", "--format=\(format)", "-\(limit)", "--", path],
+            in: repo
+        )
+        return parseFileLog(output)
+    }
+
+    /// Local + remote branch names that contain the commit (capped for UI).
+    public func branchesContaining(
+        in repo: URL,
+        commit: String,
+        limit: Int = 12
+    ) async throws -> [String] {
+        let output = try await runGit(
+            ["branch", "-a", "--contains", commit, "--format=%(refname:short)"],
+            in: repo
+        )
+        return output
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { !$0.isEmpty }
+            .prefix(limit)
+            .map { $0 }
+    }
+
+    /// Origin remote URL if configured.
+    public func remoteURL(in repo: URL, name: String = "origin") async throws -> String? {
+        let output = (try? await runGit(["remote", "get-url", name], in: repo))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (output?.isEmpty == false) ? output : nil
+    }
+
+    /// Staged + unstaged (+ untracked) files in the working tree.
+    public func workingTreeStatus(in repo: URL) async throws -> [WorkingTreeFile] {
+        let porcelain = try await runGit(["status", "--porcelain=1", "-uall"], in: repo)
+        let stagedNum = try await runGit(["diff", "--cached", "--numstat", "--find-renames"], in: repo)
+        let unstagedNum = try await runGit(["diff", "--numstat", "--find-renames"], in: repo)
+        let stagedStats = parseNumStat(stagedNum)
+        let unstagedStats = parseNumStat(unstagedNum)
+
+        var files: [WorkingTreeFile] = []
+        for line in porcelain.split(whereSeparator: \.isNewline) {
+            let raw = String(line)
+            guard raw.count >= 3 else { continue }
+            let x = raw[raw.startIndex]
+            let y = raw[raw.index(raw.startIndex, offsetBy: 1)]
+            let rest = String(raw.dropFirst(3))
+
+            if x == "?" && y == "?" {
+                let path = unescapeStatusPath(rest)
+                files.append(WorkingTreeFile(
+                    area: .unstaged,
+                    status: .added,
+                    path: path,
+                    additions: stagedStats[path]?.0 ?? 0,
+                    deletions: 0
+                ))
+                continue
+            }
+
+            let (path, oldPath) = parseStatusPath(rest)
+            if x != " " && x != "?" {
+                let status = FileChangeStatus(rawValue: String(x)) ?? .modified
+                let stats = stagedStats[path] ?? (0, 0)
+                files.append(WorkingTreeFile(
+                    area: .staged,
+                    status: status == .unknown ? .modified : status,
+                    path: path,
+                    oldPath: oldPath,
+                    additions: stats.0,
+                    deletions: stats.1
+                ))
+            }
+            if y != " " && y != "?" {
+                let status = FileChangeStatus(rawValue: String(y)) ?? .modified
+                let stats = unstagedStats[path] ?? (0, 0)
+                files.append(WorkingTreeFile(
+                    area: .unstaged,
+                    status: status == .unknown ? .modified : status,
+                    path: path,
+                    oldPath: oldPath,
+                    additions: stats.0,
+                    deletions: stats.1
+                ))
+            }
+        }
+
+        return files.sorted { lhs, rhs in
+            if lhs.area != rhs.area {
+                return lhs.area == .staged
+            }
+            return lhs.path.localizedCaseInsensitiveCompare(rhs.path) == .orderedAscending
+        }
+    }
+
+    public func stagedDiff(in repo: URL, path: String, oldPath: String? = nil) async throws -> String {
+        var args = ["diff", "--cached", "--no-color", "--find-renames", "--"]
+        if let oldPath, oldPath != path { args.append(oldPath) }
+        args.append(path)
+        return try await runGit(args, in: repo)
+    }
+
+    public func unstagedDiff(in repo: URL, path: String, oldPath: String? = nil) async throws -> String {
+        // Untracked files have no diff against the index — synthesize from file contents later.
+        var args = ["diff", "--no-color", "--find-renames", "--"]
+        if let oldPath, oldPath != path { args.append(oldPath) }
+        args.append(path)
+        return try await runGit(args, in: repo)
+    }
+
+    /// Diff from a revision (e.g. merge-base) through the working tree (includes commits + local edits).
+    public func worktreeDiff(
+        in repo: URL,
+        from revision: String,
+        path: String,
+        oldPath: String? = nil
+    ) async throws -> String {
+        var args = ["diff", "--no-color", "--find-renames", revision, "--"]
+        if let oldPath, oldPath != path { args.append(oldPath) }
+        args.append(path)
+        return try await runGit(args, in: repo)
+    }
+
+    /// Blob currently in the index (`:path`).
+    public func indexFileContents(in repo: URL, path: String) async throws -> String? {
+        let result = try await ProcessRunner.run(
+            executable: gitURL,
+            arguments: ["show", ":\(path)"],
+            currentDirectory: repo
+        )
+        if result.status != 0 || result.stdout.contains(0) { return nil }
+        return result.stdoutText
+    }
+
+    /// On-disk working tree file contents.
+    public func workingTreeFileContents(in repo: URL, path: String) async throws -> String? {
+        let url = repo.appendingPathComponent(path)
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        if data.contains(0) { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    public func listWorktrees(in repo: URL) async throws -> [GitWorktree] {
+        let output = try await runGit(["worktree", "list", "--porcelain"], in: repo)
+        var worktrees: [GitWorktree] = []
+        var path: URL?
+        var head = ""
+        var branch: String?
+        var isBare = false
+        var isDetached = false
+
+        func flush() {
+            guard let path else { return }
+            worktrees.append(GitWorktree(
+                path: path,
+                head: head,
+                branch: branch,
+                isBare: isBare,
+                isDetached: isDetached
+            ))
+        }
+
+        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
+            if line.hasPrefix("worktree ") {
+                flush()
+                path = URL(fileURLWithPath: String(line.dropFirst("worktree ".count)))
+                head = ""
+                branch = nil
+                isBare = false
+                isDetached = false
+            } else if line.hasPrefix("HEAD ") {
+                head = String(line.dropFirst("HEAD ".count))
+            } else if line.hasPrefix("branch ") {
+                let ref = String(line.dropFirst("branch ".count))
+                branch = ref.replacingOccurrences(of: "refs/heads/", with: "")
+            } else if line == "bare" {
+                isBare = true
+            } else if line == "detached" {
+                isDetached = true
+            }
+        }
+        flush()
+        return worktrees
+    }
+
     /// File contents at a revision. Returns `nil` when the path does not exist at that revision.
     public func fileContents(
         in repo: URL,
@@ -210,15 +426,10 @@ public actor GitService {
         )
 
         let records = output.split(separator: "\u{1e}", omittingEmptySubsequences: true)
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoBasic = ISO8601DateFormatter()
-        isoBasic.formatOptions = [.withInternetDateTime]
-
         return records.compactMap { record in
             let fields = record.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
             guard fields.count >= 7 else { return nil }
-            let date = iso.date(from: fields[5]) ?? isoBasic.date(from: fields[5]) ?? Date.distantPast
+            let date = Self.parseGitDate(fields[5])
             let parents = fields[6]
                 .split(whereSeparator: \.isWhitespace)
                 .map(String.init)
@@ -235,6 +446,31 @@ public actor GitService {
         }
     }
 
+    private func parseFileLog(_ output: String) -> [FileLogEntry] {
+        let records = output.split(separator: "\u{1e}", omittingEmptySubsequences: true)
+        return records.compactMap { record in
+            let fields = record.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
+            guard fields.count >= 7 else { return nil }
+            return FileLogEntry(
+                hash: fields[0].trimmingCharacters(in: .whitespacesAndNewlines),
+                shortHash: fields[1],
+                subject: fields[2],
+                authorName: fields[3],
+                authorEmail: fields[4],
+                authoredDate: Self.parseGitDate(fields[5]),
+                decorations: fields[6].trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+    }
+
+    private static func parseGitDate(_ value: String) -> Date {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoBasic = ISO8601DateFormatter()
+        isoBasic.formatOptions = [.withInternetDateTime]
+        return iso.date(from: value) ?? isoBasic.date(from: value) ?? Date.distantPast
+    }
+
     private func listChangedFiles(in repo: URL, from mergeBase: String, to branch: String) async throws -> [ChangedFile] {
         let nameStatus = try await runGit(
             ["diff", "--name-status", "--find-renames", "\(mergeBase)...\(branch)"],
@@ -248,15 +484,7 @@ public actor GitService {
     }
 
     private func parseChangedFiles(nameStatus: String, numStat: String) -> [ChangedFile] {
-        var stats: [String: (Int, Int)] = [:]
-        for line in numStat.split(whereSeparator: \.isNewline) {
-            let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            guard parts.count >= 3 else { continue }
-            let additions = Int(parts[0]) ?? 0
-            let deletions = Int(parts[1]) ?? 0
-            let path = parts.count >= 4 ? parts[3] : parts[2]
-            stats[path] = (additions, deletions)
-        }
+        let stats = parseNumStat(numStat)
 
         var files: [ChangedFile] = []
         for line in nameStatus.split(whereSeparator: \.isNewline) {
@@ -289,6 +517,36 @@ public actor GitService {
         }
 
         return files.sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
+    }
+
+    private func parseNumStat(_ numStat: String) -> [String: (Int, Int)] {
+        var stats: [String: (Int, Int)] = [:]
+        for line in numStat.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 3 else { continue }
+            let additions = Int(parts[0]) ?? 0
+            let deletions = Int(parts[1]) ?? 0
+            let path = parts.count >= 4 ? parts[3] : parts[2]
+            stats[path] = (additions, deletions)
+        }
+        return stats
+    }
+
+    private func parseStatusPath(_ rest: String) -> (path: String, oldPath: String?) {
+        if let range = rest.range(of: " -> ") {
+            let oldPath = unescapeStatusPath(String(rest[..<range.lowerBound]))
+            let path = unescapeStatusPath(String(rest[range.upperBound...]))
+            return (path, oldPath)
+        }
+        return (unescapeStatusPath(rest), nil)
+    }
+
+    private func unescapeStatusPath(_ path: String) -> String {
+        var value = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value
     }
 
     private func remoteTrackingInfo(

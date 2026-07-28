@@ -235,6 +235,8 @@ private struct ToolbarView: View {
 
                     CompareBranchControl(model: model)
 
+                    WorktreeMenu(model: model)
+
                     if let snapshot = model.snapshot {
                         CompactStats(model: model, snapshot: snapshot)
                     }
@@ -281,11 +283,26 @@ private struct ToolbarView: View {
 
     private var columnToggles: some View {
         HStack(spacing: 4) {
+            Picker("Side pane", selection: Binding(
+                get: { model.sidePaneMode },
+                set: { model.setSidePaneMode($0) }
+            )) {
+                ForEach(SidePaneMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .help("Show commit History or Pull requests")
+
             Toggle(isOn: $model.showHistory) {
-                Image(systemName: "clock.arrow.circlepath")
+                Image(systemName: model.sidePaneMode == .pullRequests ? "arrow.triangle.pull" : "clock.arrow.circlepath")
             }
             .toggleStyle(.button)
-            .help(model.showHistory ? "Hide History column" : "Show History column")
+            .help(model.showHistory
+                  ? (model.sidePaneMode == .pullRequests ? "Hide Pull requests column" : "Hide History column")
+                  : (model.sidePaneMode == .pullRequests ? "Show Pull requests column" : "Show History column"))
 
             Toggle(isOn: $model.showFiles) {
                 Image(systemName: "list.bullet.indent")
@@ -336,11 +353,80 @@ private struct CompactStats: View {
     }
 }
 
+private struct WorktreeMenu: View {
+    @ObservedObject var model: RepoSession
+
+    var body: some View {
+        Menu {
+            if model.worktrees.isEmpty {
+                Text("No worktrees")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.worktrees) { worktree in
+                    Button {
+                        Task { await model.switchToWorktree(worktree) }
+                    } label: {
+                        if model.currentWorktree?.id == worktree.id {
+                            Label(worktree.displayName, systemImage: "checkmark")
+                        } else {
+                            Text(worktree.displayName)
+                        }
+                    }
+                    .help(worktree.path.path)
+                }
+            }
+            Divider()
+            Button("Reload Worktrees") {
+                Task { await model.reloadWorktrees() }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "square.stack.3d.up")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("WORKTREE")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    Text(model.currentWorktree?.path.lastPathComponent
+                          ?? model.repoPath?.lastPathComponent
+                          ?? "Select…")
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(minWidth: 70, maxWidth: 140, alignment: .leading)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(AppTheme.subtleFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .help(model.repoPath?.path ?? "Switch git worktree")
+        .disabled(model.repoPath == nil)
+    }
+}
+
 private struct CompareBranchControl: View {
     @ObservedObject var model: RepoSession
 
-    private var compareAhead: Int {
+    private var behindCount: Int {
         model.snapshot?.compareAheadCount ?? 0
+    }
+
+    private var compareTip: String {
+        model.snapshot?.compareTip ?? model.baseBranch
     }
 
     var body: some View {
@@ -351,14 +437,20 @@ private struct CompareBranchControl: View {
                 value: model.baseBranch,
                 options: model.branches,
                 emphasized: false,
-                badge: compareAhead > 0 ? "↑\(compareAhead)" : nil,
-                badgeHelp: compareAhead > 0
-                    ? "\(model.baseBranch) is \(compareAhead) commit\(compareAhead == 1 ? "" : "s") ahead of \(model.selectedBranch)"
-                    : nil,
+                badge: model.snapshot == nil
+                    ? nil
+                    : (behindCount > 0 ? "↓\(behindCount)" : "✓"),
+                badgeHelp: {
+                    guard model.snapshot != nil else { return nil }
+                    if behindCount > 0 {
+                        return "\(model.selectedBranch) is \(behindCount) commit\(behindCount == 1 ? "" : "s") behind \(compareTip). Refresh fetches remotes first."
+                    }
+                    return "\(model.selectedBranch) includes all commits from \(compareTip)"
+                }(),
                 helpText: "Branch to compare against (merge-base)"
             ) { model.selectBaseBranch($0) }
 
-            if compareAhead > 0 {
+            if behindCount > 0 {
                 Button {
                     Task { await model.updateFromCompare() }
                 } label: {
@@ -368,7 +460,7 @@ private struct CompareBranchControl: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .disabled(model.isLoading || model.isUpdatingFromCompare || model.selectedBranch == model.baseBranch)
-                .help("Merge latest from \(model.baseBranch) into \(model.selectedBranch) (\(compareAhead) commit\(compareAhead == 1 ? "" : "s"))")
+                .help("Merge \(behindCount) commit\(behindCount == 1 ? "" : "s") from \(compareTip) into \(model.selectedBranch)")
             }
         }
     }
@@ -413,15 +505,18 @@ private struct BranchMenu: View {
                             .font(emphasized ? .callout.weight(.semibold) : .caption.weight(.medium))
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .layoutPriority(0)
                         if let badge {
                             Text(badge)
                                 .font(.caption2.monospacedDigit().weight(.bold))
-                                .foregroundStyle(.orange)
+                                .foregroundStyle(badge.hasPrefix("✓") ? Color.secondary : .orange)
+                                .fixedSize()
+                                .layoutPriority(1)
                                 .help(badgeHelp ?? badge)
                         }
                     }
                 }
-                .frame(minWidth: emphasized ? 160 : 90, maxWidth: emphasized ? 280 : 180, alignment: .leading)
+                .frame(minWidth: emphasized ? 160 : 110, maxWidth: emphasized ? 280 : 220, alignment: .leading)
 
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.caption2.weight(.semibold))
@@ -634,9 +729,16 @@ private struct BranchWorkspaceView: View {
     var body: some View {
         HStack(spacing: 0) {
             if model.showHistory {
-                CommitsPane(model: model)
-                    .frame(width: historyWidth)
-                    .frame(maxHeight: .infinity)
+                Group {
+                    switch model.sidePaneMode {
+                    case .history:
+                        CommitsPane(model: model)
+                    case .pullRequests:
+                        PullRequestsPane(model: model)
+                    }
+                }
+                .frame(width: historyWidth)
+                .frame(maxHeight: .infinity)
                 ColumnResizeHandle(width: $historyWidth, range: 200...480) {
                     workspace.historyWidth = historyWidth
                     workspace.scheduleSave()
@@ -653,8 +755,14 @@ private struct BranchWorkspaceView: View {
                 }
             }
 
-            FileInspectorView(model: model, focusedSearch: focusedSearch)
-                .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
+            Group {
+                if case .fileLog = model.inspectorMode {
+                    FileLogView(model: model)
+                } else {
+                    FileInspectorView(model: model, focusedSearch: focusedSearch)
+                }
+            }
+            .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(10)
@@ -732,11 +840,28 @@ private struct CommitsPane: View {
     var body: some View {
         PanelChrome(fill: AppTheme.historyPanel) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack {
-                    Text("History")
-                        .font(.headline)
-                    Spacer()
-                    authorFilterMenu
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("History")
+                            .font(.headline)
+                        Spacer()
+                        if model.isLoadingWorkingTree {
+                            ProgressView().controlSize(.mini)
+                        }
+                        authorFilterMenu
+                    }
+
+                    Toggle(isOn: Binding(
+                        get: { model.includeLocalChanges },
+                        set: { model.setIncludeLocalChanges($0) }
+                    )) {
+                        Text("Include local changes")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .tint(Color.accentColor)
+                    .help("Show Staged/Unstaged scopes and merge local edits into All changes")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
@@ -744,16 +869,42 @@ private struct CommitsPane: View {
                 Divider().opacity(0.45)
 
                 ScrollView {
-                    LazyVStack(spacing: 8) {
-                        if model.filteredCommits.count > 1 {
-                            CombinedCommitCard(
-                                isSelected: model.changeScope == .combined,
-                                commitCount: model.filteredCommits.count,
-                                fileCount: model.changeScope == .combined ? model.visibleFiles.count : (model.snapshot?.files.count ?? 0),
-                                additions: model.snapshot?.totalAdditions ?? 0,
-                                deletions: model.snapshot?.totalDeletions ?? 0
+                    // Non-lazy top cards stay stable; lazy only the long commit list.
+                    VStack(spacing: 8) {
+                        AllChangesCard(
+                            isSelected: model.changeScope == .combined,
+                            commitCount: model.filteredCommits.count,
+                            stagedCount: model.stagedWorkingTreeFiles.count,
+                            unstagedCount: model.unstagedWorkingTreeFiles.count,
+                            includeLocal: model.includeLocalChanges,
+                            fileCount: allChangesFileCount,
+                            additions: model.snapshot?.totalAdditions ?? 0,
+                            deletions: model.snapshot?.totalDeletions ?? 0
+                        ) {
+                            model.selectCombined()
+                        }
+
+                        if model.includeLocalChanges {
+                            LocalScopeCard(
+                                title: "Staged",
+                                subtitle: "Changes in the index, ready to commit",
+                                icon: "plus.circle.fill",
+                                tint: AppTheme.additionText,
+                                fileCount: model.stagedWorkingTreeFiles.count,
+                                isSelected: model.changeScope == .staged
                             ) {
-                                model.selectCombined()
+                                model.selectStaged()
+                            }
+
+                            LocalScopeCard(
+                                title: "Unstaged",
+                                subtitle: "Working tree edits not yet staged",
+                                icon: "pencil.circle.fill",
+                                tint: Color.orange,
+                                fileCount: model.unstagedWorkingTreeFiles.count,
+                                isSelected: model.changeScope == .unstaged
+                            ) {
+                                model.selectUnstaged()
                             }
                         }
 
@@ -761,20 +912,21 @@ private struct CommitsPane: View {
                             Text(model.selectedAuthors.isEmpty ? "No commits on this branch." : "No commits from selected authors.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                                .padding(.top, 12)
+                                .padding(.top, 4)
                         } else {
-                            ForEach(model.filteredCommits) { commit in
-                                CommitCard(
-                                    commit: commit,
-                                    isSelected: {
-                                        if case .commit(let hash) = model.changeScope {
-                                            return hash == commit.hash
-                                        }
-                                        // With a single commit, combined scope is the same change set.
-                                        return model.changeScope == .combined && model.filteredCommits.count == 1
-                                    }()
-                                ) {
-                                    model.selectCommit(commit)
+                            LazyVStack(spacing: 8) {
+                                ForEach(model.filteredCommits) { commit in
+                                    CommitCard(
+                                        commit: commit,
+                                        isSelected: {
+                                            if case .commit(let hash) = model.changeScope {
+                                                return hash == commit.hash
+                                            }
+                                            return false
+                                        }()
+                                    ) {
+                                        model.selectCommit(commit)
+                                    }
                                 }
                             }
                         }
@@ -785,6 +937,22 @@ private struct CommitsPane: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
+        .onAppear {
+            if model.includeLocalChanges {
+                Task { await model.reloadWorkingTree() }
+            }
+        }
+        .onChange(of: model.includeLocalChanges) { _, enabled in
+            if enabled {
+                Task { await model.reloadWorkingTree() }
+            }
+        }
+    }
+
+    private var allChangesFileCount: Int {
+        let branchCount = model.snapshot?.files.count ?? 0
+        guard model.includeLocalChanges else { return branchCount }
+        return Set(model.snapshot?.files.map(\.path) ?? []).union(model.workingTreeFiles.map(\.path)).count
     }
 
     @ViewBuilder
@@ -827,9 +995,12 @@ private struct CommitsPane: View {
     }
 }
 
-private struct CombinedCommitCard: View {
+private struct AllChangesCard: View {
     let isSelected: Bool
     let commitCount: Int
+    let stagedCount: Int
+    let unstagedCount: Int
+    let includeLocal: Bool
     let fileCount: Int
     let additions: Int
     let deletions: Int
@@ -841,16 +1012,23 @@ private struct CombinedCommitCard: View {
                 HStack(spacing: 8) {
                     Image(systemName: "square.stack.3d.up.fill")
                         .foregroundStyle(Color.accentColor)
-                    Text("All commits as one")
+                    Text("All changes")
                         .font(.callout.weight(.semibold))
                     Spacer()
                 }
-                Text("Review the whole branch as a single change set.")
+                Text(includeLocal
+                     ? "Branch commits plus staged and unstaged local edits."
+                     : "Review the whole branch as a single change set.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
                     Text("\(commitCount) commits")
+                    if includeLocal {
+                        Text("·")
+                        Text("\(stagedCount)s/\(unstagedCount)u")
+                            .help("\(stagedCount) staged, \(unstagedCount) unstaged")
+                    }
                     Text("·")
                     Text("\(fileCount) files")
                     Spacer()
@@ -873,7 +1051,55 @@ private struct CombinedCommitCard: View {
             )
         }
         .buttonStyle(.plain)
-        .help("Show all \(commitCount) commits as one change set")
+        .help(includeLocal
+              ? "Show branch commits together with staged and unstaged local changes"
+              : "Show all branch commits as one change set")
+    }
+}
+
+private struct LocalScopeCard: View {
+    let title: String
+    let subtitle: String
+    let icon: String
+    let tint: Color
+    let fileCount: Int
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: icon)
+                        .foregroundStyle(tint)
+                    Text(title)
+                        .font(.callout.weight(.semibold))
+                    Spacer()
+                    Text("\(fileCount)")
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .foregroundStyle(tint)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(tint.opacity(0.16), in: Capsule())
+                }
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isSelected ? tint.opacity(0.16) : tint.opacity(0.07))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(isSelected ? tint.opacity(0.55) : tint.opacity(0.22), lineWidth: isSelected ? 1.5 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("\(title): \(fileCount) file\(fileCount == 1 ? "" : "s")")
     }
 }
 
@@ -1014,17 +1240,18 @@ private struct FilesPane: View {
         }
         .onChange(of: model.filesLayout) { _, layout in
             if layout == .folders {
-                expandAllFolders()
+                expandNewFolders()
             }
         }
         .onChange(of: model.fileTree) { _, _ in
             if model.filesLayout == .folders {
-                expandAllFolders()
+                // Only open newly appeared folders — don't reset expansion (avoids scroll jumps).
+                expandNewFolders()
             }
         }
         .onAppear {
             if model.filesLayout == .folders {
-                expandAllFolders()
+                expandNewFolders()
             }
         }
     }
@@ -1037,18 +1264,32 @@ private struct FilesPane: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                     .listRowInsets(EdgeInsets(top: 7, leading: 10, bottom: 7, trailing: 10))
+                    .contextMenu { fileContextMenu(for: file) }
             }
         }
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Stable identity per scope so SwiftUI doesn't rebuild mid-scroll on minor reloads.
+        .id(fileListIdentity)
         .onAppear { model.preferFileSearch() }
         .simultaneousGesture(TapGesture().onEnded { model.preferFileSearch() })
     }
 
+    private var fileListIdentity: String {
+        switch model.changeScope {
+        case .combined: return "combined-\(model.includeLocalChanges)"
+        case .staged: return "staged"
+        case .unstaged: return "unstaged"
+        case .commit(let hash): return "commit-\(hash)"
+        }
+    }
+
     private var folderList: some View {
+        // Eager VStack (not LazyVStack): lazy stacks estimate height while scrolling,
+        // which makes the scrollbar thumb jump between different sizes.
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 2) {
                 ForEach(model.fileTree) { node in
                     FolderTreeRow(
                         node: node,
@@ -1058,6 +1299,12 @@ private struct FilesPane: View {
                         onSelect: { file in
                             model.preferFileSearch()
                             model.selectFile(file)
+                        },
+                        onLog: { file in
+                            model.openFileLog(for: file)
+                        },
+                        onRevealInFinder: { file in
+                            revealInFinder(relativePath: file.path)
                         }
                     )
                 }
@@ -1067,7 +1314,36 @@ private struct FilesPane: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
+        .id(fileListIdentity)
         .simultaneousGesture(TapGesture().onEnded { model.preferFileSearch() })
+    }
+
+    @ViewBuilder
+    private func fileContextMenu(for file: ChangedFile) -> some View {
+        Button("Log") {
+            model.openFileLog(for: file)
+        }
+        Button("Copy File Path") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(file.path, forType: .string)
+        }
+        Button("Find in Finder") {
+            revealInFinder(relativePath: file.path)
+        }
+    }
+
+    private func revealInFinder(relativePath: String) {
+        guard let repo = model.repoPath else { return }
+        let url = repo.appendingPathComponent(relativePath)
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            // Deleted / missing: open the parent folder.
+            NSWorkspace.shared.selectFile(
+                nil,
+                inFileViewerRootedAtPath: url.deletingLastPathComponent().path
+            )
+        }
     }
 
     private var fileSelection: Binding<String?> {
@@ -1085,8 +1361,8 @@ private struct FilesPane: View {
         )
     }
 
-    private func expandAllFolders() {
-        expandedFolderIDs = Set(collectFolderIDs(model.fileTree))
+    private func expandNewFolders() {
+        expandedFolderIDs.formUnion(collectFolderIDs(model.fileTree))
     }
 
     private func collectFolderIDs(_ nodes: [FileTreeNode]) -> [FileTreeNode.ID] {
@@ -1106,6 +1382,8 @@ private struct FolderTreeRow: View {
     let selectedFileID: String?
     @Binding var expandedFolderIDs: Set<FileTreeNode.ID>
     let onSelect: (ChangedFile) -> Void
+    let onLog: (ChangedFile) -> Void
+    let onRevealInFinder: (ChangedFile) -> Void
 
     private var isExpanded: Bool {
         expandedFolderIDs.contains(node.id)
@@ -1132,10 +1410,12 @@ private struct FolderTreeRow: View {
             .contentShape(Rectangle())
             .help(file.path)
             .contextMenu {
+                Button("Log") { onLog(file) }
                 Button("Copy File Path") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(file.path, forType: .string)
                 }
+                Button("Find in Finder") { onRevealInFinder(file) }
             }
         } else {
             VStack(alignment: .leading, spacing: 0) {
@@ -1182,7 +1462,9 @@ private struct FolderTreeRow: View {
                             depth: depth + 1,
                             selectedFileID: selectedFileID,
                             expandedFolderIDs: $expandedFolderIDs,
-                            onSelect: onSelect
+                            onSelect: onSelect,
+                            onLog: onLog,
+                            onRevealInFinder: onRevealInFinder
                         )
                     }
                 }
@@ -1233,12 +1515,6 @@ private struct FileRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .contextMenu {
-            Button("Copy File Path") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(file.path, forType: .string)
-            }
-        }
     }
 
     private var fileName: String {
@@ -1442,33 +1718,6 @@ private struct FileInspectorView: View {
         case .renamed, .copied: return .purple.opacity(0.18)
         default: return .orange.opacity(0.18)
         }
-    }
-}
-
-private struct PanelChrome<Content: View>: View {
-    var fill: Color? = nil
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        content
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            .background {
-                Group {
-                    if let fill {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(fill)
-                    } else {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .fill(.regularMaterial)
-                    }
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.10), radius: 12, y: 4)
     }
 }
 

@@ -13,13 +13,18 @@ enum FileViewMode: String, CaseIterable, Identifiable {
 }
 
 enum ChangeScope: Equatable, Hashable {
+    /// Branch commits since Compare, plus local staged/unstaged.
     case combined
     case commit(String)
+    case staged
+    case unstaged
 
     var cacheKeyPart: String {
         switch self {
         case .combined: return "combined"
         case .commit(let hash): return "commit:\(hash)"
+        case .staged: return "staged"
+        case .unstaged: return "unstaged"
         }
     }
 }
@@ -27,6 +32,18 @@ enum ChangeScope: Equatable, Hashable {
 enum SearchFocusTarget: Hashable {
     case fileFilter
     case content
+}
+
+enum SidePaneMode: String, CaseIterable, Identifiable {
+    case history = "History"
+    case pullRequests = "PRs"
+
+    var id: String { rawValue }
+}
+
+enum InspectorMode: Equatable {
+    case file
+    case fileLog(path: String)
 }
 
 struct FileInspectorPayload: Sendable {
@@ -62,6 +79,10 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var filesLayout: FilesLayoutMode = .folders
     @Published var showHistory = true
     @Published var showFiles = true
+    @Published var sidePaneMode: SidePaneMode = .history
+    @Published var inspectorMode: InspectorMode = .file
+    /// When on, History shows Staged/Unstaged and All changes merges local edits.
+    @Published var includeLocalChanges = false
     @Published var isLoading = false
     @Published var isLoadingFile = false
     @Published var isUpdatingFromCompare = false
@@ -71,10 +92,39 @@ final class RepoSession: ObservableObject, Identifiable {
     /// Bumped to force the matching search field to become first responder (⌘F).
     @Published var searchFocusNonce: Int = 0
 
+    // Working tree (local staged / unstaged)
+    @Published var workingTreeFiles: [WorkingTreeFile] = []
+    @Published var isLoadingWorkingTree = false
+
+    // Worktrees
+    @Published var worktrees: [GitWorktree] = []
+
+    // File log
+    @Published var fileLogEntries: [FileLogEntry] = []
+    @Published var selectedFileLogID: String?
+    @Published var fileLogDiff: String = ""
+    @Published var fileLogContainingBranches: [String] = []
+    @Published var isLoadingFileLog = false
+    @Published var isLoadingFileLogDiff = false
+    @Published var fileLogError: String?
+
+    // Pull requests
+    @Published var pullRequestFilter: PullRequestState = .open
+    @Published var pullRequests: [PullRequestSummary] = []
+    @Published var selectedPullRequestAuthors: Set<String> = []
+    @Published var selectedPullRequestID: Int?
+    @Published var isLoadingPullRequests = false
+    @Published var pullRequestError: String?
+
     private let git = GitService()
+    private let github = GitHubService()
     private var loadTask: Task<Void, Never>?
     private var fileTask: Task<Void, Never>?
     private var scopeTask: Task<Void, Never>?
+    private var workingTreeTask: Task<Void, Never>?
+    private var fileLogTask: Task<Void, Never>?
+    private var fileLogDiffTask: Task<Void, Never>?
+    private var pullRequestTask: Task<Void, Never>?
     private var inspectorCache: [String: FileInspectorPayload] = [:]
     private let cacheLimit = 96
 
@@ -91,7 +141,7 @@ final class RepoSession: ObservableObject, Identifiable {
         let commitHash: String?
         let combined: Bool
         switch changeScope {
-        case .combined:
+        case .combined, .staged, .unstaged:
             combined = true
             commitHash = nil
         case .commit(let hash):
@@ -111,7 +161,8 @@ final class RepoSession: ObservableObject, Identifiable {
             showHistory: showHistory,
             showFiles: showFiles,
             selectedAuthors: Array(selectedAuthors).sorted(),
-            fileNameQuery: fileNameQuery
+            fileNameQuery: fileNameQuery,
+            includeLocalChanges: includeLocalChanges
         )
     }
 
@@ -123,6 +174,7 @@ final class RepoSession: ObservableObject, Identifiable {
         selectedAuthors = Set(state.selectedAuthors)
         fileNameQuery = state.fileNameQuery
         selectedFileID = state.selectedFileID
+        includeLocalChanges = state.includeLocalChanges ?? false
 
         await openRepository(
             at: URL(fileURLWithPath: state.repoPath),
@@ -143,6 +195,9 @@ final class RepoSession: ObservableObject, Identifiable {
         }
 
         selectedFileID = state.selectedFileID
+        if includeLocalChanges {
+            await reloadWorkingTree()
+        }
         await reloadVisibleFiles()
         notifyStateChange()
     }
@@ -151,6 +206,20 @@ final class RepoSession: ObservableObject, Identifiable {
         guard let selectedFileID else { return nil }
         return visibleFiles.first { $0.id == selectedFileID }
             ?? filteredFiles.first { $0.id == selectedFileID }
+    }
+
+    var stagedWorkingTreeFiles: [WorkingTreeFile] {
+        workingTreeFiles.filter { $0.area == .staged }
+    }
+
+    var unstagedWorkingTreeFiles: [WorkingTreeFile] {
+        workingTreeFiles.filter { $0.area == .unstaged }
+    }
+
+    var currentWorktree: GitWorktree? {
+        guard let repoPath else { return nil }
+        let standardized = repoPath.standardizedFileURL
+        return worktrees.first { $0.path.standardizedFileURL == standardized }
     }
 
     var branchAuthors: [String] {
@@ -177,6 +246,22 @@ final class RepoSession: ObservableObject, Identifiable {
         return visibleFiles.filter { $0.path.localizedCaseInsensitiveContains(query) }
     }
 
+    var pullRequestAuthors: [String] {
+        var seen = Set<String>()
+        var names: [String] = []
+        for pr in pullRequests {
+            if seen.insert(pr.authorLogin).inserted {
+                names.append(pr.authorLogin)
+            }
+        }
+        return names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    var filteredPullRequests: [PullRequestSummary] {
+        if selectedPullRequestAuthors.isEmpty { return pullRequests }
+        return pullRequests.filter { selectedPullRequestAuthors.contains($0.authorLogin) }
+    }
+
     var fileTree: [FileTreeNode] {
         FileTreeNode.build(from: filteredFiles)
     }
@@ -189,15 +274,32 @@ final class RepoSession: ObservableObject, Identifiable {
                 ?? filteredCommits.first(where: { $0.hash == hash })
         case .combined:
             return filteredCommits.first ?? snapshot?.commits.first
+        case .staged, .unstaged:
+            return nil
         }
     }
 
     var scopeCommitSummary: String {
-        guard let commit = activeScopeCommit else {
-            return changeScope == .combined ? "No commits" : "Commit"
+        switch changeScope {
+        case .combined:
+            if let commit = activeScopeCommit {
+                let date = commit.authoredDate.formatted(date: .abbreviated, time: .shortened)
+                let base = "\(commit.shortHash) · \(commit.authorName) · \(date)"
+                if includeLocalChanges, !workingTreeFiles.isEmpty {
+                    return "\(base) · +\(workingTreeFiles.count) local"
+                }
+                return base
+            }
+            return includeLocalChanges && !workingTreeFiles.isEmpty ? "Local changes only" : "No commits"
+        case .staged:
+            return "Staged · \(stagedWorkingTreeFiles.count) file\(stagedWorkingTreeFiles.count == 1 ? "" : "s")"
+        case .unstaged:
+            return "Unstaged · \(unstagedWorkingTreeFiles.count) file\(unstagedWorkingTreeFiles.count == 1 ? "" : "s")"
+        case .commit:
+            guard let commit = activeScopeCommit else { return "Commit" }
+            let date = commit.authoredDate.formatted(date: .abbreviated, time: .shortened)
+            return "\(commit.shortHash) · \(commit.authorName) · \(date)"
         }
-        let date = commit.authoredDate.formatted(date: .abbreviated, time: .shortened)
-        return "\(commit.shortHash) · \(commit.authorName) · \(date)"
     }
 
     var repoDirectoryPath: String {
@@ -316,8 +418,40 @@ final class RepoSession: ObservableObject, Identifiable {
         notifyStateChange()
     }
 
+    func togglePullRequestAuthor(_ login: String) {
+        if selectedPullRequestAuthors.contains(login) {
+            selectedPullRequestAuthors.remove(login)
+        } else {
+            selectedPullRequestAuthors.insert(login)
+        }
+        if let selected = selectedPullRequestID,
+           !filteredPullRequests.contains(where: { $0.number == selected }) {
+            selectedPullRequestID = nil
+        }
+        notifyStateChange()
+    }
+
+    func clearPullRequestAuthorFilter() {
+        selectedPullRequestAuthors.removeAll()
+        notifyStateChange()
+    }
+
     func selectCombined() {
         changeScope = .combined
+        notifyStateChange()
+        Task { await reloadVisibleFiles() }
+    }
+
+    func selectStaged() {
+        includeLocalChanges = true
+        changeScope = .staged
+        notifyStateChange()
+        Task { await reloadVisibleFiles() }
+    }
+
+    func selectUnstaged() {
+        includeLocalChanges = true
+        changeScope = .unstaged
         notifyStateChange()
         Task { await reloadVisibleFiles() }
     }
@@ -328,9 +462,84 @@ final class RepoSession: ObservableObject, Identifiable {
         Task { await reloadVisibleFiles() }
     }
 
+    func setIncludeLocalChanges(_ enabled: Bool) {
+        includeLocalChanges = enabled
+        if !enabled, changeScope == .staged || changeScope == .unstaged {
+            changeScope = .combined
+        }
+        notifyStateChange()
+        Task {
+            if enabled {
+                await reloadWorkingTree()
+            }
+            await reloadVisibleFiles()
+        }
+    }
+
     /// Toolbar refresh: fetch remotes, then reload branches + snapshot.
     func refresh() async {
         await reloadSnapshot(resetScope: false, fetchFirst: true)
+        await reloadWorktrees()
+        await reloadWorkingTree()
+        if sidePaneMode == .pullRequests {
+            await loadPullRequests()
+        }
+        if case .fileLog(let path) = inspectorMode {
+            await loadFileLog(path: path)
+        }
+    }
+
+    func reloadWorkingTree() async {
+        guard let repoPath else {
+            workingTreeFiles = []
+            return
+        }
+        workingTreeTask?.cancel()
+        isLoadingWorkingTree = true
+        workingTreeTask = Task {
+            do {
+                let files = try await git.workingTreeStatus(in: repoPath)
+                guard !Task.isCancelled else { return }
+                let previous = workingTreeFiles
+                workingTreeFiles = files
+                isLoadingWorkingTree = false
+                // Avoid needless list reloads (they jump the Changed files scroller).
+                let scopeNeedsLocal = changeScope == .staged
+                    || changeScope == .unstaged
+                    || (changeScope == .combined && includeLocalChanges)
+                if scopeNeedsLocal, previous != files {
+                    await reloadVisibleFiles()
+                }
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                guard !Task.isCancelled else { return }
+                workingTreeFiles = []
+                isLoadingWorkingTree = false
+                errorMessage = error.localizedDescription
+            }
+        }
+        await workingTreeTask?.value
+    }
+
+    func reloadWorktrees() async {
+        guard let repoPath else {
+            worktrees = []
+            return
+        }
+        worktrees = (try? await git.listWorktrees(in: repoPath)) ?? []
+    }
+
+    func switchToWorktree(_ worktree: GitWorktree) async {
+        guard worktree.path.standardizedFileURL != repoPath?.standardizedFileURL else { return }
+        statusMessage = "Switching worktree…"
+        await openRepository(
+            at: worktree.path,
+            preferredBranch: worktree.branch,
+            preferredBase: baseBranch.isEmpty ? nil : baseBranch,
+            resetTransientState: true
+        )
+        statusMessage = nil
     }
 
     /// Merge COMPARE (`baseBranch`) into the inspected BRANCH.
@@ -349,9 +558,11 @@ final class RepoSession: ObservableObject, Identifiable {
         do {
             // Prefer fresh remote tips before merging.
             try? await git.fetchRemotes(in: repoPath)
-            try await git.merge(source: baseBranch, into: selectedBranch, in: repoPath)
+            let tip = await git.resolveFreshTip(for: baseBranch, in: repoPath)
+            statusMessage = "Updating \(selectedBranch) from \(tip)…"
+            try await git.merge(source: tip, into: selectedBranch, in: repoPath)
             await reloadSnapshot(resetScope: true, fetchFirst: false)
-            statusMessage = "Updated \(selectedBranch) with \(baseBranch)."
+            statusMessage = "Updated \(selectedBranch) with \(tip)."
             isUpdatingFromCompare = false
             // Clear the success toast shortly after.
             let message = statusMessage
@@ -420,7 +631,13 @@ final class RepoSession: ObservableObject, Identifiable {
                 } else if !fetchFirst {
                     statusMessage = nil
                 }
-                await reloadVisibleFiles()
+                async let worktreesReload: Void = reloadWorktrees()
+                await reloadWorkingTree()
+                await worktreesReload
+                // reloadWorkingTree refreshes visible files for combined/staged/unstaged.
+                if case .commit = changeScope {
+                    await reloadVisibleFiles()
+                }
                 notifyStateChange()
             } catch is CancellationError {
                 // ignore
@@ -442,6 +659,9 @@ final class RepoSession: ObservableObject, Identifiable {
     func selectFile(_ file: ChangedFile) {
         // Keep searchFocusTarget as-is so ⌘F still targets the column the user
         // was interacting with (files filter vs inspector content).
+        if case .fileLog = inspectorMode {
+            closeFileLog()
+        }
         let alreadySelected = selectedFileID == file.id
         selectedFileID = file.id
         notifyStateChange()
@@ -449,6 +669,164 @@ final class RepoSession: ObservableObject, Identifiable {
             return
         }
         Task { await loadFileInspector(for: file) }
+    }
+
+    func openFileLog(for file: ChangedFile) {
+        selectedFileID = file.id
+        inspectorMode = .fileLog(path: file.path)
+        selectedFileLogID = nil
+        fileLogDiff = ""
+        fileLogContainingBranches = []
+        fileLogError = nil
+        Task { await loadFileLog(path: file.path) }
+    }
+
+    func closeFileLog() {
+        fileLogTask?.cancel()
+        fileLogDiffTask?.cancel()
+        inspectorMode = .file
+        fileLogEntries = []
+        selectedFileLogID = nil
+        fileLogDiff = ""
+        fileLogContainingBranches = []
+        fileLogError = nil
+        isLoadingFileLog = false
+        isLoadingFileLogDiff = false
+    }
+
+    func selectFileLogEntry(_ entry: FileLogEntry) {
+        selectedFileLogID = entry.hash
+        Task { await loadFileLogDiff(for: entry) }
+    }
+
+    func setSidePaneMode(_ mode: SidePaneMode) {
+        sidePaneMode = mode
+        showHistory = true
+        if mode == .pullRequests {
+            Task { await loadPullRequests() }
+        }
+        notifyStateChange()
+    }
+
+    func setPullRequestFilter(_ state: PullRequestState) {
+        pullRequestFilter = state
+        Task { await loadPullRequests() }
+    }
+
+    func selectPullRequest(_ pr: PullRequestSummary) {
+        selectedPullRequestID = pr.number
+        // Point Branch/Compare at the PR refs when those branches exist locally.
+        if branches.contains(pr.baseRefName) {
+            baseBranch = pr.baseRefName
+        }
+        if branches.contains(pr.headRefName) {
+            selectedBranch = pr.headRefName
+            persistMemory()
+            clearInspectorCache()
+            notifyStateChange()
+            Task { await reloadSnapshot(resetScope: true) }
+        } else {
+            statusMessage = "PR #\(pr.number) head “\(pr.headRefName)” is not a local branch"
+            notifyStateChange()
+        }
+    }
+
+    func openPullRequestInBrowser(_ pr: PullRequestSummary) {
+        guard let url = URL(string: pr.url) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func loadPullRequests() async {
+        guard let repoPath else { return }
+        pullRequestTask?.cancel()
+        isLoadingPullRequests = true
+        pullRequestError = nil
+        let state = pullRequestFilter
+
+        pullRequestTask = Task {
+            do {
+                let list = try await github.listPullRequests(in: repoPath, state: state)
+                guard !Task.isCancelled else { return }
+                pullRequests = list
+                let authors = Set(list.map(\.authorLogin))
+                selectedPullRequestAuthors = selectedPullRequestAuthors.intersection(authors)
+                if let selected = selectedPullRequestID, !list.contains(where: { $0.number == selected }) {
+                    selectedPullRequestID = nil
+                }
+                isLoadingPullRequests = false
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                guard !Task.isCancelled else { return }
+                pullRequests = []
+                pullRequestError = error.localizedDescription
+                isLoadingPullRequests = false
+            }
+        }
+        await pullRequestTask?.value
+    }
+
+    private func loadFileLog(path: String) async {
+        guard let repoPath else { return }
+        fileLogTask?.cancel()
+        isLoadingFileLog = true
+        fileLogError = nil
+
+        fileLogTask = Task {
+            do {
+                let entries = try await git.fileHistory(in: repoPath, path: path)
+                guard !Task.isCancelled else { return }
+                fileLogEntries = entries
+                isLoadingFileLog = false
+                if let first = entries.first {
+                    selectedFileLogID = first.hash
+                    await loadFileLogDiff(for: first)
+                } else {
+                    fileLogDiff = ""
+                    fileLogContainingBranches = []
+                }
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                guard !Task.isCancelled else { return }
+                fileLogEntries = []
+                fileLogError = error.localizedDescription
+                isLoadingFileLog = false
+            }
+        }
+        await fileLogTask?.value
+    }
+
+    private func loadFileLogDiff(for entry: FileLogEntry) async {
+        guard let repoPath else { return }
+        guard case .fileLog(let path) = inspectorMode else { return }
+        fileLogDiffTask?.cancel()
+        isLoadingFileLogDiff = true
+
+        fileLogDiffTask = Task {
+            do {
+                async let diffTask = git.commitFileDiff(
+                    in: repoPath,
+                    commit: entry.hash,
+                    path: path,
+                    oldPath: nil
+                )
+                async let branchesTask = git.branchesContaining(in: repoPath, commit: entry.hash)
+                let (diff, branches) = try await (diffTask, branchesTask)
+                guard !Task.isCancelled, selectedFileLogID == entry.hash else { return }
+                fileLogDiff = diff.isEmpty ? "(No textual diff for this path in \(entry.shortHash).)" : diff
+                fileLogContainingBranches = branches
+                isLoadingFileLogDiff = false
+            } catch is CancellationError {
+                // ignore
+            } catch {
+                guard !Task.isCancelled, selectedFileLogID == entry.hash else { return }
+                fileLogDiff = error.localizedDescription
+                fileLogContainingBranches = []
+                isLoadingFileLogDiff = false
+            }
+        }
+        await fileLogDiffTask?.value
     }
 
     func preferFileSearch() {
@@ -469,7 +847,20 @@ final class RepoSession: ObservableObject, Identifiable {
 
     func reloadVisibleFiles() async {
         guard let snapshot else {
-            visibleFiles = []
+            // Local-only scopes can still show working tree files without a branch snapshot.
+            if changeScope == .staged || changeScope == .unstaged {
+                let files = (changeScope == .staged ? stagedWorkingTreeFiles : unstagedWorkingTreeFiles)
+                    .map(\.asChangedFile)
+                visibleFiles = files
+                selectedFileID = files.first?.id
+                if let file = files.first {
+                    await loadFileInspector(for: file)
+                } else {
+                    clearFileInspector()
+                }
+            } else {
+                visibleFiles = []
+            }
             return
         }
 
@@ -479,15 +870,32 @@ final class RepoSession: ObservableObject, Identifiable {
                 let files: [ChangedFile]
                 switch changeScope {
                 case .combined:
-                    files = snapshot.files
+                    if includeLocalChanges {
+                        files = Self.mergeBranchAndLocalFiles(
+                            branchFiles: snapshot.files,
+                            localFiles: workingTreeFiles
+                        )
+                    } else {
+                        files = snapshot.files
+                    }
                 case .commit(let hash):
                     files = try await git.commitChangedFiles(in: snapshot.repoPath, commit: hash)
+                case .staged:
+                    files = stagedWorkingTreeFiles.map(\.asChangedFile)
+                case .unstaged:
+                    files = unstagedWorkingTreeFiles.map(\.asChangedFile)
                 }
                 guard !Task.isCancelled else { return }
+                let previousSelection = selectedFileID
+                let listChanged = visibleFiles != files
                 visibleFiles = files
-                if let current = selectedFileID, files.contains(where: { $0.id == current }) {
-                    if let file = files.first(where: { $0.id == current }) {
-                        await loadFileInspector(for: file)
+                if let current = previousSelection, files.contains(where: { $0.id == current }) {
+                    selectedFileID = current
+                    // Only reload inspector when the file set or scope content likely changed.
+                    if listChanged {
+                        if let file = files.first(where: { $0.id == current }) {
+                            await loadFileInspector(for: file)
+                        }
                     }
                 } else {
                     selectedFileID = files.first?.id
@@ -509,6 +917,32 @@ final class RepoSession: ObservableObject, Identifiable {
         await scopeTask?.value
     }
 
+    private static func mergeBranchAndLocalFiles(
+        branchFiles: [ChangedFile],
+        localFiles: [WorkingTreeFile]
+    ) -> [ChangedFile] {
+        var byPath: [String: ChangedFile] = [:]
+        for file in branchFiles {
+            byPath[file.path] = file
+        }
+        for local in localFiles {
+            if let existing = byPath[local.path] {
+                byPath[local.path] = ChangedFile(
+                    status: local.status == .unknown ? existing.status : local.status,
+                    path: local.path,
+                    oldPath: local.oldPath ?? existing.oldPath,
+                    additions: max(existing.additions, local.additions),
+                    deletions: max(existing.deletions, local.deletions)
+                )
+            } else {
+                byPath[local.path] = local.asChangedFile
+            }
+        }
+        return byPath.values.sorted {
+            $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending
+        }
+    }
+
     private func clearFileInspector() {
         fileDiff = ""
         beforeContents = nil
@@ -522,12 +956,17 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func cacheKey(for file: ChangedFile, snapshot: BranchSnapshot) -> String {
-        [
+        let localMarker = (includeLocalChanges && workingTreeFiles.contains(where: { $0.path == file.path }))
+            ? "local"
+            : "clean"
+        return [
             snapshot.repoPath.path,
             snapshot.branch,
             snapshot.baseBranch,
             snapshot.mergeBase,
             changeScope.cacheKeyPart,
+            includeLocalChanges ? "inclocal" : "nolocal",
+            localMarker,
             file.path,
             file.oldPath ?? "",
         ].joined(separator: "|")
@@ -554,23 +993,27 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func loadFileInspector(for file: ChangedFile) async {
-        guard let snapshot else { return }
-        let key = cacheKey(for: file, snapshot: snapshot)
+        guard let repoPath else { return }
+        let key: String
+        if let snapshot {
+            key = cacheKey(for: file, snapshot: snapshot)
+        } else {
+            key = [repoPath.path, changeScope.cacheKeyPart, file.path, file.oldPath ?? ""].joined(separator: "|")
+        }
 
         if let cached = inspectorCache[key] {
             applyPayload(cached)
             return
         }
 
-        // Avoid cancelling an in-flight load for the same file.
         fileTask?.cancel()
         isLoadingFile = true
-        // Keep previous file visible until the new payload arrives (no flicker/clear).
 
-        let repo = snapshot.repoPath
         let beforePath = file.oldPath ?? file.path
         let afterPath = file.path
         let scope = changeScope
+        let snap = snapshot
+        let localMatch = workingTreeFiles.first { $0.path == file.path }
 
         fileTask = Task {
             do {
@@ -582,32 +1025,81 @@ final class RepoSession: ObservableObject, Identifiable {
 
                 switch scope {
                 case .combined:
-                    async let diffTask = git.fileDiff(
-                        in: repo,
-                        from: snapshot.mergeBase,
-                        to: snapshot.branch,
-                        path: file.path,
-                        oldPath: file.oldPath
-                    )
-                    async let beforeTask = git.fileContents(in: repo, revision: snapshot.mergeBase, path: beforePath)
-                    async let afterTask = git.fileContents(in: repo, revision: snapshot.branch, path: afterPath)
-                    (diff, before, after) = try await (diffTask, beforeTask, afterTask)
-                    beforeName = "\(snapshot.baseBranch) @ \(snapshot.mergeBaseShort)"
-                    afterName = snapshot.branch
+                    if let snap {
+                        let hasLocal = includeLocalChanges && localMatch != nil
+                        if hasLocal {
+                            async let diffTask = git.worktreeDiff(
+                                in: repoPath,
+                                from: snap.mergeBase,
+                                path: afterPath,
+                                oldPath: file.oldPath
+                            )
+                            async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
+                            async let afterTask = git.workingTreeFileContents(in: repoPath, path: afterPath)
+                            (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                            beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
+                            afterName = "Working tree"
+                        } else {
+                            async let diffTask = git.fileDiff(
+                                in: repoPath,
+                                from: snap.mergeBase,
+                                to: snap.branch,
+                                path: file.path,
+                                oldPath: file.oldPath
+                            )
+                            async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
+                            async let afterTask = git.fileContents(in: repoPath, revision: snap.branch, path: afterPath)
+                            (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                            beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
+                            afterName = snap.branch
+                        }
+                    } else {
+                        throw GitError.commandFailed("No branch snapshot loaded.")
+                    }
                 case .commit(let hash):
-                    let short = snapshot.commits.first(where: { $0.hash == hash })?.shortHash ?? String(hash.prefix(8))
+                    guard let snap else { throw GitError.commandFailed("No branch snapshot loaded.") }
+                    let short = snap.commits.first(where: { $0.hash == hash })?.shortHash ?? String(hash.prefix(8))
                     let parent = "\(hash)^"
                     async let diffTask = git.commitFileDiff(
-                        in: repo,
+                        in: repoPath,
                         commit: hash,
                         path: file.path,
                         oldPath: file.oldPath
                     )
-                    async let beforeTask = git.fileContents(in: repo, revision: parent, path: beforePath)
-                    async let afterTask = git.fileContents(in: repo, revision: hash, path: afterPath)
+                    async let beforeTask = git.fileContents(in: repoPath, revision: parent, path: beforePath)
+                    async let afterTask = git.fileContents(in: repoPath, revision: hash, path: afterPath)
                     (diff, before, after) = try await (diffTask, beforeTask, afterTask)
                     beforeName = "parent of \(short)"
                     afterName = short
+                case .staged:
+                    async let diffTask = git.stagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
+                    async let beforeTask = git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
+                    async let afterTask = git.indexFileContents(in: repoPath, path: afterPath)
+                    (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                    beforeName = "HEAD"
+                    afterName = "Index (staged)"
+                case .unstaged:
+                    let unstaged = try await git.unstagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
+                    let worktree = try await git.workingTreeFileContents(in: repoPath, path: afterPath)
+                    let index: String?
+                    if let fromIndex = try await git.indexFileContents(in: repoPath, path: beforePath) {
+                        index = fromIndex
+                    } else {
+                        index = try await git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
+                    }
+                    if unstaged.isEmpty, file.status == .added, let worktree, !worktree.isEmpty {
+                        diff = "--- /dev/null\n+++ b/\(afterPath)\n@@ untracked @@\n"
+                        before = nil
+                        after = worktree
+                        beforeName = "(new file)"
+                        afterName = "Working tree"
+                    } else {
+                        diff = unstaged
+                        before = index
+                        after = worktree
+                        beforeName = "Index / HEAD"
+                        afterName = "Working tree"
+                    }
                 }
 
                 guard !Task.isCancelled else { return }
@@ -619,7 +1111,6 @@ final class RepoSession: ObservableObject, Identifiable {
                     afterLabel: afterName
                 )
                 storeCache(key: key, payload: payload)
-                // Only apply if this file is still selected.
                 if selectedFileID == file.id {
                     applyPayload(payload)
                 }

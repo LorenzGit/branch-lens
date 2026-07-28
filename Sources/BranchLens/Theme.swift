@@ -1,6 +1,33 @@
 import AppKit
 import SwiftUI
 
+struct PanelChrome<Content: View>: View {
+    var fill: Color? = nil
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background {
+                Group {
+                    if let fill {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(fill)
+                    } else {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(.regularMaterial)
+                    }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.10), radius: 12, y: 4)
+    }
+}
+
 enum AppTheme {
     static let mono = Font.system(size: 12.5, design: .monospaced)
     static let monoNS = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
