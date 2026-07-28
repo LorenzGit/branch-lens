@@ -1,0 +1,29 @@
+# Swift / SPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# App packaging
+dist/
+*.app
+*.dmg
+*.zip
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Local secrets / env (none expected, keep ignored)
+.env
+.env.*
+*.pem
+*.p12
+credentials.json
