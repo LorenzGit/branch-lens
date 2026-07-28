@@ -71,74 +71,94 @@ struct SyntaxTextView: NSViewRepresentable {
 
         scroll.documentView = textView
         context.coordinator.textView = textView
-        apply(to: textView)
+        scheduleApply(to: textView, coordinator: context.coordinator, cacheKey: contentKey())
         return scroll
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = context.coordinator.textView ?? scrollView.documentView as? NSTextView else { return }
-        let key = "\(path)||\(source.count)||\(source.hashValue)||\(showLineNumbers)||\(searchQuery)"
+        let key = contentKey()
         guard context.coordinator.renderedKey != key else { return }
-        context.coordinator.renderedKey = key
-        apply(to: textView)
+        scheduleApply(to: textView, coordinator: context.coordinator, cacheKey: key)
     }
 
-    private func apply(to textView: NSTextView) {
-        let attributed = NSMutableAttributedString(attributedString: buildAttributed())
-        let first = SearchHighlight.apply(to: attributed, query: searchQuery)
-        textView.textStorage?.setAttributedString(attributed)
-        textView.backgroundColor = .textBackgroundColor
-        let width = max(attributed.size().width + 40, 400)
-        textView.frame = NSRect(x: 0, y: 0, width: width, height: 10)
-        textView.sizeToFit()
-        SearchHighlight.scroll(textView: textView, to: first)
+    private func contentKey() -> String {
+        HighlightRenderCache.key(
+            kind: showLineNumbers ? "source" : "source-noln",
+            path: path,
+            source: source,
+            searchQuery: searchQuery
+        )
     }
 
-    private func buildAttributed() -> NSAttributedString {
-        let result = NSMutableAttributedString()
-        let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
-        let gutterWidth = showLineNumbers ? max(3, String(lines.count).count) : 0
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineBreakMode = .byClipping
-        paragraph.alignment = .left
+    private func scheduleApply(to textView: NSTextView, coordinator: Coordinator, cacheKey: String? = nil) {
+        let cacheKey = cacheKey ?? contentKey()
+        coordinator.renderGeneration &+= 1
+        let generation = coordinator.renderGeneration
 
-        for (index, line) in lines.enumerated() {
-            if showLineNumbers {
-                let gutter = String(format: "%\(gutterWidth)d  ", index + 1)
-                result.append(NSAttributedString(string: gutter, attributes: [
-                    .font: AppTheme.monoNS,
-                    .foregroundColor: NSColor.tertiaryLabelColor,
-                    .paragraphStyle: paragraph,
-                ]))
-            }
+        if let cached = HighlightRenderCache.get(cacheKey) {
+            applyEntry(cached, to: textView, scrollToSearch: true)
+            coordinator.renderedKey = cacheKey
+            return
+        }
 
-            let highlighted = CodeHighlighter.attributedString(
-                String(line),
-                path: path,
-                plainColor: AppTheme.plainCode,
-                keywordColor: AppTheme.keywordCode,
-                stringColor: AppTheme.stringCode,
-                commentColor: AppTheme.commentCode,
-                numberColor: AppTheme.numberCode,
-                font: AppTheme.monoNS
+        // Keep previous content visible while the next file highlights off-main.
+        let source = self.source
+        let path = self.path
+        let showLineNumbers = self.showLineNumbers
+        let searchQuery = self.searchQuery
+        let colors = SyntaxRenderBuilder.Colors.current()
+        let font = AppTheme.monoNS
+        let lineHeight = font.ascender - font.descender + font.leading
+
+        coordinator.renderTask?.cancel()
+        coordinator.renderTask = Task.detached(priority: .userInitiated) {
+            let attributed = NSMutableAttributedString(
+                attributedString: SyntaxRenderBuilder.buildSource(
+                    source: source,
+                    path: path,
+                    showLineNumbers: showLineNumbers,
+                    font: font,
+                    colors: colors
+                )
             )
-            let mutable = NSMutableAttributedString(attributedString: highlighted)
-            mutable.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: mutable.length))
-            result.append(mutable)
+            _ = SearchHighlight.apply(to: attributed, query: searchQuery)
+            let maxChars = HighlightRenderCache.maxLineCharacterCount(in: attributed.string)
+            let width = HighlightRenderCache.estimateWidth(lineCharacterCounts: maxChars, padding: 40)
+            let lineCount = source.isEmpty ? 1 : source.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+            let height = max(CGFloat(lineCount) * max(lineHeight, 14) + 24, 40)
+            let entry = HighlightRenderCache.Entry(attributed: attributed, width: width, height: height)
+            HighlightRenderCache.set(cacheKey, entry: entry)
 
-            if index < lines.count - 1 {
-                result.append(NSAttributedString(string: "\n", attributes: [
-                    .font: AppTheme.monoNS,
-                    .paragraphStyle: paragraph,
-                ]))
+            await MainActor.run {
+                guard !Task.isCancelled, coordinator.renderGeneration == generation else { return }
+                applyEntry(entry, to: textView, scrollToSearch: true)
+                coordinator.renderedKey = cacheKey
             }
         }
-        return result
+    }
+
+    private func applyEntry(_ entry: HighlightRenderCache.Entry, to textView: NSTextView, scrollToSearch: Bool) {
+        textView.textStorage?.setAttributedString(entry.attributed)
+        textView.backgroundColor = .textBackgroundColor
+        // Restore cached metrics — skip sizeToFit (major Compare switch cost).
+        textView.frame = NSRect(x: 0, y: 0, width: entry.width, height: entry.height)
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        if scrollToSearch, !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let full = entry.attributed.string as NSString
+            let found = full.range(of: searchQuery, options: [.caseInsensitive, .diacriticInsensitive])
+            SearchHighlight.scroll(textView: textView, to: found.location == NSNotFound ? nil : found)
+        }
     }
 
     final class Coordinator {
         var textView: NSTextView?
         var renderedKey: String?
+        var renderGeneration: Int = 0
+        var renderTask: Task<Void, Never>?
     }
 }
 
@@ -178,29 +198,169 @@ struct DiffScrollView: NSViewRepresentable {
 
         scroll.documentView = textView
         context.coordinator.textView = textView
-        apply(to: textView)
+        scheduleApply(to: textView, coordinator: context.coordinator, cacheKey: contentKey())
         return scroll
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = context.coordinator.textView ?? scrollView.documentView as? NSTextView else { return }
-        let key = "\(path)||\(text.hashValue)||\(searchQuery)"
+        let key = contentKey()
         guard context.coordinator.renderedKey != key else { return }
-        context.coordinator.renderedKey = key
-        apply(to: textView)
+        scheduleApply(to: textView, coordinator: context.coordinator, cacheKey: key)
     }
 
-    private func apply(to textView: NSTextView) {
-        let attributed = NSMutableAttributedString(attributedString: buildDiffAttributed())
-        let first = SearchHighlight.apply(to: attributed, query: searchQuery)
-        textView.textStorage?.setAttributedString(attributed)
-        let width = max(attributed.size().width + 48, 480)
-        textView.frame = NSRect(x: 0, y: 0, width: width, height: 10)
-        textView.sizeToFit()
-        SearchHighlight.scroll(textView: textView, to: first)
+    private func contentKey() -> String {
+        HighlightRenderCache.key(kind: "diff", path: path, source: text, searchQuery: searchQuery)
     }
 
-    private func buildDiffAttributed() -> NSAttributedString {
+    private func scheduleApply(to textView: NSTextView, coordinator: Coordinator, cacheKey: String? = nil) {
+        let cacheKey = cacheKey ?? contentKey()
+        coordinator.renderGeneration &+= 1
+        let generation = coordinator.renderGeneration
+
+        if let cached = HighlightRenderCache.get(cacheKey) {
+            applyEntry(cached, to: textView)
+            coordinator.renderedKey = cacheKey
+            return
+        }
+
+        let text = self.text
+        let path = self.path
+        let searchQuery = self.searchQuery
+        let colors = SyntaxRenderBuilder.Colors.current()
+        let font = AppTheme.monoNS
+        let boldFont = AppTheme.monoBoldNS
+        let lineHeight = font.ascender - font.descender + font.leading
+
+        coordinator.renderTask?.cancel()
+        coordinator.renderTask = Task.detached(priority: .userInitiated) {
+            let attributed = NSMutableAttributedString(
+                attributedString: SyntaxRenderBuilder.buildDiff(
+                    text: text,
+                    path: path,
+                    font: font,
+                    boldFont: boldFont,
+                    colors: colors
+                )
+            )
+            _ = SearchHighlight.apply(to: attributed, query: searchQuery)
+            let maxChars = HighlightRenderCache.maxLineCharacterCount(in: attributed.string)
+            let width = HighlightRenderCache.estimateWidth(lineCharacterCounts: maxChars, padding: 48)
+            let lineCount = text.isEmpty ? 1 : text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+            let height = max(CGFloat(lineCount) * max(lineHeight, 14) + 24, 40)
+            let entry = HighlightRenderCache.Entry(attributed: attributed, width: width, height: height)
+            HighlightRenderCache.set(cacheKey, entry: entry)
+
+            await MainActor.run {
+                guard !Task.isCancelled, coordinator.renderGeneration == generation else { return }
+                applyEntry(entry, to: textView)
+                coordinator.renderedKey = cacheKey
+            }
+        }
+    }
+
+    private func applyEntry(_ entry: HighlightRenderCache.Entry, to textView: NSTextView) {
+        textView.textStorage?.setAttributedString(entry.attributed)
+        textView.frame = NSRect(x: 0, y: 0, width: entry.width, height: entry.height)
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let full = entry.attributed.string as NSString
+            let found = full.range(of: searchQuery, options: [.caseInsensitive, .diacriticInsensitive])
+            SearchHighlight.scroll(textView: textView, to: found.location == NSNotFound ? nil : found)
+        }
+    }
+
+    final class Coordinator {
+        var textView: NSTextView?
+        var renderedKey: String?
+        var renderGeneration: Int = 0
+        var renderTask: Task<Void, Never>?
+    }
+}
+
+/// Off-main-actor highlight builders (colors/fonts captured on the main thread first).
+enum SyntaxRenderBuilder {
+    struct Colors: @unchecked Sendable {
+        let plain: NSColor
+        let keyword: NSColor
+        let string: NSColor
+        let comment: NSColor
+        let number: NSColor
+        let gutter: NSColor
+        let secondary: NSColor
+
+        @MainActor
+        static func current() -> Colors {
+            Colors(
+                plain: AppTheme.plainCode,
+                keyword: AppTheme.keywordCode,
+                string: AppTheme.stringCode,
+                comment: AppTheme.commentCode,
+                number: AppTheme.numberCode,
+                gutter: .tertiaryLabelColor,
+                secondary: .secondaryLabelColor
+            )
+        }
+    }
+
+    nonisolated static func buildSource(
+        source: String,
+        path: String,
+        showLineNumbers: Bool,
+        font: NSFont,
+        colors: Colors
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+        let gutterWidth = showLineNumbers ? max(3, String(lines.count).count) : 0
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byClipping
+        paragraph.alignment = .left
+
+        for (index, line) in lines.enumerated() {
+            if showLineNumbers {
+                let gutter = String(format: "%\(gutterWidth)d  ", index + 1)
+                result.append(NSAttributedString(string: gutter, attributes: [
+                    .font: font,
+                    .foregroundColor: colors.gutter,
+                    .paragraphStyle: paragraph,
+                ]))
+            }
+
+            let highlighted = CodeHighlighter.attributedString(
+                String(line),
+                path: path,
+                plainColor: colors.plain,
+                keywordColor: colors.keyword,
+                stringColor: colors.string,
+                commentColor: colors.comment,
+                numberColor: colors.number,
+                font: font
+            )
+            let mutable = NSMutableAttributedString(attributedString: highlighted)
+            mutable.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: mutable.length))
+            result.append(mutable)
+
+            if index < lines.count - 1 {
+                result.append(NSAttributedString(string: "\n", attributes: [
+                    .font: font,
+                    .paragraphStyle: paragraph,
+                ]))
+            }
+        }
+        return result
+    }
+
+    nonisolated static func buildDiff(
+        text: String,
+        path: String,
+        font: NSFont,
+        boldFont: NSFont,
+        colors: Colors
+    ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let lines = DiffParser.parse(text).filter { $0.kind != .meta && $0.kind != .header }
         let paragraph = NSMutableParagraphStyle()
@@ -229,24 +389,23 @@ struct DiffScrollView: NSViewRepresentable {
             default: prefix = " "
             }
 
-            let gutterColor: NSColor = .secondaryLabelColor
             let prefixColor: NSColor = {
                 switch line.kind {
                 case .addition: return NSColor(calibratedRed: 0.25, green: 0.78, blue: 0.45, alpha: 1)
                 case .deletion: return NSColor(calibratedRed: 0.95, green: 0.35, blue: 0.38, alpha: 1)
-                default: return .secondaryLabelColor
+                default: return colors.secondary
                 }
             }()
 
             let prefixAttrs: [NSAttributedString.Key: Any] = [
-                .font: AppTheme.monoBoldNS,
+                .font: boldFont,
                 .foregroundColor: prefixColor,
                 .backgroundColor: bg,
                 .paragraphStyle: paragraph,
             ]
             let gutterAttrs: [NSAttributedString.Key: Any] = [
-                .font: AppTheme.monoNS,
-                .foregroundColor: gutterColor,
+                .font: font,
+                .foregroundColor: colors.secondary,
                 .backgroundColor: bg,
                 .paragraphStyle: paragraph,
             ]
@@ -259,23 +418,22 @@ struct DiffScrollView: NSViewRepresentable {
                 let highlighted = CodeHighlighter.attributedString(
                     line.code,
                     path: path,
-                    plainColor: AppTheme.plainCode,
-                    keywordColor: AppTheme.keywordCode,
-                    stringColor: AppTheme.stringCode,
-                    commentColor: AppTheme.commentCode,
-                    numberColor: AppTheme.numberCode,
-                    font: AppTheme.monoNS
+                    plainColor: colors.plain,
+                    keywordColor: colors.keyword,
+                    stringColor: colors.string,
+                    commentColor: colors.comment,
+                    numberColor: colors.number,
+                    font: font
                 )
                 let mutable = NSMutableAttributedString(attributedString: highlighted)
-                let codeAttrs: [NSAttributedString.Key: Any] = [
+                mutable.addAttributes([
                     .backgroundColor: bg,
                     .paragraphStyle: paragraph,
-                ]
-                mutable.addAttributes(codeAttrs, range: NSRange(location: 0, length: mutable.length))
+                ], range: NSRange(location: 0, length: mutable.length))
                 result.append(mutable)
             case .hunk:
                 result.append(NSAttributedString(string: line.raw, attributes: [
-                    .font: AppTheme.monoBoldNS,
+                    .font: boldFont,
                     .foregroundColor: NSColor(calibratedRed: 0.45, green: 0.70, blue: 1.0, alpha: 1),
                     .backgroundColor: bg,
                     .paragraphStyle: paragraph,
@@ -286,17 +444,12 @@ struct DiffScrollView: NSViewRepresentable {
 
             if index < lines.count - 1 {
                 result.append(NSAttributedString(string: "\n", attributes: [
-                    .font: AppTheme.monoNS,
+                    .font: font,
                     .backgroundColor: bg,
                     .paragraphStyle: paragraph,
                 ]))
             }
         }
         return result
-    }
-
-    final class Coordinator {
-        var textView: NSTextView?
-        var renderedKey: String?
     }
 }

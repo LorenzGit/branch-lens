@@ -1,3 +1,4 @@
+import AppKit
 import BranchLensCore
 import SwiftUI
 
@@ -66,6 +67,7 @@ struct ContentView: View {
 private struct SessionContainer: View {
     @ObservedObject var session: RepoSession
     @ObservedObject var workspace: WorkspaceModel
+    @FocusState private var focusedSearch: SearchFocusTarget?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -78,8 +80,24 @@ private struct SessionContainer: View {
                     Task { await session.reloadSnapshot() }
                 }
             } else {
-                BranchWorkspaceView(model: session, workspace: workspace)
+                BranchWorkspaceView(
+                    model: session,
+                    workspace: workspace,
+                    focusedSearch: $focusedSearch
+                )
             }
+        }
+        .background {
+            Button("Find") {
+                session.activateFindShortcut()
+            }
+            .keyboardShortcut("f", modifiers: [.command])
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+        }
+        .onChange(of: session.searchFocusNonce) { _, _ in
+            focusedSearch = session.searchFocusTarget
         }
         .onChange(of: session.showHistory) { _, _ in session.onStateChange?() }
         .onChange(of: session.showFiles) { _, _ in session.onStateChange?() }
@@ -116,6 +134,7 @@ private struct TabBarView: View {
                 Button("Open Repository…") {
                     workspace.openRepositoryPicker()
                 }
+                .help("Open a local git repository in a new tab")
                 if !workspace.recentRepos.isEmpty {
                     Divider()
                     Section("Recent") {
@@ -123,6 +142,7 @@ private struct TabBarView: View {
                             Button(url.path) {
                                 Task { await workspace.openRepository(at: url) }
                             }
+                            .help(url.path)
                         }
                     }
                 }
@@ -133,7 +153,7 @@ private struct TabBarView: View {
                     .contentShape(Rectangle())
             }
             .menuStyle(.borderlessButton)
-            .help("New tab")
+            .help("New tab — open a repository")
             .padding(.trailing, 8)
         }
         .background(Color.primary.opacity(0.04))
@@ -169,6 +189,7 @@ private struct TabChip: View {
                 }
             }
             .buttonStyle(.plain)
+            .help(session.repoPath?.path ?? "Switch to \(title)")
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -178,7 +199,7 @@ private struct TabChip: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Close tab")
+            .help("Close “\(title)”")
         }
         .padding(.leading, 10)
         .padding(.trailing, 6)
@@ -191,7 +212,6 @@ private struct TabChip: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(isActive ? Color.accentColor.opacity(0.35) : Color.clear, lineWidth: 1)
         )
-        .help(session.repoPath?.path ?? title)
     }
 }
 
@@ -209,16 +229,11 @@ private struct ToolbarView: View {
                         icon: "arrow.triangle.branch",
                         value: model.selectedBranch,
                         options: model.branches,
-                        emphasized: true
+                        emphasized: true,
+                        helpText: "Branch to inspect"
                     ) { model.selectBranch($0) }
 
-                    BranchMenu(
-                        title: "Since",
-                        icon: "point.topleft.down.to.point.bottomright.curvepath",
-                        value: model.baseBranch,
-                        options: model.branches,
-                        emphasized: false
-                    ) { model.selectBaseBranch($0) }
+                    CompareBranchControl(model: model)
 
                     if let snapshot = model.snapshot {
                         CompactStats(model: model, snapshot: snapshot)
@@ -226,23 +241,31 @@ private struct ToolbarView: View {
 
                     Spacer(minLength: 8)
 
+                    if let status = model.statusMessage {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
                     columnToggles
 
                     Button {
-                        Task { await model.reloadSnapshot() }
+                        Task { await model.refresh() }
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
                     .buttonStyle(.bordered)
-                    .disabled(model.isLoading)
-                    .help("Reload")
+                    .disabled(model.isLoading || model.isUpdatingFromCompare)
+                    .help("Fetch remotes and reload this branch")
                 } else {
                     Spacer()
                 }
 
-                if model.isLoading {
+                if model.isLoading || model.isUpdatingFromCompare {
                     ProgressView()
                         .controlSize(.small)
+                        .help(model.isUpdatingFromCompare ? "Updating branch…" : "Loading…")
                 }
             }
             .padding(.horizontal, 14)
@@ -262,13 +285,13 @@ private struct ToolbarView: View {
                 Image(systemName: "clock.arrow.circlepath")
             }
             .toggleStyle(.button)
-            .help(model.showHistory ? "Hide History" : "Show History")
+            .help(model.showHistory ? "Hide History column" : "Show History column")
 
             Toggle(isOn: $model.showFiles) {
                 Image(systemName: "list.bullet.indent")
             }
             .toggleStyle(.button)
-            .help(model.showFiles ? "Hide Changed files" : "Show Changed files")
+            .help(model.showFiles ? "Hide Changed files column" : "Show Changed files column")
         }
     }
 }
@@ -292,7 +315,7 @@ private struct CompactStats: View {
             .help("Lines added / deleted")
             Text(snapshot.mergeBaseShort)
                 .foregroundStyle(.secondary)
-                .help("Merge base with \(snapshot.baseBranch)")
+                .help("Merge base with Compare branch \(snapshot.baseBranch)")
             if let tracking = snapshot.remoteTrackingBranch {
                 let ahead = snapshot.aheadOfRemote ?? 0
                 let behind = snapshot.behindRemote ?? 0
@@ -313,54 +336,181 @@ private struct CompactStats: View {
     }
 }
 
+private struct CompareBranchControl: View {
+    @ObservedObject var model: RepoSession
+
+    private var compareAhead: Int {
+        model.snapshot?.compareAheadCount ?? 0
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            BranchMenu(
+                title: "Compare",
+                icon: "point.topleft.down.to.point.bottomright.curvepath",
+                value: model.baseBranch,
+                options: model.branches,
+                emphasized: false,
+                badge: compareAhead > 0 ? "↑\(compareAhead)" : nil,
+                badgeHelp: compareAhead > 0
+                    ? "\(model.baseBranch) is \(compareAhead) commit\(compareAhead == 1 ? "" : "s") ahead of \(model.selectedBranch)"
+                    : nil,
+                helpText: "Branch to compare against (merge-base)"
+            ) { model.selectBaseBranch($0) }
+
+            if compareAhead > 0 {
+                Button {
+                    Task { await model.updateFromCompare() }
+                } label: {
+                    Label("Update", systemImage: "arrow.down.circle")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(model.isLoading || model.isUpdatingFromCompare || model.selectedBranch == model.baseBranch)
+                .help("Merge latest from \(model.baseBranch) into \(model.selectedBranch) (\(compareAhead) commit\(compareAhead == 1 ? "" : "s"))")
+            }
+        }
+    }
+}
+
 private struct BranchMenu: View {
     let title: String
     let icon: String
     let value: String
     let options: [String]
     let emphasized: Bool
+    var badge: String? = nil
+    var badgeHelp: String? = nil
+    var helpText: String = ""
     let onSelect: (String) -> Void
 
+    @State private var isOpen = false
+    @State private var query = ""
+
+    private var filteredOptions: [String] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return options }
+        return options.filter { $0.localizedCaseInsensitiveContains(q) }
+    }
+
     var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .foregroundStyle(emphasized ? Color.accentColor : .secondary)
-                .frame(width: 16)
+        Button {
+            query = ""
+            isOpen.toggle()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .foregroundStyle(emphasized ? Color.accentColor : .secondary)
+                    .frame(width: 16)
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title.uppercased())
-                    .font(.caption2.weight(.bold))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title.uppercased())
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        Text(value.isEmpty ? "Select…" : value)
+                            .font(emphasized ? .callout.weight(.semibold) : .caption.weight(.medium))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if let badge {
+                            Text(badge)
+                                .font(.caption2.monospacedDigit().weight(.bold))
+                                .foregroundStyle(.orange)
+                                .help(badgeHelp ?? badge)
+                        }
+                    }
+                }
+                .frame(minWidth: emphasized ? 160 : 90, maxWidth: emphasized ? 280 : 180, alignment: .leading)
+
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Text(value.isEmpty ? "Select…" : value)
-                    .font(emphasized ? .callout.weight(.semibold) : .caption.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
-            .frame(minWidth: emphasized ? 160 : 90, maxWidth: emphasized ? 280 : 150, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(emphasized ? Color.accentColor.opacity(0.10) : AppTheme.subtleFill)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(emphasized ? Color.accentColor.opacity(0.25) : Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(helpText.isEmpty ? value : "\(helpText)\n\(value)")
+        .popover(isPresented: $isOpen, arrowEdge: .bottom) {
+            branchPickerPopover
+        }
+    }
 
-            Picker(title, selection: Binding(
-                get: { value },
-                set: { onSelect($0) }
-            )) {
-                ForEach(options, id: \.self) { branch in
-                    Text(branch).tag(branch)
+    private var branchPickerPopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search branches…", text: $query)
+                    .textFieldStyle(.plain)
+                if !query.isEmpty {
+                    Button {
+                        query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear search")
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(width: 16)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            if filteredOptions.isEmpty {
+                Text(options.isEmpty ? "No branches" : "No matches")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(filteredOptions, id: \.self) { branch in
+                            Button {
+                                onSelect(branch)
+                                isOpen = false
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: branch == value ? "checkmark" : "arrow.triangle.branch")
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(branch == value ? Color.accentColor : .secondary)
+                                        .frame(width: 14)
+                                    Text(branch)
+                                        .font(.callout.monospaced())
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer(minLength: 0)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(branch == value ? Color.accentColor.opacity(0.14) : Color.clear)
+                                )
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Select \(branch)")
+                        }
+                    }
+                }
+                .frame(maxHeight: 280)
+            }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .fill(emphasized ? Color.accentColor.opacity(0.10) : AppTheme.subtleFill)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                .strokeBorder(emphasized ? Color.accentColor.opacity(0.25) : Color.primary.opacity(0.08), lineWidth: 1)
-        )
-        .help(value)
+        .padding(10)
+        .frame(width: 300)
     }
 }
 
@@ -402,6 +552,7 @@ private struct EmptyWorkspaceView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut("o", modifiers: [.command])
+                .help("Open a local git repository (⌘O)")
 
                 if !workspace.recentRepos.isEmpty {
                     Menu("Recent") {
@@ -409,9 +560,11 @@ private struct EmptyWorkspaceView: View {
                             Button(url.path) {
                                 Task { await workspace.openRepository(at: url) }
                             }
+                            .help(url.path)
                         }
                     }
                     .controlSize(.large)
+                    .help("Open a recently used repository")
                 }
             }
 
@@ -473,6 +626,7 @@ private struct ErrorStateView: View {
 private struct BranchWorkspaceView: View {
     @ObservedObject var model: RepoSession
     @ObservedObject var workspace: WorkspaceModel
+    var focusedSearch: FocusState<SearchFocusTarget?>.Binding
     /// Local widths avoid publishing every drag pixel (which makes resize feel jerky).
     @State private var historyWidth: CGFloat = 270
     @State private var filesWidth: CGFloat = 340
@@ -490,7 +644,7 @@ private struct BranchWorkspaceView: View {
             }
 
             if model.showFiles {
-                FilesPane(model: model)
+                FilesPane(model: model, focusedSearch: focusedSearch)
                     .frame(width: filesWidth)
                     .frame(maxHeight: .infinity)
                 ColumnResizeHandle(width: $filesWidth, range: 240...560) {
@@ -499,7 +653,7 @@ private struct BranchWorkspaceView: View {
                 }
             }
 
-            FileInspectorView(model: model)
+            FileInspectorView(model: model, focusedSearch: focusedSearch)
                 .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -539,6 +693,7 @@ private struct ColumnResizeHandle: View {
         }
         .frame(width: 8)
         .frame(maxHeight: .infinity)
+        .help("Drag to resize column")
         .onHover { hovering in
             if hovering {
                 NSCursor.resizeLeftRight.set()
@@ -666,6 +821,9 @@ private struct CommitsPane: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
+        .help(model.selectedAuthors.isEmpty
+              ? "Filter commits by author"
+              : "Filtering by \(model.selectedAuthors.count) author\(model.selectedAuthors.count == 1 ? "" : "s")")
     }
 }
 
@@ -715,6 +873,7 @@ private struct CombinedCommitCard: View {
             )
         }
         .buttonStyle(.plain)
+        .help("Show all \(commitCount) commits as one change set")
     }
 }
 
@@ -759,6 +918,7 @@ private struct CommitCard: View {
             )
         }
         .buttonStyle(.plain)
+        .help("\(commit.shortHash): \(commit.subject)")
     }
 }
 
@@ -766,6 +926,7 @@ private struct CommitCard: View {
 
 private struct FilesPane: View {
     @ObservedObject var model: RepoSession
+    var focusedSearch: FocusState<SearchFocusTarget?>.Binding
     @State private var expandedFolderIDs: Set<FileTreeNode.ID> = []
 
     var body: some View {
@@ -784,6 +945,9 @@ private struct FilesPane: View {
                         .pickerStyle(.segmented)
                         .labelsHidden()
                         .frame(maxWidth: 150)
+                        .help(model.filesLayout == .folders
+                              ? "Folder tree layout (switch to Flat)"
+                              : "Flat list layout (switch to Folders)")
                     }
 
                     if !model.repoDirectoryPath.isEmpty {
@@ -806,6 +970,9 @@ private struct FilesPane: View {
                             .foregroundStyle(.secondary)
                         TextField("Filter files…", text: $model.fileNameQuery)
                             .textFieldStyle(.plain)
+                            .focused(focusedSearch, equals: .fileFilter)
+                            .help("Filter changed files by name (⌘F when this column is active)")
+                            .onTapGesture { model.preferFileSearch() }
                         if !model.fileNameQuery.isEmpty {
                             Button {
                                 model.fileNameQuery = ""
@@ -814,14 +981,19 @@ private struct FilesPane: View {
                                     .foregroundStyle(.secondary)
                             }
                             .buttonStyle(.plain)
+                            .help("Clear file filter")
                         }
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 6)
                     .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .help("Filter changed files by name")
+                    .onTapGesture { model.preferFileSearch() }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
+                .contentShape(Rectangle())
+                .onTapGesture { model.preferFileSearch() }
 
                 Divider().opacity(0.45)
 
@@ -858,14 +1030,20 @@ private struct FilesPane: View {
     }
 
     private var flatList: some View {
-        List(model.filteredFiles, selection: fileSelection) { file in
-            FileRow(file: file, showDirectory: true)
-                .tag(file.id)
-                .listRowInsets(EdgeInsets(top: 7, leading: 10, bottom: 7, trailing: 10))
+        List(selection: fileSelection) {
+            ForEach(model.filteredFiles) { file in
+                FileRow(file: file, showDirectory: true)
+                    .tag(file.id)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .listRowInsets(EdgeInsets(top: 7, leading: 10, bottom: 7, trailing: 10))
+            }
         }
         .listStyle(.inset)
         .scrollContentBackground(.hidden)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear { model.preferFileSearch() }
+        .simultaneousGesture(TapGesture().onEnded { model.preferFileSearch() })
     }
 
     private var folderList: some View {
@@ -877,23 +1055,31 @@ private struct FilesPane: View {
                         depth: 0,
                         selectedFileID: model.selectedFileID,
                         expandedFolderIDs: $expandedFolderIDs,
-                        onSelect: { model.selectFile($0) }
+                        onSelect: { file in
+                            model.preferFileSearch()
+                            model.selectFile(file)
+                        }
                     )
                 }
             }
             .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { model.preferFileSearch() })
     }
 
     private var fileSelection: Binding<String?> {
         Binding(
             get: { model.selectedFileID },
             set: { newValue in
-                model.selectedFileID = newValue
                 if let id = newValue,
                    let file = model.visibleFiles.first(where: { $0.id == id }) {
+                    model.preferFileSearch()
                     model.selectFile(file)
+                } else {
+                    model.selectedFileID = newValue
                 }
             }
         )
@@ -934,12 +1120,23 @@ private struct FolderTreeRow: View {
                     .padding(.leading, CGFloat(depth) * Self.iconWidth + Self.iconWidth)
                     .padding(.trailing, 8)
                     .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                     .background(
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
                             .fill(selectedFileID == file.id ? Color.accentColor.opacity(0.14) : Color.clear)
                     )
             }
             .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .help(file.path)
+            .contextMenu {
+                Button("Copy File Path") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(file.path, forType: .string)
+                }
+            }
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 Button {
@@ -976,6 +1173,7 @@ private struct FolderTreeRow: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .help(isExpanded ? "Collapse \(node.name)" : "Expand \(node.name)")
 
                 if isExpanded {
                     ForEach(node.children) { child in
@@ -1033,6 +1231,14 @@ private struct FileRow: View {
             }
             .font(.caption.monospacedDigit().weight(.semibold))
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button("Copy File Path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(file.path, forType: .string)
+            }
+        }
     }
 
     private var fileName: String {
@@ -1058,6 +1264,7 @@ private struct FileRow: View {
 
 private struct FileInspectorView: View {
     @ObservedObject var model: RepoSession
+    var focusedSearch: FocusState<SearchFocusTarget?>.Binding
 
     var body: some View {
         PanelChrome {
@@ -1069,6 +1276,8 @@ private struct FileInspectorView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
+        .contentShape(Rectangle())
+        .simultaneousGesture(TapGesture().onEnded { model.preferContentSearch() })
     }
 
     private var header: some View {
@@ -1111,6 +1320,7 @@ private struct FileInspectorView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(maxWidth: 360)
+                .help("View mode: Diff, Before, After, or side-by-side Compare")
 
                 Spacer(minLength: 8)
 
@@ -1119,11 +1329,15 @@ private struct FileInspectorView: View {
                         .foregroundStyle(.secondary)
                     TextField("Search in view…", text: $model.contentQuery)
                         .textFieldStyle(.plain)
+                        .focused(focusedSearch, equals: .content)
                         .frame(minWidth: 140, maxWidth: 220)
+                        .help("Search in the current file view (⌘F)")
+                        .onTapGesture { model.preferContentSearch() }
                     if !model.contentQuery.isEmpty {
                         Text("\(model.contentMatchCount)")
                             .font(.caption.monospacedDigit().weight(.semibold))
                             .foregroundStyle(.secondary)
+                            .help("\(model.contentMatchCount) match\(model.contentMatchCount == 1 ? "" : "es")")
                         Button {
                             model.contentQuery = ""
                         } label: {
@@ -1131,11 +1345,14 @@ private struct FileInspectorView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help("Clear content search")
                     }
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 5)
                 .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .help("Search in the current file view")
+                .onTapGesture { model.preferContentSearch() }
             }
         }
         .padding(.horizontal, 12)

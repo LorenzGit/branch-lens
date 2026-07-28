@@ -24,6 +24,11 @@ enum ChangeScope: Equatable, Hashable {
     }
 }
 
+enum SearchFocusTarget: Hashable {
+    case fileFilter
+    case content
+}
+
 struct FileInspectorPayload: Sendable {
     var diff: String
     var before: String?
@@ -59,14 +64,19 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var showFiles = true
     @Published var isLoading = false
     @Published var isLoadingFile = false
+    @Published var isUpdatingFromCompare = false
     @Published var errorMessage: String?
+    @Published var statusMessage: String?
+    @Published var searchFocusTarget: SearchFocusTarget = .content
+    /// Bumped to force the matching search field to become first responder (⌘F).
+    @Published var searchFocusNonce: Int = 0
 
     private let git = GitService()
     private var loadTask: Task<Void, Never>?
     private var fileTask: Task<Void, Never>?
     private var scopeTask: Task<Void, Never>?
     private var inspectorCache: [String: FileInspectorPayload] = [:]
-    private let cacheLimit = 64
+    private let cacheLimit = 96
 
     init(id: UUID = UUID()) {
         self.id = id
@@ -318,7 +328,47 @@ final class RepoSession: ObservableObject, Identifiable {
         Task { await reloadVisibleFiles() }
     }
 
-    func reloadSnapshot(resetScope: Bool = true) async {
+    /// Toolbar refresh: fetch remotes, then reload branches + snapshot.
+    func refresh() async {
+        await reloadSnapshot(resetScope: false, fetchFirst: true)
+    }
+
+    /// Merge COMPARE (`baseBranch`) into the inspected BRANCH.
+    func updateFromCompare() async {
+        guard let repoPath else { return }
+        guard !selectedBranch.isEmpty, !baseBranch.isEmpty else { return }
+        guard selectedBranch != baseBranch else {
+            errorMessage = "Branch and Compare are the same — nothing to update."
+            return
+        }
+
+        isUpdatingFromCompare = true
+        errorMessage = nil
+        statusMessage = "Updating \(selectedBranch) from \(baseBranch)…"
+
+        do {
+            // Prefer fresh remote tips before merging.
+            try? await git.fetchRemotes(in: repoPath)
+            try await git.merge(source: baseBranch, into: selectedBranch, in: repoPath)
+            await reloadSnapshot(resetScope: true, fetchFirst: false)
+            statusMessage = "Updated \(selectedBranch) with \(baseBranch)."
+            isUpdatingFromCompare = false
+            // Clear the success toast shortly after.
+            let message = statusMessage
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                if statusMessage == message {
+                    statusMessage = nil
+                }
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+            isUpdatingFromCompare = false
+        }
+    }
+
+    func reloadSnapshot(resetScope: Bool = true, fetchFirst: Bool = false) async {
         guard let repoPath else { return }
         guard !selectedBranch.isEmpty, !baseBranch.isEmpty else {
             snapshot = nil
@@ -330,10 +380,27 @@ final class RepoSession: ObservableObject, Identifiable {
         let base = baseBranch
         isLoading = true
         errorMessage = nil
+        if fetchFirst {
+            statusMessage = "Fetching…"
+        }
         persistMemory()
 
         loadTask = Task {
             do {
+                if fetchFirst {
+                    do {
+                        try await git.fetchRemotes(in: repoPath)
+                    } catch {
+                        // Still reload local state; surface fetch failure.
+                        guard !Task.isCancelled else { return }
+                        errorMessage = "Fetch failed: \(error.localizedDescription)"
+                    }
+                    let listed = (try? await git.listBranches(in: repoPath)) ?? []
+                    if !listed.isEmpty {
+                        branches = listed
+                    }
+                }
+
                 let snap = try await git.loadSnapshot(repo: repoPath, branch: branch, baseBranch: base)
                 guard !Task.isCancelled else { return }
                 snapshot = snap
@@ -348,6 +415,11 @@ final class RepoSession: ObservableObject, Identifiable {
                 }
                 clearInspectorCache()
                 isLoading = false
+                if fetchFirst, errorMessage == nil {
+                    statusMessage = nil
+                } else if !fetchFirst {
+                    statusMessage = nil
+                }
                 await reloadVisibleFiles()
                 notifyStateChange()
             } catch is CancellationError {
@@ -358,6 +430,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 visibleFiles = []
                 clearFileInspector()
                 errorMessage = error.localizedDescription
+                statusMessage = nil
                 isLoading = false
             }
         }
@@ -367,9 +440,31 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     func selectFile(_ file: ChangedFile) {
+        // Keep searchFocusTarget as-is so ⌘F still targets the column the user
+        // was interacting with (files filter vs inspector content).
+        let alreadySelected = selectedFileID == file.id
         selectedFileID = file.id
         notifyStateChange()
+        if alreadySelected, !(beforeContents == nil && afterContents == nil && fileDiff.isEmpty) {
+            return
+        }
         Task { await loadFileInspector(for: file) }
+    }
+
+    func preferFileSearch() {
+        searchFocusTarget = .fileFilter
+    }
+
+    func preferContentSearch() {
+        searchFocusTarget = .content
+    }
+
+    func activateFindShortcut() {
+        // If the files column is hidden, always search content.
+        if !showFiles {
+            searchFocusTarget = .content
+        }
+        searchFocusNonce &+= 1
     }
 
     func reloadVisibleFiles() async {
@@ -423,6 +518,7 @@ final class RepoSession: ObservableObject, Identifiable {
 
     private func clearInspectorCache() {
         inspectorCache.removeAll(keepingCapacity: true)
+        HighlightRenderCache.clear()
     }
 
     private func cacheKey(for file: ChangedFile, snapshot: BranchSnapshot) -> String {
@@ -466,13 +562,10 @@ final class RepoSession: ObservableObject, Identifiable {
             return
         }
 
+        // Avoid cancelling an in-flight load for the same file.
         fileTask?.cancel()
         isLoadingFile = true
-        // Keep previous content visible while loading a cache miss — only clear if empty.
-        if fileDiff.isEmpty {
-            beforeContents = nil
-            afterContents = nil
-        }
+        // Keep previous file visible until the new payload arrives (no flicker/clear).
 
         let repo = snapshot.repoPath
         let beforePath = file.oldPath ?? file.path

@@ -84,6 +84,8 @@ public struct BranchSnapshot: Sendable {
     public let mergeBaseShort: String
     public let commits: [GitCommit]
     public let files: [ChangedFile]
+    /// Commits on `baseBranch` that are not on `branch` (COMPARE is ahead).
+    public let compareAheadCount: Int
     public let aheadOfRemote: Int?
     public let behindRemote: Int?
     public let remoteTrackingBranch: String?
@@ -99,6 +101,7 @@ public struct BranchSnapshot: Sendable {
         mergeBaseShort: String,
         commits: [GitCommit],
         files: [ChangedFile],
+        compareAheadCount: Int,
         aheadOfRemote: Int?,
         behindRemote: Int?,
         remoteTrackingBranch: String?
@@ -110,6 +113,7 @@ public struct BranchSnapshot: Sendable {
         self.mergeBaseShort = mergeBaseShort
         self.commits = commits
         self.files = files
+        self.compareAheadCount = compareAheadCount
         self.aheadOfRemote = aheadOfRemote
         self.behindRemote = behindRemote
         self.remoteTrackingBranch = remoteTrackingBranch

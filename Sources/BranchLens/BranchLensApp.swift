@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -14,7 +15,20 @@ struct BranchLensApp: App {
                 }
                 .keyboardShortcut("o", modifiers: [.command])
             }
+            CommandGroup(replacing: .appInfo) {
+                Button("About BranchLens") {
+                    showAboutPanel()
+                }
+            }
         }
+    }
+
+    private func showAboutPanel() {
+        // Copyright comes from Info.plist (`NSHumanReadableCopyright`).
+        // Don't also pass `.credits` with the same text or it appears twice.
+        NSApplication.shared.orderFrontStandardAboutPanel(options: [
+            .applicationName: "BranchLens",
+        ])
     }
 }
 

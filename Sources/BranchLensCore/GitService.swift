@@ -55,6 +55,39 @@ public actor GitService {
         return branches.first
     }
 
+    /// Fetch all remotes so local remote-tracking refs are up to date.
+    public func fetchRemotes(in repo: URL) async throws {
+        _ = try await runGit(["fetch", "--all", "--prune"], in: repo)
+    }
+
+    public func commitCount(in repo: URL, from: String, to: String) async throws -> Int {
+        let output = try await runGit(
+            ["rev-list", "--count", "\(from)..\(to)"],
+            in: repo
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(output) ?? 0
+    }
+
+    public func isWorkingTreeClean(in repo: URL) async throws -> Bool {
+        let status = try await runGit(["status", "--porcelain"], in: repo)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return status.isEmpty
+    }
+
+    /// Checkout `target` if needed, then merge `source` into it.
+    public func merge(source: String, into target: String, in repo: URL) async throws {
+        let current = try await currentBranch(in: repo)
+        if current != target {
+            guard try await isWorkingTreeClean(in: repo) else {
+                throw GitError.commandFailed(
+                    "Working tree has uncommitted changes. Commit or stash before updating “\(target)”."
+                )
+            }
+            _ = try await runGit(["checkout", target], in: repo)
+        }
+        _ = try await runGit(["merge", "--no-edit", source], in: repo)
+    }
+
     public func loadSnapshot(
         repo: URL,
         branch: String,
@@ -76,6 +109,7 @@ public actor GitService {
 
         let commits = try await listCommits(in: repo, from: mergeBase, to: branch)
         let files = try await listChangedFiles(in: repo, from: mergeBase, to: branch)
+        let compareAheadCount = try await commitCount(in: repo, from: branch, to: baseBranch)
         let remote = try await remoteTrackingInfo(in: repo, branch: branch)
 
         return BranchSnapshot(
@@ -86,6 +120,7 @@ public actor GitService {
             mergeBaseShort: mergeBaseShort,
             commits: commits,
             files: files,
+            compareAheadCount: compareAheadCount,
             aheadOfRemote: remote.ahead,
             behindRemote: remote.behind,
             remoteTrackingBranch: remote.tracking
