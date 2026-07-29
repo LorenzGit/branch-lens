@@ -190,16 +190,17 @@ struct DiffScrollView: NSViewRepresentable {
     let text: String
     let path: String
     var searchQuery: String = ""
+    /// When false, sizes to content (no nested scroller) via intrinsic height.
+    var allowsScrolling: Bool = true
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
-        scroll.autohidesScrollers = true
+        let scroll = FittingScrollView()
+        configureScrolling(scroll)
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
 
         let textView = NSTextView()
         textView.isEditable = false
@@ -221,15 +222,77 @@ struct DiffScrollView: NSViewRepresentable {
 
         scroll.documentView = textView
         context.coordinator.textView = textView
+        context.coordinator.scrollView = scroll
+        if !allowsScrolling {
+            scroll.fittingHeight = Self.estimatedHeight(for: text)
+        }
         scheduleApply(to: textView, coordinator: context.coordinator, cacheKey: contentKey())
         return scroll
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        configureScrolling(scrollView)
+        context.coordinator.scrollView = scrollView as? FittingScrollView
         guard let textView = context.coordinator.textView ?? scrollView.documentView as? NSTextView else { return }
         let key = contentKey()
-        guard context.coordinator.renderedKey != key else { return }
+        guard context.coordinator.renderedKey != key else {
+            if !allowsScrolling, let fitted = scrollView as? FittingScrollView, fitted.fittingHeight <= 0 {
+                fitted.fittingHeight = Self.estimatedHeight(for: text)
+            }
+            return
+        }
+        if !allowsScrolling, let fitted = scrollView as? FittingScrollView {
+            fitted.fittingHeight = Self.estimatedHeight(for: text)
+        }
         scheduleApply(to: textView, coordinator: context.coordinator, cacheKey: key)
+    }
+
+    private func configureScrolling(_ scroll: NSScrollView) {
+        if let fitted = scroll as? FittingScrollView {
+            fitted.allowsScrolling = allowsScrolling
+        }
+        scroll.hasVerticalScroller = allowsScrolling
+        scroll.hasHorizontalScroller = allowsScrolling
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.verticalScrollElasticity = allowsScrolling ? .automatic : .none
+        scroll.horizontalScrollElasticity = allowsScrolling ? .automatic : .none
+        scroll.contentView.drawsBackground = false
+        scroll.drawsBackground = false
+    }
+
+    static func estimatedHeight(for text: String) -> CGFloat {
+        let font = AppTheme.monoNS
+        let lineHeight = max(font.ascender - font.descender + font.leading, 14)
+        let lineCount = text.isEmpty ? 1 : text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+        return max(CGFloat(lineCount) * lineHeight + 24, 40)
+    }
+
+    /// Forwards wheel/trackpad scrolling when embedded without its own scroller,
+    /// and reports intrinsic height so LazyVStack does not stretch the view.
+    final class FittingScrollView: NSScrollView {
+        var allowsScrolling = true
+        var fittingHeight: CGFloat = NSView.noIntrinsicMetric {
+            didSet {
+                guard fittingHeight != oldValue else { return }
+                invalidateIntrinsicContentSize()
+            }
+        }
+
+        override var intrinsicContentSize: NSSize {
+            guard !allowsScrolling, fittingHeight > 0 else {
+                return NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+            }
+            return NSSize(width: NSView.noIntrinsicMetric, height: fittingHeight)
+        }
+
+        override func scrollWheel(with event: NSEvent) {
+            if allowsScrolling {
+                super.scrollWheel(with: event)
+            } else {
+                nextResponder?.scrollWheel(with: event)
+            }
+        }
     }
 
     private func contentKey() -> String {
@@ -240,9 +303,10 @@ struct DiffScrollView: NSViewRepresentable {
         let cacheKey = cacheKey ?? contentKey()
         coordinator.renderGeneration &+= 1
         let generation = coordinator.renderGeneration
+        let allowsScrolling = self.allowsScrolling
 
         if let cached = HighlightRenderCache.get(cacheKey) {
-            applyEntry(cached, to: textView)
+            applyEntry(cached, to: textView, coordinator: coordinator, allowsScrolling: allowsScrolling)
             coordinator.renderedKey = cacheKey
             return
         }
@@ -269,26 +333,34 @@ struct DiffScrollView: NSViewRepresentable {
             _ = SearchHighlight.apply(to: attributed, query: searchQuery)
             let maxChars = HighlightRenderCache.maxLineCharacterCount(in: attributed.string)
             let width = HighlightRenderCache.estimateWidth(lineCharacterCounts: maxChars, padding: 48)
-            let lineCount = text.isEmpty ? 1 : text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
-            let height = max(CGFloat(lineCount) * max(lineHeight, 14) + 24, 40)
+            let displayedLineCount = max(attributed.string.isEmpty ? 1 : attributed.string.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }, 1)
+            let height = max(CGFloat(displayedLineCount) * max(lineHeight, 14) + 24, 40)
             let entry = HighlightRenderCache.Entry(attributed: attributed, width: width, height: height)
             HighlightRenderCache.set(cacheKey, entry: entry)
 
             await MainActor.run {
                 guard !Task.isCancelled, coordinator.renderGeneration == generation else { return }
-                applyEntry(entry, to: textView)
+                applyEntry(entry, to: textView, coordinator: coordinator, allowsScrolling: allowsScrolling)
                 coordinator.renderedKey = cacheKey
             }
         }
     }
 
-    private func applyEntry(_ entry: HighlightRenderCache.Entry, to textView: NSTextView) {
+    private func applyEntry(
+        _ entry: HighlightRenderCache.Entry,
+        to textView: NSTextView,
+        coordinator: Coordinator,
+        allowsScrolling: Bool
+    ) {
         textView.textStorage?.setAttributedString(entry.attributed)
         textView.frame = NSRect(x: 0, y: 0, width: entry.width, height: entry.height)
         textView.textContainer?.containerSize = NSSize(
             width: CGFloat.greatestFiniteMagnitude,
             height: CGFloat.greatestFiniteMagnitude
         )
+        if !allowsScrolling, let scroll = coordinator.scrollView {
+            scroll.fittingHeight = entry.height
+        }
         if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let full = entry.attributed.string as NSString
             let found = full.range(of: searchQuery, options: [.caseInsensitive, .diacriticInsensitive])
@@ -298,6 +370,7 @@ struct DiffScrollView: NSViewRepresentable {
 
     final class Coordinator {
         var textView: NSTextView?
+        weak var scrollView: FittingScrollView?
         var renderedKey: String?
         var renderGeneration: Int = 0
         var renderTask: Task<Void, Never>?

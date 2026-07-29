@@ -27,6 +27,31 @@ public struct DiffLine: Identifiable, Sendable, Hashable {
     }
 }
 
+public struct DiffHunk: Identifiable, Hashable, Sendable {
+    public let id: Int
+    public let header: String
+    public let body: [DiffLine]
+
+    public init(id: Int, header: String, body: [DiffLine]) {
+        self.id = id
+        self.header = header
+        self.body = body
+    }
+
+    public var isSyntheticUntracked: Bool {
+        header.contains("untracked")
+    }
+
+    public var changeCount: Int {
+        body.reduce(0) { count, line in
+            switch line.kind {
+            case .addition, .deletion: return count + 1
+            default: return count
+            }
+        }
+    }
+}
+
 public enum DiffParser {
     /// Old-file line numbers that were deleted, and new-file line numbers that were added.
     public static func changedLineNumbers(in text: String) -> (deleted: Set<Int>, added: Set<Int>) {
@@ -43,6 +68,63 @@ public enum DiffParser {
             }
         }
         return (deleted, added)
+    }
+
+    /// Group parsed diff lines into hunks (header + body until the next hunk).
+    public static func hunks(in text: String) -> [DiffHunk] {
+        let lines = parse(text)
+        var result: [DiffHunk] = []
+        var currentHeader: String?
+        var currentID = 0
+        var body: [DiffLine] = []
+
+        func flush() {
+            guard let header = currentHeader else { return }
+            result.append(DiffHunk(id: currentID, header: header, body: body))
+            body = []
+            currentHeader = nil
+        }
+
+        for line in lines {
+            switch line.kind {
+            case .hunk:
+                flush()
+                currentHeader = line.raw
+                currentID = line.id
+            case .addition, .deletion, .context:
+                if currentHeader != nil {
+                    body.append(line)
+                }
+            case .meta, .header:
+                break
+            }
+        }
+        flush()
+        return result
+    }
+
+    /// Build a standalone unified patch for one hunk that `git apply --cached` can consume.
+    public static func patch(
+        for hunk: DiffHunk,
+        path: String,
+        oldPath: String? = nil,
+        originalDiff: String
+    ) -> String? {
+        guard !hunk.isSyntheticUntracked else { return nil }
+        guard hunk.header.hasPrefix("@@") else { return nil }
+
+        let meta = parse(originalDiff).filter { $0.kind == .meta }.map(\.raw)
+        let diffGit = meta.first(where: { $0.hasPrefix("diff --git ") })
+            ?? "diff --git a/\(oldPath ?? path) b/\(path)"
+        let oldHeader = meta.last(where: { $0.hasPrefix("--- ") })
+            ?? "--- a/\(oldPath ?? path)"
+        let newHeader = meta.last(where: { $0.hasPrefix("+++ ") })
+            ?? "+++ b/\(path)"
+
+        var lines = [diffGit, oldHeader, newHeader, hunk.header]
+        lines.append(contentsOf: hunk.body.map(\.raw))
+        // git apply is happier with a trailing newline.
+        return lines.joined(separator: "\n") + "\n"
     }
 
     public static func parse(_ text: String) -> [DiffLine] {

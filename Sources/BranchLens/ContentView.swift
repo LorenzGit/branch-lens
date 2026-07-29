@@ -35,9 +35,15 @@ struct ContentView: View {
             await workspace.restoreIfNeeded()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .inactive || phase == .background {
+            if phase == .active {
+                Task { await workspace.refreshActiveTabIfNeeded() }
+            } else if phase == .inactive || phase == .background {
                 workspace.saveNow()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            // scenePhase can miss some macOS focus transitions; this backs it up.
+            Task { await workspace.refreshActiveTabIfNeeded() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .openRepository)) { _ in
             workspace.openRepositoryPicker()
@@ -95,6 +101,17 @@ private struct SessionContainer: View {
             .opacity(0)
             .frame(width: 0, height: 0)
             .accessibilityHidden(true)
+
+            Button("Find in Files") {
+                session.openCrossFileSearch()
+            }
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+        }
+        .sheet(isPresented: $session.isCrossFileSearchPresented) {
+            CrossFileSearchSheet(model: session)
         }
         .onChange(of: session.searchFocusNonce) { _, _ in
             focusedSearch = session.searchFocusTarget
@@ -264,7 +281,7 @@ private struct ToolbarView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(model.isLoading || model.isUpdatingFromCompare)
-                    .help("Fetch remotes and reload this branch")
+                    .help("Fetch remotes and reload this branch (also resets the 3-minute auto-refresh cooldown)")
                 } else {
                     Spacer()
                 }
@@ -1111,7 +1128,11 @@ private struct CommitsPane: View {
                                 icon: "plus.circle.fill",
                                 tint: AppTheme.additionText,
                                 fileCount: model.stagedWorkingTreeFiles.count,
-                                isSelected: model.changeScope == .staged
+                                isSelected: model.changeScope == .staged,
+                                contextActionTitle: model.stagedWorkingTreeFiles.isEmpty ? nil : "Unstage All",
+                                onContextAction: {
+                                    Task { await model.unstageAllStaged() }
+                                }
                             ) {
                                 model.selectStaged()
                             }
@@ -1122,7 +1143,11 @@ private struct CommitsPane: View {
                                 icon: "pencil.circle.fill",
                                 tint: Color.orange,
                                 fileCount: model.unstagedWorkingTreeFiles.count,
-                                isSelected: model.changeScope == .unstaged
+                                isSelected: model.changeScope == .unstaged,
+                                contextActionTitle: model.unstagedWorkingTreeFiles.isEmpty ? nil : "Stage All",
+                                onContextAction: {
+                                    Task { await model.stageAllUnstaged() }
+                                }
                             ) {
                                 model.selectUnstaged()
                             }
@@ -1331,6 +1356,8 @@ private struct LocalScopeCard: View {
     let tint: Color
     let fileCount: Int
     let isSelected: Bool
+    var contextActionTitle: String? = nil
+    var onContextAction: (() -> Void)? = nil
     let action: () -> Void
 
     var body: some View {
@@ -1367,6 +1394,11 @@ private struct LocalScopeCard: View {
         }
         .buttonStyle(.plain)
         .help("\(title): \(fileCount) file\(fileCount == 1 ? "" : "s")")
+        .contextMenu {
+            if let contextActionTitle, let onContextAction {
+                Button(contextActionTitle, action: onContextAction)
+            }
+        }
     }
 }
 
@@ -1570,6 +1602,14 @@ private struct FilesPane: View {
                         Text("Changed files")
                             .font(.headline)
                         Spacer()
+                        Button {
+                            model.openCrossFileSearch()
+                        } label: {
+                            Image(systemName: "doc.text.magnifyingglass")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Find in changed files (⌘⇧F)")
+
                         Picker("Layout", selection: $model.filesLayout) {
                             ForEach(FilesLayoutMode.allCases) { mode in
                                 Text(mode.rawValue).tag(mode)
@@ -1622,11 +1662,20 @@ private struct FilesPane: View {
                     .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .help("Filter changed files by name")
                     .onTapGesture { model.preferFileSearch() }
+
+                    if !model.crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        activeCrossFileChip
+                    }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
                 .contentShape(Rectangle())
                 .onTapGesture { model.preferFileSearch() }
+                .onChange(of: model.fileNameQuery) { _, _ in
+                    if !model.crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        model.scheduleCrossFileSearch()
+                    }
+                }
 
                 Divider().opacity(0.45)
 
@@ -1634,7 +1683,7 @@ private struct FilesPane: View {
                     ContentUnavailableView(
                         model.visibleFiles.isEmpty ? "No file changes" : "No matching files",
                         systemImage: "folder",
-                        description: Text(model.visibleFiles.isEmpty ? "Nothing changed in this scope." : "Try a different file name filter.")
+                        description: Text(emptyFilesDescription)
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if model.filesLayout == .flat {
@@ -1663,10 +1712,66 @@ private struct FilesPane: View {
         }
     }
 
+    private var emptyFilesDescription: String {
+        if model.visibleFiles.isEmpty {
+            return "Nothing changed in this scope."
+        }
+        if !model.crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "No changed files contain that text in \(model.crossFileSearchMode.rawValue.lowercased())."
+        }
+        return "Try a different file name filter."
+    }
+
+    private var activeCrossFileChip: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "doc.text.magnifyingglass")
+                .foregroundStyle(.secondary)
+            Button {
+                model.openCrossFileSearch()
+            } label: {
+                HStack(spacing: 6) {
+                    Text(model.crossFileSearchMode.rawValue)
+                        .foregroundStyle(.secondary)
+                    Text(model.crossFileQuery)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if model.isSearchingCrossFile {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Text("\(model.crossFileMatchCounts.count)")
+                            .font(.caption.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.caption)
+            }
+            .buttonStyle(.plain)
+            .help("Edit find-in-files search")
+
+            Spacer(minLength: 0)
+
+            Button {
+                model.clearCrossFileSearch()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Clear find-in-files search")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
     private var flatList: some View {
         List(selection: fileSelection) {
             ForEach(model.filteredFiles) { file in
-                FileRow(file: file, showDirectory: true)
+                FileRow(
+                    file: file,
+                    showDirectory: true,
+                    matchCount: model.crossFileMatchCounts[file.id]
+                )
                     .tag(file.id)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
@@ -1681,6 +1786,7 @@ private struct FilesPane: View {
         .id(fileListIdentity)
         .onAppear { model.preferFileSearch() }
         .simultaneousGesture(TapGesture().onEnded { model.preferFileSearch() })
+        .help("⌘-click to add/remove; ⇧-click to select a range")
     }
 
     private var fileListIdentity: String {
@@ -1701,18 +1807,34 @@ private struct FilesPane: View {
                     FolderTreeRow(
                         node: node,
                         depth: 0,
-                        selectedFileID: model.selectedFileID,
+                        selectedFileIDs: model.selectedFileIDs,
+                        matchCounts: model.crossFileMatchCounts,
                         expandedFolderIDs: $expandedFolderIDs,
+                        canStage: { model.isUnstaged($0) },
+                        canUnstage: { model.isStaged($0) },
                         onSelect: { file in
                             model.preferFileSearch()
-                            model.selectFile(file)
+                            model.handleFileClick(file)
                         },
                         onLog: { file in
                             model.openFileLog(for: file)
                         },
                         onRevealInFinder: { file in
                             revealInFinder(relativePath: file.path)
-                        }
+                        },
+                        onStage: { file in
+                            Task { await model.stageFile(file) }
+                        },
+                        onUnstage: { file in
+                            Task { await model.unstageFile(file) }
+                        },
+                        onStageSelected: model.selectedFilesStagable.isEmpty ? nil : {
+                            Task { await model.stageSelectedFiles() }
+                        },
+                        onUnstageSelected: model.selectedFilesUnstagable.isEmpty ? nil : {
+                            Task { await model.unstageSelectedFiles() }
+                        },
+                        multiSelectionCount: model.selectedFileIDs.count
                     )
                 }
             }
@@ -1727,6 +1849,36 @@ private struct FilesPane: View {
 
     @ViewBuilder
     private func fileContextMenu(for file: ChangedFile) -> some View {
+        let multi = model.selectedFileIDs.count > 1 && model.selectedFileIDs.contains(file.id)
+        if multi {
+            if !model.selectedFilesStagable.isEmpty {
+                Button("Stage Selected") {
+                    Task { await model.stageSelectedFiles() }
+                }
+            }
+            if !model.selectedFilesUnstagable.isEmpty {
+                Button("Unstage Selected") {
+                    Task { await model.unstageSelectedFiles() }
+                }
+            }
+            if !model.selectedFilesStagable.isEmpty || !model.selectedFilesUnstagable.isEmpty {
+                Divider()
+            }
+        } else {
+            if model.isUnstaged(file) {
+                Button("Stage File") {
+                    Task { await model.stageFile(file) }
+                }
+            }
+            if model.isStaged(file) {
+                Button("Unstage File") {
+                    Task { await model.unstageFile(file) }
+                }
+            }
+            if model.isUnstaged(file) || model.isStaged(file) {
+                Divider()
+            }
+        }
         Button("Log") {
             model.openFileLog(for: file)
         }
@@ -1753,17 +1905,12 @@ private struct FilesPane: View {
         }
     }
 
-    private var fileSelection: Binding<String?> {
+    private var fileSelection: Binding<Set<String>> {
         Binding(
-            get: { model.selectedFileID },
+            get: { model.selectedFileIDs },
             set: { newValue in
-                if let id = newValue,
-                   let file = model.visibleFiles.first(where: { $0.id == id }) {
-                    model.preferFileSearch()
-                    model.selectFile(file)
-                } else {
-                    model.selectedFileID = newValue
-                }
+                model.preferFileSearch()
+                model.applyListSelection(newValue)
             }
         )
     }
@@ -1786,11 +1933,19 @@ private struct FolderTreeRow: View {
 
     let node: FileTreeNode
     let depth: Int
-    let selectedFileID: String?
+    let selectedFileIDs: Set<String>
+    var matchCounts: [String: Int] = [:]
     @Binding var expandedFolderIDs: Set<FileTreeNode.ID>
+    var canStage: (ChangedFile) -> Bool = { _ in false }
+    var canUnstage: (ChangedFile) -> Bool = { _ in false }
     let onSelect: (ChangedFile) -> Void
     let onLog: (ChangedFile) -> Void
     let onRevealInFinder: (ChangedFile) -> Void
+    var onStage: ((ChangedFile) -> Void)? = nil
+    var onUnstage: ((ChangedFile) -> Void)? = nil
+    var onStageSelected: (() -> Void)? = nil
+    var onUnstageSelected: (() -> Void)? = nil
+    var multiSelectionCount: Int = 0
 
     private var isExpanded: Bool {
         expandedFolderIDs.contains(node.id)
@@ -1801,7 +1956,11 @@ private struct FolderTreeRow: View {
             Button {
                 onSelect(file)
             } label: {
-                FileRow(file: file, showDirectory: false)
+                FileRow(
+                    file: file,
+                    showDirectory: false,
+                    matchCount: matchCounts[file.id]
+                )
                     .padding(.leading, CGFloat(depth) * Self.iconWidth + Self.iconWidth)
                     .padding(.trailing, 8)
                     .padding(.vertical, 6)
@@ -1809,7 +1968,7 @@ private struct FolderTreeRow: View {
                     .contentShape(Rectangle())
                     .background(
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(selectedFileID == file.id ? Color.accentColor.opacity(0.14) : Color.clear)
+                            .fill(selectedFileIDs.contains(file.id) ? Color.accentColor.opacity(0.14) : Color.clear)
                     )
             }
             .buttonStyle(.plain)
@@ -1817,6 +1976,28 @@ private struct FolderTreeRow: View {
             .contentShape(Rectangle())
             .help(file.path)
             .contextMenu {
+                let multi = multiSelectionCount > 1 && selectedFileIDs.contains(file.id)
+                if multi {
+                    if let onStageSelected {
+                        Button("Stage Selected") { onStageSelected() }
+                    }
+                    if let onUnstageSelected {
+                        Button("Unstage Selected") { onUnstageSelected() }
+                    }
+                    if onStageSelected != nil || onUnstageSelected != nil {
+                        Divider()
+                    }
+                } else {
+                    if canStage(file), let onStage {
+                        Button("Stage File") { onStage(file) }
+                    }
+                    if canUnstage(file), let onUnstage {
+                        Button("Unstage File") { onUnstage(file) }
+                    }
+                    if canStage(file) || canUnstage(file) {
+                        Divider()
+                    }
+                }
                 Button("Log") { onLog(file) }
                 Button("Copy File Path") {
                     NSPasteboard.general.clearContents()
@@ -1867,11 +2048,19 @@ private struct FolderTreeRow: View {
                         FolderTreeRow(
                             node: child,
                             depth: depth + 1,
-                            selectedFileID: selectedFileID,
+                            selectedFileIDs: selectedFileIDs,
+                            matchCounts: matchCounts,
                             expandedFolderIDs: $expandedFolderIDs,
+                            canStage: canStage,
+                            canUnstage: canUnstage,
                             onSelect: onSelect,
                             onLog: onLog,
-                            onRevealInFinder: onRevealInFinder
+                            onRevealInFinder: onRevealInFinder,
+                            onStage: onStage,
+                            onUnstage: onUnstage,
+                            onStageSelected: onStageSelected,
+                            onUnstageSelected: onUnstageSelected,
+                            multiSelectionCount: multiSelectionCount
                         )
                     }
                 }
@@ -1883,6 +2072,7 @@ private struct FolderTreeRow: View {
 private struct FileRow: View {
     let file: ChangedFile
     var showDirectory: Bool = true
+    var matchCount: Int? = nil
 
     var body: some View {
         HStack(spacing: 10) {
@@ -1907,6 +2097,16 @@ private struct FileRow: View {
             }
 
             Spacer(minLength: 4)
+
+            if let matchCount, matchCount > 0 {
+                Text("\(matchCount)")
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.14), in: Capsule())
+                    .help("\(matchCount) match\(matchCount == 1 ? "" : "es")")
+            }
 
             VStack(alignment: .trailing, spacing: 1) {
                 if file.additions > 0 {
@@ -1943,6 +2143,158 @@ private struct FileRow: View {
     }
 }
 
+// MARK: - Find in files
+
+private struct CrossFileSearchSheet: View {
+    @ObservedObject var model: RepoSession
+    @FocusState private var queryFocused: Bool
+    @Environment(\.dismiss) private var dismiss
+
+    private var matches: [(file: ChangedFile, count: Int)] {
+        model.nameFilteredFiles.compactMap { file in
+            guard let count = model.crossFileMatchCounts[file.id] else { return nil }
+            return (file, count)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Text("Find in Files")
+                    .font(.headline)
+                Spacer()
+                Button("Done") {
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+
+            Divider().opacity(0.45)
+
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 8) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search in changed files…", text: $model.crossFileQuery)
+                        .textFieldStyle(.plain)
+                        .focused($queryFocused)
+                        .onSubmit { model.scheduleCrossFileSearch() }
+                    if model.isSearchingCrossFile {
+                        ProgressView().controlSize(.small)
+                    } else if !model.crossFileQuery.isEmpty {
+                        Button {
+                            model.clearCrossFileSearch()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear search")
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                Picker("Search scope", selection: $model.crossFileSearchMode) {
+                    ForEach(CrossFileSearchMode.allCases) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .help("Full Source searches file contents; Modifications searches only added/removed diff lines")
+
+                Text(statusLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(16)
+
+            Divider().opacity(0.45)
+
+            Group {
+                if model.crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    ContentUnavailableView(
+                        "Search changed files",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text("Choose Full Source or Modifications, then enter a search string.")
+                    )
+                } else if model.isSearchingCrossFile && matches.isEmpty {
+                    ProgressView("Searching…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if matches.isEmpty {
+                    ContentUnavailableView(
+                        "No matches",
+                        systemImage: "magnifyingglass",
+                        description: Text("No changed files contain that text in \(model.crossFileSearchMode.rawValue.lowercased()).")
+                    )
+                } else {
+                    List(matches, id: \.file.id) { item in
+                        Button {
+                            model.selectFile(item.file)
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 10) {
+                                Text(item.file.status.rawValue)
+                                    .font(.caption.weight(.bold).monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 22)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text((item.file.path as NSString).lastPathComponent)
+                                        .font(.callout.weight(.medium))
+                                        .lineLimit(1)
+                                    Text(item.file.path)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.head)
+                                }
+                                Spacer(minLength: 4)
+                                Text("\(item.count)")
+                                    .font(.caption.monospacedDigit().weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 2)
+                                    .background(Color.accentColor.opacity(0.14), in: Capsule())
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .listStyle(.inset)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: 520, minHeight: 420)
+        .onAppear {
+            model.scheduleCrossFileSearch()
+            DispatchQueue.main.async {
+                queryFocused = true
+            }
+        }
+        .onChange(of: model.crossFileQuery) { _, _ in
+            model.scheduleCrossFileSearch()
+        }
+        .onChange(of: model.crossFileSearchMode) { _, _ in
+            model.scheduleCrossFileSearch()
+        }
+    }
+
+    private var statusLine: String {
+        let query = model.crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if query.isEmpty {
+            return "Searches the current Changed files scope."
+        }
+        if model.isSearchingCrossFile {
+            return "Searching \(model.nameFilteredFiles.count) file\(model.nameFilteredFiles.count == 1 ? "" : "s")…"
+        }
+        return "\(matches.count) matching file\(matches.count == 1 ? "" : "s") · \(model.crossFileSearchMode.rawValue)"
+    }
+}
+
 // MARK: - Inspector
 
 private struct FileInspectorView: View {
@@ -1952,15 +2304,68 @@ private struct FileInspectorView: View {
     var body: some View {
         PanelChrome {
             VStack(alignment: .leading, spacing: 0) {
-                header
-                Divider().opacity(0.45)
-                content
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if model.hasMultiFileSelection {
+                    multiSelectPanel
+                } else {
+                    header
+                    Divider().opacity(0.45)
+                    content
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .contentShape(Rectangle())
-        .simultaneousGesture(TapGesture().onEnded { model.preferContentSearch() })
+        .simultaneousGesture(TapGesture().onEnded {
+            if !model.hasMultiFileSelection {
+                model.preferContentSearch()
+            }
+        })
+    }
+
+    private var multiSelectPanel: some View {
+        VStack(spacing: 18) {
+            Spacer(minLength: 0)
+            Image(systemName: "doc.on.doc")
+                .font(.system(size: 36, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("\(model.selectedFileIDs.count) files selected")
+                .font(.title3.weight(.semibold))
+            Text("⌘-click to add or remove · ⇧-click for a range")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 12) {
+                if !model.selectedFilesStagable.isEmpty {
+                    Button("Stage Selected") {
+                        Task { await model.stageSelectedFiles() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .help("Stage \(model.selectedFilesStagable.count) selected file\(model.selectedFilesStagable.count == 1 ? "" : "s")")
+                }
+                if !model.selectedFilesUnstagable.isEmpty {
+                    Button("Unstage Selected") {
+                        Task { await model.unstageSelectedFiles() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .help("Unstage \(model.selectedFilesUnstagable.count) selected file\(model.selectedFilesUnstagable.count == 1 ? "" : "s")")
+                }
+            }
+
+            if model.selectedFilesStagable.isEmpty && model.selectedFilesUnstagable.isEmpty {
+                Text("Selected files are not in the working tree staging areas.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24)
     }
 
     private var header: some View {
@@ -2005,6 +2410,23 @@ private struct FileInspectorView: View {
                     .labelsHidden()
                     .frame(maxWidth: 360)
                     .help("View mode: Diff, Before, After, or side-by-side Compare")
+                }
+
+                if let file = model.selectedFile, model.isUnstaged(file) {
+                    Button("Stage File") {
+                        Task { await model.stageFile(file) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("Stage this file into the index")
+                }
+                if let file = model.selectedFile, model.isStaged(file) {
+                    Button("Unstage File") {
+                        Task { await model.unstageFile(file) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("Unstage this file from the index")
                 }
 
                 Spacer(minLength: 8)
@@ -2096,13 +2518,33 @@ private struct FileInspectorView: View {
         } else {
             switch model.fileViewMode {
             case .diff:
-                DiffScrollView(
-                    text: model.fileDiff,
-                    path: model.selectedFile?.path ?? "file.txt",
-                    searchQuery: model.contentQuery
-                )
-                .id("diff-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if let file = model.selectedFile,
+                   model.changeScope == .unstaged || model.changeScope == .staged {
+                    HunkDiffView(
+                        text: model.fileDiff,
+                        path: file.path,
+                        searchQuery: model.contentQuery,
+                        actionTitle: model.changeScope == .staged ? "Unstage Hunk" : "Stage Hunk"
+                    ) { hunk in
+                        Task {
+                            if model.changeScope == .staged {
+                                await model.unstageHunk(hunk, for: file)
+                            } else {
+                                await model.stageHunk(hunk, for: file)
+                            }
+                        }
+                    }
+                    .id("hunks-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    DiffScrollView(
+                        text: model.fileDiff,
+                        path: model.selectedFile?.path ?? "file.txt",
+                        searchQuery: model.contentQuery
+                    )
+                    .id("diff-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
             case .before:
                 CodePane(
                     title: "Before",

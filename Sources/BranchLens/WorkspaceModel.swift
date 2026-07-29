@@ -55,8 +55,17 @@ final class WorkspaceModel: ObservableObject {
     }
 
     func selectTab(_ id: UUID) {
+        let changed = activeTabID != id
         activeTabID = id
         scheduleSave()
+        if changed {
+            Task { await refreshActiveTabIfNeeded() }
+        }
+    }
+
+    /// Fetch+reload the active tab if its auto-fetch cooldown has elapsed.
+    func refreshActiveTabIfNeeded() async {
+        await activeSession?.refreshIfStale()
     }
 
     func openRepositoryPicker() {

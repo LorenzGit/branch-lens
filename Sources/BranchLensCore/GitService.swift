@@ -433,6 +433,50 @@ public actor GitService {
         return try await runGit(args, in: repo)
     }
 
+    /// Stage paths in the index (`git add -- …`). Works for modified, deleted, and untracked.
+    public func stagePaths(_ paths: [String], in repo: URL) async throws {
+        let cleaned = paths.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return }
+        _ = try await runGit(["add", "--"] + cleaned, in: repo)
+    }
+
+    /// Unstage paths (`git restore --staged -- …`).
+    public func unstagePaths(_ paths: [String], in repo: URL) async throws {
+        let cleaned = paths.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return }
+        _ = try await runGit(["restore", "--staged", "--"] + cleaned, in: repo)
+    }
+
+    /// Apply a unified diff to the index. `reverse: true` unstages the hunk.
+    public func applyPatchToIndex(
+        _ patch: String,
+        in repo: URL,
+        reverse: Bool
+    ) async throws {
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-\(UUID().uuidString).patch")
+        defer { try? FileManager.default.removeItem(at: temp) }
+        try patch.data(using: .utf8)?.write(to: temp)
+
+        var args = ["apply", "--cached", "--whitespace=nowarn"]
+        if reverse { args.append("--reverse") }
+        args.append(contentsOf: ["--", temp.path])
+
+        let result = try await ProcessRunner.run(
+            executable: gitURL,
+            arguments: args,
+            currentDirectory: repo
+        )
+        if result.status != 0 {
+            let message = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw GitError.commandFailed(
+                message.isEmpty
+                    ? "git apply --cached failed (\(result.status))"
+                    : message
+            )
+        }
+    }
+
     /// Diff from a revision (e.g. merge-base) through the working tree (includes commits + local edits).
     public func worktreeDiff(
         in repo: URL,

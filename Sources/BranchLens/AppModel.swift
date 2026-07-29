@@ -31,7 +31,15 @@ enum ChangeScope: Equatable, Hashable {
 
 enum SearchFocusTarget: Hashable {
     case fileFilter
+    case crossFile
     case content
+}
+
+enum CrossFileSearchMode: String, CaseIterable, Identifiable {
+    case fullSource = "Full Source"
+    case modifications = "Modifications"
+
+    var id: String { rawValue }
 }
 
 enum SidePaneMode: String, CaseIterable, Identifiable {
@@ -86,6 +94,8 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var snapshot: BranchSnapshot?
     @Published var changeScope: ChangeScope = .combined
     @Published var selectedFileID: String?
+    /// Multi-select set (⌘/⇧ click). Primary/last focus stays in `selectedFileID`.
+    @Published var selectedFileIDs: Set<String> = []
     @Published var fileViewMode: FileViewMode = .diff
     @Published var visibleFiles: [ChangedFile] = []
     @Published var fileDiff: String = ""
@@ -96,6 +106,14 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var selectedAuthors: Set<String> = []
     @Published var fileNameQuery: String = ""
     @Published var contentQuery: String = ""
+    /// Search string across all changed files (filters the Files list).
+    @Published var crossFileQuery: String = ""
+    @Published var crossFileSearchMode: CrossFileSearchMode = .modifications
+    /// path → match count for the active cross-file query.
+    @Published var crossFileMatchCounts: [String: Int] = [:]
+    @Published var isSearchingCrossFile = false
+    /// Find-in-files tool sheet (not always visible in the Files pane).
+    @Published var isCrossFileSearchPresented = false
     @Published var filesLayout: FilesLayoutMode = .folders
     @Published var showHistory = true
     @Published var showFiles = true
@@ -155,9 +173,15 @@ final class RepoSession: ObservableObject, Identifiable {
     private var pullRequestTask: Task<Void, Never>?
     private var commitPRTask: Task<Void, Never>?
     private var mergedIntoCompareTask: Task<Void, Never>?
+    private var crossFileSearchTask: Task<Void, Never>?
     private var inspectorCache: [String: FileInspectorPayload] = [:]
     private let cacheLimit = 96
     private let commitPRLookupLimit = 60
+    /// Anchor for Shift+Click range selection.
+    private var selectionAnchorID: String?
+    /// Last fetch+reload (auto or manual). Auto-refresh is skipped within the cooldown.
+    private var lastFetchRefreshAt: Date?
+    private static let autoFetchCooldown: TimeInterval = 3 * 60
 
     init(id: UUID = UUID()) {
         self.id = id
@@ -226,6 +250,13 @@ final class RepoSession: ObservableObject, Identifiable {
         }
 
         selectedFileID = state.selectedFileID
+        if let id = state.selectedFileID {
+            selectedFileIDs = [id]
+            selectionAnchorID = id
+        } else {
+            selectedFileIDs = []
+            selectionAnchorID = nil
+        }
         if includeLocalChanges {
             await reloadWorkingTree()
         }
@@ -236,7 +267,24 @@ final class RepoSession: ObservableObject, Identifiable {
     var selectedFile: ChangedFile? {
         guard let selectedFileID else { return nil }
         return visibleFiles.first { $0.id == selectedFileID }
-            ?? filteredFiles.first { $0.id == selectedFileID }
+            ?? nameFilteredFiles.first { $0.id == selectedFileID }
+    }
+
+    var hasMultiFileSelection: Bool {
+        selectedFileIDs.count > 1
+    }
+
+    var selectedFiles: [ChangedFile] {
+        let order = nameFilteredFiles
+        return order.filter { selectedFileIDs.contains($0.id) }
+    }
+
+    var selectedFilesStagable: [ChangedFile] {
+        selectedFiles.filter(isUnstaged)
+    }
+
+    var selectedFilesUnstagable: [ChangedFile] {
+        selectedFiles.filter(isStaged)
     }
 
     var stagedWorkingTreeFiles: [WorkingTreeFile] {
@@ -295,10 +343,21 @@ final class RepoSession: ObservableObject, Identifiable {
         return merged.commits.filter { selectedAuthors.contains($0.authorName) }
     }
 
-    var filteredFiles: [ChangedFile] {
+    /// Name filter only (used for Shift+Click range order and selection lists).
+    var nameFilteredFiles: [ChangedFile] {
         let query = fileNameQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return visibleFiles }
         return visibleFiles.filter { $0.path.localizedCaseInsensitiveContains(query) }
+    }
+
+    /// Files shown in the Files pane (name filter + optional cross-file content search).
+    var filteredFiles: [ChangedFile] {
+        let named = nameFilteredFiles
+        let cross = crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cross.isEmpty else { return named }
+        // While the first search is in flight, keep showing the name-filtered list.
+        if crossFileMatchCounts.isEmpty, isSearchingCrossFile { return named }
+        return named.filter { crossFileMatchCounts[$0.id] != nil }
     }
 
     var pullRequestAuthors: [String] {
@@ -544,7 +603,19 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     /// Toolbar refresh: fetch remotes, then reload History, Changed files, and inspector content.
-    func refresh() async {
+    /// - Parameter force: When true (manual button), always runs and resets the auto-fetch cooldown.
+    ///   When false (window activate / tab switch), skips if a fetch ran within the last 3 minutes.
+    func refresh(force: Bool = true) async {
+        guard repoPath != nil else { return }
+        if !force {
+            if let last = lastFetchRefreshAt,
+               Date().timeIntervalSince(last) < Self.autoFetchCooldown {
+                return
+            }
+        }
+        // Claim the cooldown immediately so activate + tab-switch bursts coalesce.
+        lastFetchRefreshAt = Date()
+
         await reloadSnapshot(resetScope: false, fetchFirst: true, refreshPanes: true)
         if sidePaneMode == .pullRequests {
             await loadPullRequests()
@@ -552,6 +623,171 @@ final class RepoSession: ObservableObject, Identifiable {
         if case .fileLog(let path) = inspectorMode {
             await loadFileLog(path: path)
         }
+    }
+
+    /// Auto fetch+reload when the window becomes active or this tab is selected.
+    func refreshIfStale() async {
+        await refresh(force: false)
+    }
+
+    func isUnstaged(_ file: ChangedFile) -> Bool {
+        if changeScope == .unstaged { return true }
+        if changeScope == .staged { return false }
+        return workingTreeFiles.contains { $0.path == file.path && $0.area == .unstaged }
+    }
+
+    func isStaged(_ file: ChangedFile) -> Bool {
+        if changeScope == .staged { return true }
+        if changeScope == .unstaged { return false }
+        return workingTreeFiles.contains { $0.path == file.path && $0.area == .staged }
+    }
+
+    /// Preferred area for single-action UI (Unstaged wins when both exist).
+    func stagingArea(for file: ChangedFile) -> WorkingTreeArea? {
+        if isUnstaged(file) { return .unstaged }
+        if isStaged(file) { return .staged }
+        return nil
+    }
+
+    func stageFile(_ file: ChangedFile) async {
+        guard let repoPath else { return }
+        var paths = [file.path]
+        if let old = file.oldPath, old != file.path { paths.append(old) }
+        do {
+            try await git.stagePaths(paths, in: repoPath)
+            await refreshAfterStaging(preferSelecting: file.path)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func unstageFile(_ file: ChangedFile) async {
+        guard let repoPath else { return }
+        var paths = [file.path]
+        if let old = file.oldPath, old != file.path { paths.append(old) }
+        do {
+            try await git.unstagePaths(paths, in: repoPath)
+            await refreshAfterStaging(preferSelecting: file.path)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func stageAllUnstaged() async {
+        guard let repoPath else { return }
+        let paths = Array(Set(unstagedWorkingTreeFiles.flatMap { file -> [String] in
+            if let old = file.oldPath, old != file.path { return [file.path, old] }
+            return [file.path]
+        }))
+        guard !paths.isEmpty else { return }
+        do {
+            try await git.stagePaths(paths, in: repoPath)
+            await refreshAfterStaging(preferSelecting: selectedFile?.path ?? paths[0])
+            statusMessage = "Staged \(paths.count) path\(paths.count == 1 ? "" : "s")."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func unstageAllStaged() async {
+        guard let repoPath else { return }
+        let paths = Array(Set(stagedWorkingTreeFiles.flatMap { file -> [String] in
+            if let old = file.oldPath, old != file.path { return [file.path, old] }
+            return [file.path]
+        }))
+        guard !paths.isEmpty else { return }
+        do {
+            try await git.unstagePaths(paths, in: repoPath)
+            await refreshAfterStaging(preferSelecting: selectedFile?.path ?? paths[0])
+            statusMessage = "Unstaged \(paths.count) path\(paths.count == 1 ? "" : "s")."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func stageSelectedFiles() async {
+        let files = selectedFilesStagable
+        guard let repoPath, !files.isEmpty else { return }
+        let paths = Array(Set(files.flatMap { file -> [String] in
+            if let old = file.oldPath, old != file.path { return [file.path, old] }
+            return [file.path]
+        }))
+        do {
+            try await git.stagePaths(paths, in: repoPath)
+            await refreshAfterStaging(preferSelecting: files[0].path)
+            statusMessage = "Staged \(files.count) file\(files.count == 1 ? "" : "s")."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func unstageSelectedFiles() async {
+        let files = selectedFilesUnstagable
+        guard let repoPath, !files.isEmpty else { return }
+        let paths = Array(Set(files.flatMap { file -> [String] in
+            if let old = file.oldPath, old != file.path { return [file.path, old] }
+            return [file.path]
+        }))
+        do {
+            try await git.unstagePaths(paths, in: repoPath)
+            await refreshAfterStaging(preferSelecting: files[0].path)
+            statusMessage = "Unstaged \(files.count) file\(files.count == 1 ? "" : "s")."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func stageHunk(_ hunk: DiffHunk, for file: ChangedFile) async {
+        await applyHunk(hunk, for: file, reverse: false)
+    }
+
+    func unstageHunk(_ hunk: DiffHunk, for file: ChangedFile) async {
+        await applyHunk(hunk, for: file, reverse: true)
+    }
+
+    private func applyHunk(_ hunk: DiffHunk, for file: ChangedFile, reverse: Bool) async {
+        guard let repoPath else { return }
+        if hunk.isSyntheticUntracked {
+            // Synthetic untracked marker — stage the whole file instead.
+            if !reverse {
+                await stageFile(file)
+            }
+            return
+        }
+        guard let patch = DiffParser.patch(
+            for: hunk,
+            path: file.path,
+            oldPath: file.oldPath,
+            originalDiff: fileDiff
+        ) else {
+            errorMessage = "Could not build a patch for this hunk."
+            return
+        }
+        do {
+            try await git.applyPatchToIndex(patch, in: repoPath, reverse: reverse)
+            await refreshAfterStaging(preferSelecting: file.path)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func refreshAfterStaging(preferSelecting path: String) async {
+        clearInspectorCache()
+        await reloadWorkingTree(updateVisibleFiles: false)
+        // Keep the user in the same local scope when possible.
+        await reloadVisibleFiles(forceInspectorReload: true)
+        if !hasMultiFileSelection, let stillVisible = visibleFiles.first(where: { $0.path == path }) {
+            selectedFileID = stillVisible.id
+            selectedFileIDs = [stillVisible.id]
+            selectionAnchorID = stillVisible.id
+            await loadFileInspector(for: stillVisible)
+        }
+        contentRefreshNonce &+= 1
+        notifyStateChange()
     }
 
     func reloadWorkingTree(updateVisibleFiles: Bool = true) async {
@@ -858,8 +1094,15 @@ final class RepoSession: ObservableObject, Identifiable {
         if case .fileLog = inspectorMode {
             closeFileLog()
         }
-        let alreadySelected = selectedFileID == file.id
+        let alreadySelected = selectedFileID == file.id && selectedFileIDs == [file.id]
         selectedFileID = file.id
+        selectedFileIDs = [file.id]
+        selectionAnchorID = file.id
+        // Propagate cross-file search into the inspector highlighter.
+        let cross = crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cross.isEmpty {
+            contentQuery = cross
+        }
         notifyStateChange()
         if alreadySelected, !(beforeContents == nil && afterContents == nil && fileDiff.isEmpty) {
             return
@@ -867,8 +1110,230 @@ final class RepoSession: ObservableObject, Identifiable {
         Task { await loadFileInspector(for: file) }
     }
 
+    /// ⌘-click: add/remove file from the selection.
+    func toggleFileInSelection(_ file: ChangedFile) {
+        if case .fileLog = inspectorMode {
+            closeFileLog()
+        }
+        if selectedFileIDs.contains(file.id) {
+            selectedFileIDs.remove(file.id)
+            if selectedFileID == file.id {
+                selectedFileID = selectedFileIDs.sorted().first
+            }
+            if selectionAnchorID == file.id {
+                selectionAnchorID = selectedFileID
+            }
+        } else {
+            selectedFileIDs.insert(file.id)
+            selectedFileID = file.id
+            selectionAnchorID = file.id
+        }
+        if selectedFileIDs.count == 1, let id = selectedFileIDs.first,
+           let only = visibleFiles.first(where: { $0.id == id }) {
+            Task { await loadFileInspector(for: only) }
+        }
+        notifyStateChange()
+    }
+
+    /// ⇧-click: select contiguous range from the anchor through `file` (name-filtered order).
+    func selectFileRange(to file: ChangedFile) {
+        if case .fileLog = inspectorMode {
+            closeFileLog()
+        }
+        let order = nameFilteredFiles
+        let anchorID = selectionAnchorID ?? selectedFileID
+        guard let anchorID,
+              let from = order.firstIndex(where: { $0.id == anchorID }),
+              let to = order.firstIndex(where: { $0.id == file.id }) else {
+            selectFile(file)
+            return
+        }
+        let lo = min(from, to)
+        let hi = max(from, to)
+        selectedFileIDs = Set(order[lo...hi].map(\.id))
+        selectedFileID = file.id
+        notifyStateChange()
+    }
+
+    /// Click handler that respects ⌘ / ⇧ modifiers.
+    func handleFileClick(_ file: ChangedFile) {
+        let flags = NSEvent.modifierFlags
+        if flags.contains(.command) {
+            toggleFileInSelection(file)
+        } else if flags.contains(.shift) {
+            selectFileRange(to: file)
+        } else {
+            selectFile(file)
+        }
+    }
+
+    /// Sync from SwiftUI `List(selection:)` multi-select (flat layout).
+    func applyListSelection(_ ids: Set<String>) {
+        let previous = selectedFileIDs
+        if ids == previous { return }
+
+        if case .fileLog = inspectorMode, ids.count != 1 {
+            closeFileLog()
+        }
+
+        selectedFileIDs = ids
+        if ids.isEmpty {
+            selectedFileID = nil
+            selectionAnchorID = nil
+            clearFileInspector()
+            notifyStateChange()
+            return
+        }
+
+        if ids.count == 1, let id = ids.first {
+            selectedFileID = id
+            selectionAnchorID = id
+            if let file = visibleFiles.first(where: { $0.id == id }) {
+                let cross = crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cross.isEmpty { contentQuery = cross }
+                Task { await loadFileInspector(for: file) }
+            }
+            notifyStateChange()
+            return
+        }
+
+        let added = ids.subtracting(previous)
+        let removed = previous.subtracting(ids)
+        if added.count == 1, removed.isEmpty {
+            selectedFileID = added.first
+            selectionAnchorID = added.first
+        } else if removed.count >= 1, added.isEmpty {
+            if let sel = selectedFileID, !ids.contains(sel) {
+                selectedFileID = ids.sorted().first
+            }
+        } else if !added.isEmpty {
+            // Shift-range style update: keep existing anchor when possible.
+            if selectionAnchorID == nil || !(previous.contains(selectionAnchorID!)) {
+                selectionAnchorID = previous.first ?? added.first
+            }
+            selectedFileID = added.sorted().first ?? selectedFileID
+        }
+        notifyStateChange()
+    }
+
+    func preferCrossFileSearch() {
+        searchFocusTarget = .crossFile
+    }
+
+    func openCrossFileSearch() {
+        isCrossFileSearchPresented = true
+        preferCrossFileSearch()
+        searchFocusNonce &+= 1
+    }
+
+    func clearCrossFileSearch() {
+        crossFileQuery = ""
+        crossFileMatchCounts = [:]
+        isSearchingCrossFile = false
+        crossFileSearchTask?.cancel()
+        notifyStateChange()
+    }
+
+    func scheduleCrossFileSearch() {
+        crossFileSearchTask?.cancel()
+        let query = crossFileQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            crossFileMatchCounts = [:]
+            isSearchingCrossFile = false
+            notifyStateChange()
+            return
+        }
+
+        let files = nameFilteredFiles
+        let mode = crossFileSearchMode
+        isSearchingCrossFile = true
+        crossFileSearchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled else { return }
+
+            var counts: [String: Int] = [:]
+            let chunkSize = 6
+            var index = 0
+            while index < files.count {
+                guard !Task.isCancelled else { return }
+                let end = min(index + chunkSize, files.count)
+                let chunk = Array(files[index..<end])
+                await withTaskGroup(of: (String, Int)?.self) { group in
+                    for file in chunk {
+                        group.addTask { @MainActor in
+                            do {
+                                let corpus = try await self.corpusForCrossFileSearch(file: file, mode: mode)
+                                let n = TextUtilities.matchCount(in: corpus, query: query)
+                                return n > 0 ? (file.id, n) : nil
+                            } catch {
+                                return nil
+                            }
+                        }
+                    }
+                    for await item in group {
+                        if let item { counts[item.0] = item.1 }
+                    }
+                }
+                index = end
+            }
+
+            guard !Task.isCancelled else { return }
+            crossFileMatchCounts = counts
+            isSearchingCrossFile = false
+            let visibleIDs = Set(
+                nameFilteredFiles
+                    .filter { counts[$0.id] != nil }
+                    .map(\.id)
+            )
+            selectedFileIDs = selectedFileIDs.intersection(visibleIDs)
+            if let sel = selectedFileID, !visibleIDs.contains(sel) {
+                selectedFileID = selectedFileIDs.sorted().first ?? visibleIDs.sorted().first
+            }
+            notifyStateChange()
+        }
+    }
+
+    private func corpusForCrossFileSearch(file: ChangedFile, mode: CrossFileSearchMode) async throws -> String {
+        guard let repoPath else { return "" }
+        let key: String
+        if let snapshot {
+            key = cacheKey(for: file, snapshot: snapshot)
+        } else {
+            key = [repoPath.path, changeScope.cacheKeyPart, file.path, file.oldPath ?? ""].joined(separator: "|")
+        }
+
+        if let cached = inspectorCache[key] {
+            return Self.corpus(from: cached, file: file, mode: mode)
+        }
+
+        let payload = try await fetchInspectorPayload(for: file)
+        storeCache(key: key, payload: payload)
+        return Self.corpus(from: payload, file: file, mode: mode)
+    }
+
+    private static func corpus(from payload: FileInspectorPayload, file: ChangedFile, mode: CrossFileSearchMode) -> String {
+        switch mode {
+        case .fullSource:
+            if file.status == .deleted {
+                return payload.before ?? ""
+            }
+            return payload.after ?? payload.before ?? ""
+        case .modifications:
+            return modificationText(from: payload.diff)
+        }
+    }
+
+    private static func modificationText(from diff: String) -> String {
+        DiffParser.parse(diff)
+            .filter { $0.kind == .addition || $0.kind == .deletion }
+            .map(\.code)
+            .joined(separator: "\n")
+    }
+
     func openFileLog(for file: ChangedFile) {
         selectedFileID = file.id
+        selectedFileIDs = [file.id]
+        selectionAnchorID = file.id
         inspectorMode = .fileLog(path: file.path)
         selectedFileLogID = nil
         fileLogDiff = ""
@@ -1121,14 +1586,16 @@ final class RepoSession: ObservableObject, Identifiable {
                 let files = (changeScope == .staged ? stagedWorkingTreeFiles : unstagedWorkingTreeFiles)
                     .map(\.asChangedFile)
                 visibleFiles = files
-                selectedFileID = files.first?.id
-                if let file = files.first {
+                syncSelection(to: files, prefer: selectedFileID)
+                if let file = selectedFile {
                     await loadFileInspector(for: file)
                 } else {
                     clearFileInspector()
                 }
+                scheduleCrossFileSearch()
             } else {
                 visibleFiles = []
+                selectedFileIDs = []
             }
             return
         }
@@ -1156,36 +1623,69 @@ final class RepoSession: ObservableObject, Identifiable {
                 }
                 guard !Task.isCancelled else { return }
                 let previousSelection = selectedFileID
+                let previousMulti = selectedFileIDs
                 let listChanged = visibleFiles != files
                 // Assign a fresh array so SwiftUI always sees a Combined-files update
                 // even when paths match but stats/content changed after fetch.
                 visibleFiles = files
-                if let current = previousSelection, let file = files.first(where: { $0.id == current }) {
-                    selectedFileID = current
+                syncSelection(to: files, prefer: previousSelection, preserving: previousMulti)
+                if hasMultiFileSelection {
+                    // Keep multi-select panel; no single-file reload.
+                } else if let file = selectedFile {
                     if forceInspectorReload || listChanged {
                         clearFileInspector()
                         isLoadingFile = true
                         await loadFileInspector(for: file)
                     }
-                } else if let file = files.first {
-                    selectedFileID = file.id
-                    clearFileInspector()
-                    isLoadingFile = true
-                    await loadFileInspector(for: file)
                 } else {
-                    selectedFileID = nil
                     clearFileInspector()
                 }
+                scheduleCrossFileSearch()
             } catch is CancellationError {
                 // ignore
             } catch {
                 guard !Task.isCancelled else { return }
                 visibleFiles = []
+                selectedFileIDs = []
                 clearFileInspector()
                 errorMessage = error.localizedDescription
             }
         }
         await scopeTask?.value
+    }
+
+    private func syncSelection(
+        to files: [ChangedFile],
+        prefer preferredID: String?,
+        preserving previousMulti: Set<String> = []
+    ) {
+        let available = Set(files.map(\.id))
+        let kept = previousMulti.intersection(available)
+        if kept.count > 1 {
+            selectedFileIDs = kept
+            if let preferredID, kept.contains(preferredID) {
+                selectedFileID = preferredID
+            } else if let sel = selectedFileID, kept.contains(sel) {
+                // keep
+            } else {
+                selectedFileID = kept.sorted().first
+            }
+            selectionAnchorID = selectionAnchorID.flatMap { kept.contains($0) ? $0 : nil } ?? selectedFileID
+            return
+        }
+        if let preferredID, available.contains(preferredID) {
+            selectedFileID = preferredID
+            selectedFileIDs = [preferredID]
+            selectionAnchorID = preferredID
+        } else if let file = files.first {
+            selectedFileID = file.id
+            selectedFileIDs = [file.id]
+            selectionAnchorID = file.id
+        } else {
+            selectedFileID = nil
+            selectedFileIDs = []
+            selectionAnchorID = nil
+        }
     }
 
     private static func mergeBranchAndLocalFiles(
@@ -1279,117 +1779,23 @@ final class RepoSession: ObservableObject, Identifiable {
 
         fileTask?.cancel()
         isLoadingFile = true
-
-        let beforePath = file.oldPath ?? file.path
-        let afterPath = file.path
-        let scope = changeScope
-        let snap = snapshot
-        let localMatch = workingTreeFiles.first { $0.path == file.path }
+        let targetID = file.id
 
         fileTask = Task {
             do {
-                let diff: String
-                let before: String?
-                let after: String?
-                let beforeName: String
-                let afterName: String
-
-                switch scope {
-                case .combined:
-                    if let snap {
-                        let hasLocal = includeLocalChanges && localMatch != nil
-                        if hasLocal {
-                            async let diffTask = git.worktreeDiff(
-                                in: repoPath,
-                                from: snap.mergeBase,
-                                path: afterPath,
-                                oldPath: file.oldPath
-                            )
-                            async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
-                            async let afterTask = git.workingTreeFileContents(in: repoPath, path: afterPath)
-                            (diff, before, after) = try await (diffTask, beforeTask, afterTask)
-                            beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
-                            afterName = "Working tree"
-                        } else {
-                            async let diffTask = git.fileDiff(
-                                in: repoPath,
-                                from: snap.mergeBase,
-                                to: snap.branch,
-                                path: file.path,
-                                oldPath: file.oldPath
-                            )
-                            async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
-                            async let afterTask = git.fileContents(in: repoPath, revision: snap.branch, path: afterPath)
-                            (diff, before, after) = try await (diffTask, beforeTask, afterTask)
-                            beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
-                            afterName = snap.branch
-                        }
-                    } else {
-                        throw GitError.commandFailed("No branch snapshot loaded.")
-                    }
-                case .commit(let hash):
-                    guard let snap else { throw GitError.commandFailed("No branch snapshot loaded.") }
-                    let short = snap.commits.first(where: { $0.hash == hash })?.shortHash ?? String(hash.prefix(8))
-                    let parent = "\(hash)^"
-                    async let diffTask = git.commitFileDiff(
-                        in: repoPath,
-                        commit: hash,
-                        path: file.path,
-                        oldPath: file.oldPath
-                    )
-                    async let beforeTask = git.fileContents(in: repoPath, revision: parent, path: beforePath)
-                    async let afterTask = git.fileContents(in: repoPath, revision: hash, path: afterPath)
-                    (diff, before, after) = try await (diffTask, beforeTask, afterTask)
-                    beforeName = "parent of \(short)"
-                    afterName = short
-                case .staged:
-                    async let diffTask = git.stagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
-                    async let beforeTask = git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
-                    async let afterTask = git.indexFileContents(in: repoPath, path: afterPath)
-                    (diff, before, after) = try await (diffTask, beforeTask, afterTask)
-                    beforeName = "HEAD"
-                    afterName = "Index (staged)"
-                case .unstaged:
-                    let unstaged = try await git.unstagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
-                    let worktree = try await git.workingTreeFileContents(in: repoPath, path: afterPath)
-                    let index: String?
-                    if let fromIndex = try await git.indexFileContents(in: repoPath, path: beforePath) {
-                        index = fromIndex
-                    } else {
-                        index = try await git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
-                    }
-                    if unstaged.isEmpty, file.status == .added, let worktree, !worktree.isEmpty {
-                        diff = "--- /dev/null\n+++ b/\(afterPath)\n@@ untracked @@\n"
-                        before = nil
-                        after = worktree
-                        beforeName = "(new file)"
-                        afterName = "Working tree"
-                    } else {
-                        diff = unstaged
-                        before = index
-                        after = worktree
-                        beforeName = "Index / HEAD"
-                        afterName = "Working tree"
-                    }
-                }
-
+                let payload = try await fetchInspectorPayload(for: file)
                 guard !Task.isCancelled else { return }
-                let payload = FileInspectorPayload(
-                    diff: diff.isEmpty ? "(No textual diff — binary or empty change.)" : diff,
-                    before: before,
-                    after: after,
-                    beforeLabel: beforeName,
-                    afterLabel: afterName
-                )
                 storeCache(key: key, payload: payload)
-                if selectedFileID == file.id {
+                if selectedFileID == targetID, !hasMultiFileSelection {
                     applyPayload(payload)
+                } else {
+                    isLoadingFile = false
                 }
             } catch is CancellationError {
                 // ignore
             } catch {
                 guard !Task.isCancelled else { return }
-                if selectedFileID == file.id {
+                if selectedFileID == targetID, !hasMultiFileSelection {
                     fileDiff = error.localizedDescription
                     beforeContents = nil
                     afterContents = nil
@@ -1398,6 +1804,111 @@ final class RepoSession: ObservableObject, Identifiable {
             }
         }
         await fileTask?.value
+    }
+
+    private func fetchInspectorPayload(for file: ChangedFile) async throws -> FileInspectorPayload {
+        guard let repoPath else {
+            throw GitError.commandFailed("No repository open.")
+        }
+
+        let beforePath = file.oldPath ?? file.path
+        let afterPath = file.path
+        let scope = changeScope
+        let snap = snapshot
+        let localMatch = workingTreeFiles.first { $0.path == file.path }
+
+        let diff: String
+        let before: String?
+        let after: String?
+        let beforeName: String
+        let afterName: String
+
+        switch scope {
+        case .combined:
+            if let snap {
+                let hasLocal = includeLocalChanges && localMatch != nil
+                if hasLocal {
+                    async let diffTask = git.worktreeDiff(
+                        in: repoPath,
+                        from: snap.mergeBase,
+                        path: afterPath,
+                        oldPath: file.oldPath
+                    )
+                    async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
+                    async let afterTask = git.workingTreeFileContents(in: repoPath, path: afterPath)
+                    (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                    beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
+                    afterName = "Working tree"
+                } else {
+                    async let diffTask = git.fileDiff(
+                        in: repoPath,
+                        from: snap.mergeBase,
+                        to: snap.branch,
+                        path: file.path,
+                        oldPath: file.oldPath
+                    )
+                    async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
+                    async let afterTask = git.fileContents(in: repoPath, revision: snap.branch, path: afterPath)
+                    (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                    beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
+                    afterName = snap.branch
+                }
+            } else {
+                throw GitError.commandFailed("No branch snapshot loaded.")
+            }
+        case .commit(let hash):
+            guard let snap else { throw GitError.commandFailed("No branch snapshot loaded.") }
+            let short = snap.commits.first(where: { $0.hash == hash })?.shortHash ?? String(hash.prefix(8))
+            let parent = "\(hash)^"
+            async let diffTask = git.commitFileDiff(
+                in: repoPath,
+                commit: hash,
+                path: file.path,
+                oldPath: file.oldPath
+            )
+            async let beforeTask = git.fileContents(in: repoPath, revision: parent, path: beforePath)
+            async let afterTask = git.fileContents(in: repoPath, revision: hash, path: afterPath)
+            (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+            beforeName = "parent of \(short)"
+            afterName = short
+        case .staged:
+            async let diffTask = git.stagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
+            async let beforeTask = git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
+            async let afterTask = git.indexFileContents(in: repoPath, path: afterPath)
+            (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+            beforeName = "HEAD"
+            afterName = "Index (staged)"
+        case .unstaged:
+            let unstaged = try await git.unstagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
+            let worktree = try await git.workingTreeFileContents(in: repoPath, path: afterPath)
+            let index: String?
+            if let fromIndex = try await git.indexFileContents(in: repoPath, path: beforePath) {
+                index = fromIndex
+            } else {
+                index = try await git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
+            }
+            if unstaged.isEmpty, file.status == .added, let worktree, !worktree.isEmpty {
+                diff = "--- /dev/null\n+++ b/\(afterPath)\n@@ untracked @@\n"
+                before = nil
+                after = worktree
+                beforeName = "(new file)"
+                afterName = "Working tree"
+            } else {
+                diff = unstaged
+                before = index
+                after = worktree
+                beforeName = "Index / HEAD"
+                afterName = "Working tree"
+            }
+        }
+
+        return FileInspectorPayload(
+            diff: diff.isEmpty ? "(No textual diff — binary or empty change.)" : diff,
+            before: before,
+            after: after,
+            beforeLabel: beforeName,
+            afterLabel: afterName
+        )
     }
 
     private func persistMemory() {
