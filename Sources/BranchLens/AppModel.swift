@@ -47,6 +47,16 @@ enum InspectorMode: Equatable {
 }
 
 struct MergedIntoCompareInfo: Equatable {
+    enum Kind: Equatable {
+        /// Merged PR whose head was this BRANCH.
+        case mergedPR
+        /// BRANCH tip is identical to COMPARE.
+        case inSync
+        /// BRANCH is contained in COMPARE, but no merged PR for this head.
+        case contained
+    }
+
+    var kind: Kind
     var compareLabel: String
     var commits: [GitCommit]
     var pullRequest: CommitPullRequestLink?
@@ -66,7 +76,11 @@ final class RepoSession: ObservableObject, Identifiable {
     var onStateChange: (() -> Void)?
 
     @Published var repoPath: URL?
-    @Published var branches: [String] = []
+    @Published var branchRecords: [GitBranch] = []
+    var branches: [String] { branchRecords.map(\.name) }
+    var branchTipDates: [String: Date] {
+        Dictionary(uniqueKeysWithValues: branchRecords.map { ($0.name, $0.tipDate) })
+    }
     @Published var selectedBranch: String = ""
     @Published var baseBranch: String = ""
     @Published var snapshot: BranchSnapshot?
@@ -233,6 +247,23 @@ final class RepoSession: ObservableObject, Identifiable {
         workingTreeFiles.filter { $0.area == .unstaged }
     }
 
+    /// Unique local paths with staged and/or unstaged edits.
+    var localChangeFileCount: Int {
+        Set(workingTreeFiles.map(\.path)).count
+    }
+
+    var localChangeAdditions: Int {
+        workingTreeFiles.reduce(0) { $0 + $1.additions }
+    }
+
+    var localChangeDeletions: Int {
+        workingTreeFiles.reduce(0) { $0 + $1.deletions }
+    }
+
+    var hasLocalChanges: Bool {
+        !workingTreeFiles.isEmpty
+    }
+
     var currentWorktree: GitWorktree? {
         guard let repoPath else { return nil }
         let standardized = repoPath.standardizedFileURL
@@ -337,6 +368,11 @@ final class RepoSession: ObservableObject, Identifiable {
     var visibleDeletions: Int { visibleFiles.reduce(0) { $0 + $1.deletions } }
 
     var beforeLineCount: Int { TextUtilities.lineCount(beforeContents) }
+
+    /// Line numbers from the current unified diff for Compare pane tinting.
+    var compareChangedLineNumbers: (deleted: Set<Int>, added: Set<Int>) {
+        DiffParser.changedLineNumbers(in: fileDiff)
+    }
     var afterLineCount: Int { TextUtilities.lineCount(afterContents) }
 
     var activeContentForSearch: String {
@@ -369,26 +405,27 @@ final class RepoSession: ObservableObject, Identifiable {
             RecentRepos.remember(root)
 
             let listed = try await git.listBranches(in: root)
-            branches = listed
+            branchRecords = listed
+            let names = listed.map(\.name)
             let memory = RepoMemory.load(for: root)
             let current = try await git.currentBranch(in: root)
-            let detectedBase = try await git.detectBaseBranch(in: root, branches: listed) ?? ""
+            let detectedBase = try await git.detectBaseBranch(in: root, branches: names) ?? ""
 
-            if let preferredBranch, listed.contains(preferredBranch) {
+            if let preferredBranch, names.contains(preferredBranch) {
                 selectedBranch = preferredBranch
-            } else if let remembered = memory?.branch, listed.contains(remembered) {
+            } else if let remembered = memory?.branch, names.contains(remembered) {
                 selectedBranch = remembered
-            } else if let current, listed.contains(current), current != detectedBase {
+            } else if let current, names.contains(current), current != detectedBase {
                 selectedBranch = current
-            } else if let other = listed.first(where: { $0 != detectedBase }) {
+            } else if let other = names.first(where: { $0 != detectedBase }) {
                 selectedBranch = other
             } else {
-                selectedBranch = listed.first ?? ""
+                selectedBranch = names.first ?? ""
             }
 
-            if let preferredBase, listed.contains(preferredBase) {
+            if let preferredBase, names.contains(preferredBase) {
                 baseBranch = preferredBase
-            } else if let rememberedBase = memory?.base, listed.contains(rememberedBase) {
+            } else if let rememberedBase = memory?.base, names.contains(rememberedBase) {
                 baseBranch = rememberedBase
             } else {
                 baseBranch = detectedBase
@@ -678,7 +715,7 @@ final class RepoSession: ObservableObject, Identifiable {
                     }
                     let listed = (try? await git.listBranches(in: repoPath)) ?? []
                     if !listed.isEmpty {
-                        branches = listed
+                        branchRecords = listed
                     }
                 }
 
@@ -742,7 +779,8 @@ final class RepoSession: ObservableObject, Identifiable {
         await loadTask?.value
     }
 
-    /// When BRANCH has nothing unique vs COMPARE, surface the already-merged PR commits.
+    /// When BRANCH has nothing unique vs COMPARE, explain why — and only show merged
+    /// commits when a PR was actually opened from THIS branch head.
     private func loadMergedIntoCompareIfNeeded(for snap: BranchSnapshot) async {
         mergedIntoCompareTask?.cancel()
         guard snap.commits.isEmpty else {
@@ -763,32 +801,52 @@ final class RepoSession: ObservableObject, Identifiable {
                 return
             }
 
-            let commits = (try? await git.commitsMergedIntoCompare(
-                branch: branch,
-                compareTip: compareTip,
-                in: repoPath
-            )) ?? []
-            guard !Task.isCancelled else { return }
-
-            var pr = try? await github.mergedPullRequest(headBranch: branch, in: repoPath)
-            if pr == nil, let tip = commits.first {
-                let links = (try? await github.pullRequests(containingCommit: tip.hash, in: repoPath)) ?? []
-                pr = Self.preferredCommitPullRequest(from: links)
-            }
+            // Important: do NOT infer a PR from the tip commit. When this branch tip
+            // matches main, the tip is often someone else's merge commit.
+            let pr = try? await github.mergedPullRequest(headBranch: branch, in: repoPath)
             guard !Task.isCancelled else { return }
 
             if let pr {
+                var commits: [GitCommit] = []
+                if let shas = try? await github.pullRequestCommitSHAs(number: pr.number, in: repoPath) {
+                    for sha in shas.reversed() {
+                        if let detail = try? await git.commitDetails(for: sha, in: repoPath) {
+                            commits.append(detail)
+                        }
+                    }
+                }
+                if commits.isEmpty {
+                    commits = (try? await git.commitsMergedIntoCompare(
+                        branch: branch,
+                        compareTip: compareTip,
+                        in: repoPath
+                    )) ?? []
+                }
                 for commit in commits {
                     commitPullRequests[commit.hash] = pr
                     commitPRResolved.insert(commit.hash)
                 }
+                mergedIntoCompare = MergedIntoCompareInfo(
+                    kind: .mergedPR,
+                    compareLabel: compareLabel,
+                    commits: commits,
+                    pullRequest: pr
+                )
+            } else if await git.revisionsEqual(branch, compareTip, in: repoPath) {
+                mergedIntoCompare = MergedIntoCompareInfo(
+                    kind: .inSync,
+                    compareLabel: compareLabel,
+                    commits: [],
+                    pullRequest: nil
+                )
+            } else {
+                mergedIntoCompare = MergedIntoCompareInfo(
+                    kind: .contained,
+                    compareLabel: compareLabel,
+                    commits: [],
+                    pullRequest: nil
+                )
             }
-
-            mergedIntoCompare = MergedIntoCompareInfo(
-                compareLabel: compareLabel,
-                commits: commits,
-                pullRequest: pr
-            )
             notifyStateChange()
         }
         await mergedIntoCompareTask?.value

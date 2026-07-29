@@ -229,6 +229,7 @@ private struct ToolbarView: View {
                         icon: "arrow.triangle.branch",
                         value: model.selectedBranch,
                         options: model.branches,
+                        tipDates: model.branchTipDates,
                         emphasized: true,
                         badge: upstreamBadge(for: model.snapshot),
                         badgeHelp: upstreamBadgeHelp(for: model.snapshot),
@@ -532,6 +533,7 @@ private struct CompareBranchControl: View {
                 icon: "point.topleft.down.to.point.bottomright.curvepath",
                 value: model.baseBranch,
                 options: model.branches,
+                tipDates: model.branchTipDates,
                 emphasized: false,
                 badge: badge,
                 badgeHelp: badgeHelp,
@@ -571,11 +573,26 @@ private struct CompareBranchControl: View {
     }
 }
 
+private enum BranchSortMode: String, CaseIterable, Identifiable {
+    case name
+    case date
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .name: return "Name"
+        case .date: return "Date"
+        }
+    }
+}
+
 private struct BranchMenu: View {
     let title: String
     let icon: String
     let value: String
     let options: [String]
+    var tipDates: [String: Date] = [:]
     let emphasized: Bool
     var badge: String? = nil
     var badgeHelp: String? = nil
@@ -585,11 +602,40 @@ private struct BranchMenu: View {
 
     @State private var isOpen = false
     @State private var query = ""
+    @AppStorage("BranchLens.branchSortMode") private var sortModeRaw: String = BranchSortMode.name.rawValue
+
+    private var sortMode: BranchSortMode {
+        BranchSortMode(rawValue: sortModeRaw) ?? .name
+    }
 
     private var filteredOptions: [String] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return options }
-        return options.filter { $0.localizedCaseInsensitiveContains(q) }
+        let base = q.isEmpty
+            ? options
+            : options.filter { $0.localizedCaseInsensitiveContains(q) }
+        switch sortMode {
+        case .name:
+            return base.sorted {
+                $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+            }
+        case .date:
+            return base.sorted { lhs, rhs in
+                let ld = tipDates[lhs] ?? .distantPast
+                let rd = tipDates[rhs] ?? .distantPast
+                if ld != rd { return ld > rd }
+                return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+            }
+        }
+    }
+
+    private var popoverWidth: CGFloat {
+        let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        let longest = options
+            .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
+            .max() ?? 180
+        // Icon + paddings + optional relative-date column; clamp for extreme names.
+        let dateExtra: CGFloat = sortMode == .date ? 78 : 0
+        return min(max(ceil(longest) + 52 + dateExtra, 260), 720)
     }
 
     var body: some View {
@@ -675,6 +721,18 @@ private struct BranchMenu: View {
             .padding(.vertical, 6)
             .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
+            Picker("Sort", selection: Binding(
+                get: { sortMode },
+                set: { sortModeRaw = $0.rawValue }
+            )) {
+                ForEach(BranchSortMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .help("Sort branches by name or newest tip date")
+
             if filteredOptions.isEmpty {
                 Text(options.isEmpty ? "No branches" : "No matches")
                     .font(.caption)
@@ -697,8 +755,14 @@ private struct BranchMenu: View {
                                     Text(branch)
                                         .font(.callout.monospaced())
                                         .lineLimit(1)
-                                        .truncationMode(.middle)
+                                        .fixedSize(horizontal: true, vertical: false)
                                     Spacer(minLength: 0)
+                                    if sortMode == .date, let date = tipDates[branch] {
+                                        Text(date, style: .relative)
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                            .fixedSize()
+                                    }
                                 }
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 6)
@@ -709,7 +773,7 @@ private struct BranchMenu: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .help("Select \(branch)")
+                            .help(branchHelp(for: branch))
                         }
                     }
                 }
@@ -717,7 +781,15 @@ private struct BranchMenu: View {
             }
         }
         .padding(10)
-        .frame(width: 300)
+        .frame(width: popoverWidth)
+    }
+
+    private func branchHelp(for branch: String) -> String {
+        if let date = tipDates[branch] {
+            let formatted = date.formatted(date: .abbreviated, time: .shortened)
+            return "Select \(branch)\nTip: \(formatted)"
+        }
+        return "Select \(branch)"
     }
 }
 
@@ -963,17 +1035,53 @@ private struct CommitsPane: View {
                         authorFilterMenu
                     }
 
-                    Toggle(isOn: Binding(
-                        get: { model.includeLocalChanges },
-                        set: { model.setIncludeLocalChanges($0) }
-                    )) {
-                        Text("Include local changes")
-                            .font(.caption.weight(.semibold))
+                    HStack(spacing: 10) {
+                        Toggle(isOn: Binding(
+                            get: { model.includeLocalChanges },
+                            set: { model.setIncludeLocalChanges($0) }
+                        )) {
+                            Text("Include local changes")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .tint(Color.accentColor)
+                        .help("Show Staged/Unstaged scopes and merge local edits into All changes")
+
+                        Spacer(minLength: 0)
+
+                        if model.isLoadingWorkingTree && !model.hasLocalChanges {
+                            ProgressView()
+                                .controlSize(.mini)
+                        } else if model.hasLocalChanges {
+                            HStack(spacing: 6) {
+                                Text("\(model.localChangeFileCount)f")
+                                    .foregroundStyle(.secondary)
+                                    .help("\(model.localChangeFileCount) local file\(model.localChangeFileCount == 1 ? "" : "s") changed")
+                                Text("+\(model.localChangeAdditions)")
+                                    .foregroundStyle(AppTheme.additionText)
+                                    .help("\(model.localChangeAdditions) lines added locally")
+                                Text("−\(model.localChangeDeletions)")
+                                    .foregroundStyle(AppTheme.deletionText)
+                                    .help("\(model.localChangeDeletions) lines deleted locally")
+                            }
+                            .font(.caption.monospacedDigit().weight(.semibold))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                (model.includeLocalChanges
+                                 ? Color.accentColor.opacity(0.12)
+                                 : Color.orange.opacity(0.12)),
+                                in: Capsule()
+                            )
+                            .help("Local working-tree changes (shown even when Include local changes is off)")
+                        } else {
+                            Text("Clean")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                                .help("No local staged or unstaged changes")
+                        }
                     }
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .tint(Color.accentColor)
-                    .help("Show Staged/Unstaged scopes and merge local edits into All changes")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
@@ -1029,12 +1137,14 @@ private struct CommitsPane: View {
                             )
 
                             if model.filteredMergedCommits.isEmpty {
-                                Text(model.selectedAuthors.isEmpty
-                                      ? "No merged commits to show."
-                                      : "No merged commits from selected authors.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .padding(.top, 4)
+                                if merged.kind == .mergedPR {
+                                    Text(model.selectedAuthors.isEmpty
+                                          ? "No merged commits to show."
+                                          : "No merged commits from selected authors.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .padding(.top, 4)
+                                }
                             } else {
                                 LazyVStack(spacing: 8) {
                                     ForEach(model.filteredMergedCommits) { commit in
@@ -1088,9 +1198,8 @@ private struct CommitsPane: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .onAppear {
-            if model.includeLocalChanges {
-                Task { await model.reloadWorkingTree() }
-            }
+            // Always refresh local stats so the toggle row can show counts even when off.
+            Task { await model.reloadWorkingTree() }
         }
         .onChange(of: model.includeLocalChanges) { _, enabled in
             if enabled {
@@ -1265,19 +1374,52 @@ private struct MergedIntoCompareCard: View {
     let info: MergedIntoCompareInfo
     let onOpenPullRequest: (CommitPullRequestLink) -> Void
 
-    private var tint: Color { Color(red: 0.55, green: 0.40, blue: 0.90) }
+    private var tint: Color {
+        switch info.kind {
+        case .mergedPR: return Color(red: 0.55, green: 0.40, blue: 0.90)
+        case .inSync: return Color.accentColor
+        case .contained: return .secondary
+        }
+    }
+
+    private var title: String {
+        switch info.kind {
+        case .mergedPR: return "Fully merged into \(info.compareLabel)"
+        case .inSync: return "In sync with \(info.compareLabel)"
+        case .contained: return "Already contained in \(info.compareLabel)"
+        }
+    }
+
+    private var subtitle: String {
+        switch info.kind {
+        case .mergedPR:
+            return "This branch has no unique commits left versus \(info.compareLabel). Showing commits from its merged pull request."
+        case .inSync:
+            return "This branch tip matches \(info.compareLabel), so there are no unique commits to review. The tip may be a merge from another branch."
+        case .contained:
+            return "Every commit on this branch is already in \(info.compareLabel), but no merged PR was found for this branch head."
+        }
+    }
+
+    private var icon: String {
+        switch info.kind {
+        case .mergedPR: return "checkmark.seal.fill"
+        case .inSync: return "equal.circle.fill"
+        case .contained: return "arrow.down.circle.fill"
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Image(systemName: "checkmark.seal.fill")
+                Image(systemName: icon)
                     .foregroundStyle(tint)
-                Text("Fully merged into \(info.compareLabel)")
+                Text(title)
                     .font(.callout.weight(.semibold))
                 Spacer(minLength: 0)
             }
 
-            Text("This branch has no unique commits left versus \(info.compareLabel). Showing the commits that were already merged.")
+            Text(subtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1318,11 +1460,11 @@ private struct MergedIntoCompareCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(tint.opacity(0.08))
+                .fill(tint.opacity(info.kind == .contained ? 0.06 : 0.08))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(tint.opacity(0.35), lineWidth: 1)
+                .strokeBorder(tint.opacity(info.kind == .contained ? 0.22 : 0.35), lineWidth: 1)
         )
     }
 }
@@ -1851,17 +1993,19 @@ private struct FileInspectorView: View {
             }
 
             HStack(spacing: 10) {
-                Picker(selection: $model.fileViewMode) {
-                    ForEach(FileViewMode.allCases) { mode in
-                        Text(mode.rawValue).tag(mode)
+                if showsRevisionModes {
+                    Picker(selection: $model.fileViewMode) {
+                        ForEach(FileViewMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    } label: {
+                        EmptyView()
                     }
-                } label: {
-                    EmptyView()
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(maxWidth: 360)
+                    .help("View mode: Diff, Before, After, or side-by-side Compare")
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 360)
-                .help("View mode: Diff, Before, After, or side-by-side Compare")
 
                 Spacer(minLength: 8)
 
@@ -1900,9 +2044,18 @@ private struct FileInspectorView: View {
         .padding(.vertical, 10)
     }
 
+    /// Added/deleted files have no meaningful before/after pair — show content only.
+    private var showsRevisionModes: Bool {
+        guard let status = model.selectedFile?.status else { return true }
+        switch status {
+        case .added, .deleted: return false
+        default: return true
+        }
+    }
+
     @ViewBuilder
     private var content: some View {
-        if model.isLoadingFile && model.fileDiff.isEmpty && model.beforeContents == nil {
+        if model.isLoadingFile && model.fileDiff.isEmpty && model.beforeContents == nil && model.afterContents == nil {
             ProgressView("Loading file…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.selectedFile == nil {
@@ -1911,6 +2064,34 @@ private struct FileInspectorView: View {
                 systemImage: "doc.text.magnifyingglass",
                 description: Text("Choose a changed file to inspect Diff, Before, or After.")
             )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.selectedFile?.status == .added {
+            CodePane(
+                title: "Contents",
+                subtitle: model.afterLabel,
+                accent: AppTheme.additionText,
+                source: model.afterContents,
+                path: model.selectedFile?.path ?? "file.txt",
+                placeholder: "New file is empty or could not be loaded.",
+                lineCount: model.afterLineCount,
+                searchQuery: model.contentQuery
+            )
+            .id("added-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+            .padding(10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.selectedFile?.status == .deleted {
+            CodePane(
+                title: "Contents",
+                subtitle: model.beforeLabel,
+                accent: AppTheme.deletionText,
+                source: model.beforeContents,
+                path: model.selectedFile?.oldPath ?? model.selectedFile?.path ?? "file.txt",
+                placeholder: "Deleted file could not be loaded.",
+                lineCount: model.beforeLineCount,
+                searchQuery: model.contentQuery
+            )
+            .id("deleted-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+            .padding(10)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             switch model.fileViewMode {
@@ -1931,7 +2112,9 @@ private struct FileInspectorView: View {
                     path: model.selectedFile?.oldPath ?? model.selectedFile?.path ?? "file.txt",
                     placeholder: "File did not exist in this revision.",
                     lineCount: model.beforeLineCount,
-                    searchQuery: model.contentQuery
+                    searchQuery: model.contentQuery,
+                    emphasizedLines: model.compareChangedLineNumbers.deleted,
+                    lineEmphasis: .deletion
                 )
                 .id("before-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
                 .padding(10)
@@ -1945,12 +2128,15 @@ private struct FileInspectorView: View {
                     path: model.selectedFile?.path ?? "file.txt",
                     placeholder: "File does not exist in this revision.",
                     lineCount: model.afterLineCount,
-                    searchQuery: model.contentQuery
+                    searchQuery: model.contentQuery,
+                    emphasizedLines: model.compareChangedLineNumbers.added,
+                    lineEmphasis: .addition
                 )
                 .id("after-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .compare:
+                let changed = model.compareChangedLineNumbers
                 HStack(spacing: 10) {
                     CodePane(
                         title: "Before",
@@ -1960,7 +2146,9 @@ private struct FileInspectorView: View {
                         path: model.selectedFile?.oldPath ?? model.selectedFile?.path ?? "file.txt",
                         placeholder: "File did not exist in this revision.",
                         lineCount: model.beforeLineCount,
-                        searchQuery: model.contentQuery
+                        searchQuery: model.contentQuery,
+                        emphasizedLines: changed.deleted,
+                        lineEmphasis: .deletion
                     )
                     CodePane(
                         title: "After",
@@ -1970,7 +2158,9 @@ private struct FileInspectorView: View {
                         path: model.selectedFile?.path ?? "file.txt",
                         placeholder: "File does not exist in this revision.",
                         lineCount: model.afterLineCount,
-                        searchQuery: model.contentQuery
+                        searchQuery: model.contentQuery,
+                        emphasizedLines: changed.added,
+                        lineEmphasis: .addition
                     )
                 }
                 .id("compare-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")

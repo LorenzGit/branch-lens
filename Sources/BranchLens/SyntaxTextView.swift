@@ -29,12 +29,21 @@ enum SearchHighlight {
     }
 }
 
+enum SyntaxLineEmphasis: String, Sendable, Hashable {
+    case none
+    case addition
+    case deletion
+}
+
 /// Non-wrapping, selectable, syntax-highlighted source viewer.
 struct SyntaxTextView: NSViewRepresentable {
     let source: String
     let path: String
     var showLineNumbers: Bool = true
     var searchQuery: String = ""
+    /// 1-based line numbers to tint with `lineEmphasis`.
+    var emphasizedLines: Set<Int> = []
+    var lineEmphasis: SyntaxLineEmphasis = .none
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -83,11 +92,21 @@ struct SyntaxTextView: NSViewRepresentable {
     }
 
     private func contentKey() -> String {
-        HighlightRenderCache.key(
+        let emphasisKey: String
+        if lineEmphasis == .none || emphasizedLines.isEmpty {
+            emphasisKey = "none"
+        } else {
+            let sample = emphasizedLines.sorted()
+            let head = sample.prefix(8).map(String.init).joined(separator: ",")
+            let tail = sample.suffix(8).map(String.init).joined(separator: ",")
+            emphasisKey = "\(lineEmphasis.rawValue):\(sample.count):\(head):\(tail)"
+        }
+        return HighlightRenderCache.key(
             kind: showLineNumbers ? "source" : "source-noln",
             path: path,
             source: source,
-            searchQuery: searchQuery
+            searchQuery: searchQuery,
+            extra: emphasisKey
         )
     }
 
@@ -107,6 +126,8 @@ struct SyntaxTextView: NSViewRepresentable {
         let path = self.path
         let showLineNumbers = self.showLineNumbers
         let searchQuery = self.searchQuery
+        let emphasizedLines = self.emphasizedLines
+        let lineEmphasis = self.lineEmphasis
         let colors = SyntaxRenderBuilder.Colors.current()
         let font = AppTheme.monoNS
         let lineHeight = font.ascender - font.descender + font.leading
@@ -119,7 +140,9 @@ struct SyntaxTextView: NSViewRepresentable {
                     path: path,
                     showLineNumbers: showLineNumbers,
                     font: font,
-                    colors: colors
+                    colors: colors,
+                    emphasizedLines: emphasizedLines,
+                    lineEmphasis: lineEmphasis
                 )
             )
             _ = SearchHighlight.apply(to: attributed, query: searchQuery)
@@ -311,7 +334,9 @@ enum SyntaxRenderBuilder {
         path: String,
         showLineNumbers: Bool,
         font: NSFont,
-        colors: Colors
+        colors: Colors,
+        emphasizedLines: Set<Int> = [],
+        lineEmphasis: SyntaxLineEmphasis = .none
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
         let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
@@ -321,13 +346,22 @@ enum SyntaxRenderBuilder {
         paragraph.alignment = .left
 
         for (index, line) in lines.enumerated() {
+            let lineNumber = index + 1
+            let bg = emphasisBackground(
+                for: lineNumber,
+                emphasizedLines: emphasizedLines,
+                lineEmphasis: lineEmphasis
+            )
+
             if showLineNumbers {
-                let gutter = String(format: "%\(gutterWidth)d  ", index + 1)
-                result.append(NSAttributedString(string: gutter, attributes: [
+                let gutter = String(format: "%\(gutterWidth)d  ", lineNumber)
+                var gutterAttrs: [NSAttributedString.Key: Any] = [
                     .font: font,
                     .foregroundColor: colors.gutter,
                     .paragraphStyle: paragraph,
-                ]))
+                ]
+                if let bg { gutterAttrs[.backgroundColor] = bg }
+                result.append(NSAttributedString(string: gutter, attributes: gutterAttrs))
             }
 
             let highlighted = CodeHighlighter.attributedString(
@@ -341,17 +375,39 @@ enum SyntaxRenderBuilder {
                 font: font
             )
             let mutable = NSMutableAttributedString(attributedString: highlighted)
-            mutable.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: mutable.length))
+            var codeAttrs: [NSAttributedString.Key: Any] = [
+                .paragraphStyle: paragraph,
+            ]
+            if let bg { codeAttrs[.backgroundColor] = bg }
+            mutable.addAttributes(codeAttrs, range: NSRange(location: 0, length: mutable.length))
             result.append(mutable)
 
             if index < lines.count - 1 {
-                result.append(NSAttributedString(string: "\n", attributes: [
+                var newlineAttrs: [NSAttributedString.Key: Any] = [
                     .font: font,
                     .paragraphStyle: paragraph,
-                ]))
+                ]
+                if let bg { newlineAttrs[.backgroundColor] = bg }
+                result.append(NSAttributedString(string: "\n", attributes: newlineAttrs))
             }
         }
         return result
+    }
+
+    nonisolated private static func emphasisBackground(
+        for lineNumber: Int,
+        emphasizedLines: Set<Int>,
+        lineEmphasis: SyntaxLineEmphasis
+    ) -> NSColor? {
+        guard lineEmphasis != .none, emphasizedLines.contains(lineNumber) else { return nil }
+        switch lineEmphasis {
+        case .addition:
+            return NSColor(calibratedRed: 0.18, green: 0.64, blue: 0.35, alpha: 0.22)
+        case .deletion:
+            return NSColor(calibratedRed: 0.86, green: 0.24, blue: 0.27, alpha: 0.22)
+        case .none:
+            return nil
+        }
     }
 
     nonisolated static func buildDiff(

@@ -28,6 +28,23 @@ public struct DiffLine: Identifiable, Sendable, Hashable {
 }
 
 public enum DiffParser {
+    /// Old-file line numbers that were deleted, and new-file line numbers that were added.
+    public static func changedLineNumbers(in text: String) -> (deleted: Set<Int>, added: Set<Int>) {
+        var deleted = Set<Int>()
+        var added = Set<Int>()
+        for line in parse(text) {
+            switch line.kind {
+            case .deletion:
+                if let old = line.oldLine { deleted.insert(old) }
+            case .addition:
+                if let new = line.newLine { added.insert(new) }
+            default:
+                break
+            }
+        }
+        return (deleted, added)
+    }
+
     public static func parse(_ text: String) -> [DiffLine] {
         var lines: [DiffLine] = []
         var oldLine: Int?

@@ -84,6 +84,32 @@ public actor GitHubService {
         )
     }
 
+    /// Commit SHAs that belong to a pull request (newest first from GitHub).
+    public func pullRequestCommitSHAs(
+        number: Int,
+        in repo: URL
+    ) async throws -> [String] {
+        let ghURL = try requireGH()
+        let result = try await ProcessRunner.run(
+            executable: ghURL,
+            arguments: [
+                "pr", "view", String(number),
+                "--json", "commits",
+                "--jq", "[.commits[].oid]",
+            ],
+            currentDirectory: repo
+        )
+        if result.status != 0 {
+            let message = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw GitError.commandFailed(
+                message.isEmpty
+                    ? "gh pr view failed (\(result.status))"
+                    : message
+            )
+        }
+        return try JSONDecoder().decode([String].self, from: result.stdout)
+    }
+
     /// PRs that contain `commit` (open, merged, or closed), via GitHub's commit→PR API.
     public func pullRequests(
         containingCommit commit: String,

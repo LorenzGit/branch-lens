@@ -1,5 +1,16 @@
 import Foundation
 
+public struct GitBranch: Identifiable, Hashable, Sendable {
+    public var id: String { name }
+    public let name: String
+    public let tipDate: Date
+
+    public init(name: String, tipDate: Date) {
+        self.name = name
+        self.tipDate = tipDate
+    }
+}
+
 public struct GitCommit: Identifiable, Hashable, Sendable {
     public var id: String { hash }
     public let hash: String

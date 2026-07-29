@@ -18,16 +18,26 @@ public actor GitService {
         return URL(fileURLWithPath: root)
     }
 
-    public func listBranches(in repo: URL) async throws -> [String] {
+    public func listBranches(in repo: URL) async throws -> [GitBranch] {
         let output = try await runGit(
-            ["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+            [
+                "for-each-ref",
+                "--format=%(refname:short)%00%(committerdate:iso8601-strict)",
+                "--sort=refname",
+                "refs/heads/",
+            ],
             in: repo
         )
         return output
             .split(whereSeparator: \.isNewline)
-            .map(String.init)
-            .filter { !$0.isEmpty }
-            .sorted()
+            .compactMap { line -> GitBranch? in
+                let parts = line.split(separator: "\0", maxSplits: 1, omittingEmptySubsequences: false)
+                guard let namePart = parts.first else { return nil }
+                let name = String(namePart).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { return nil }
+                let dateString = parts.count > 1 ? String(parts[1]) : ""
+                return GitBranch(name: name, tipDate: Self.parseGitDate(dateString))
+            }
     }
 
     public func currentBranch(in repo: URL) async throws -> String? {
@@ -151,6 +161,26 @@ public actor GitService {
             currentDirectory: repo
         )
         return result?.status == 0
+    }
+
+    public func revisionsEqual(
+        _ lhs: String,
+        _ rhs: String,
+        in repo: URL
+    ) async -> Bool {
+        let left = (try? await runGit(["rev-parse", lhs], in: repo))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = (try? await runGit(["rev-parse", rhs], in: repo))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let left, let right, !left.isEmpty, !right.isEmpty else { return false }
+        return left == right
+    }
+
+    public func commitDetails(
+        for hash: String,
+        in repo: URL
+    ) async throws -> GitCommit? {
+        try await listCommits(in: repo, range: "-1 \(hash)").first
     }
 
     /// Commits that this branch contributed into `compareTip` when the branch tip is

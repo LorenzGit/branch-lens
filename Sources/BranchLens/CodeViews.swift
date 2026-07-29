@@ -10,6 +10,9 @@ struct CodePane: View {
     let placeholder: String
     var lineCount: Int = 0
     var searchQuery: String = ""
+    /// 1-based source line numbers to tint (Compare mode).
+    var emphasizedLines: Set<Int> = []
+    var lineEmphasis: SyntaxLineEmphasis = .none
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -46,7 +49,9 @@ struct CodePane: View {
                         source: source,
                         path: path,
                         showLineNumbers: true,
-                        searchQuery: searchQuery
+                        searchQuery: searchQuery,
+                        emphasizedLines: emphasizedLines,
+                        lineEmphasis: lineEmphasis
                     )
                 } else {
                     Text(placeholder)

@@ -21,11 +21,17 @@ enum HighlightRenderCache {
         return max(sample.size().width / 32, 7)
     }()
 
-    static func key(kind: String, path: String, source: String, searchQuery: String) -> String {
+    static func key(
+        kind: String,
+        path: String,
+        source: String,
+        searchQuery: String,
+        extra: String = ""
+    ) -> String {
         // Avoid hashing entire files: length + prefix/suffix fingerprint.
         let prefix = source.prefix(96)
         let suffix = source.suffix(96)
-        return "\(kind)|\(path)|\(source.count)|\(prefix)|\(suffix)|\(searchQuery)"
+        return "\(kind)|\(path)|\(source.count)|\(prefix)|\(suffix)|\(searchQuery)|\(extra)"
     }
 
     static func get(_ key: String) -> Entry? {
