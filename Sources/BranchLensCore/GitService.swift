@@ -760,13 +760,22 @@ public actor GitService {
         in repo: URL,
         branch: String
     ) async throws -> (tracking: String?, ahead: Int?, behind: Int?) {
-        let tracking = (try? await runGit(
+        let upstream = (try? await runGit(
             ["rev-parse", "--abbrev-ref", "\(branch)@{upstream}"],
             in: repo
         ).trimmingCharacters(in: .whitespacesAndNewlines))
-        guard let tracking, !tracking.isEmpty else {
+        let originTip = "origin/\(branch)"
+        let tracking: String?
+        if let upstream, !upstream.isEmpty {
+            tracking = upstream
+        } else if (try? await runGit(["rev-parse", "--verify", originTip], in: repo)) != nil {
+            tracking = originTip
+        } else {
+            // No remote counterpart yet — treat all local commits as unpushed if the branch exists.
             return (nil, nil, nil)
         }
+
+        guard let tracking else { return (nil, nil, nil) }
 
         let counts = try await runGit(
             ["rev-list", "--left-right", "--count", "\(branch)...\(tracking)"],

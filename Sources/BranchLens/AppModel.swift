@@ -119,6 +119,7 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var commitMessageDraft = ""
     @Published var commitShouldPush = false
     @Published var isCommitting = false
+    @Published var isPushing = false
     @Published var filesLayout: FilesLayoutMode = .folders
     @Published var showHistory = true
     @Published var showFiles = true
@@ -718,6 +719,27 @@ final class RepoSession: ObservableObject, Identifiable {
         commitShouldPush = false
         errorMessage = nil
         isCommitSheetPresented = true
+    }
+
+    var unpushedCommitCount: Int {
+        snapshot?.aheadOfRemote ?? 0
+    }
+
+    func pushBranch() async {
+        guard let repoPath, !selectedBranch.isEmpty else { return }
+        isPushing = true
+        statusMessage = "Pushing \(selectedBranch)…"
+        do {
+            try await git.pushCurrentBranch(in: repoPath, branch: selectedBranch)
+            await reloadSnapshot(resetScope: false, fetchFirst: true, refreshPanes: false)
+            statusMessage = "Pushed \(selectedBranch)."
+            clearStatusEventually(statusMessage)
+            notifyStateChange()
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+        }
+        isPushing = false
     }
 
     func commitStaged(message: String, push: Bool) async {

@@ -257,6 +257,25 @@ private struct ToolbarView: View {
                         helpText: "Branch to inspect"
                     ) { model.selectBranch($0) }
 
+                    if model.unpushedCommitCount > 0 {
+                        Button {
+                            Task { await model.pushBranch() }
+                        } label: {
+                            if model.isPushing {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Text("\(model.unpushedCommitCount) Push")
+                                    .font(.caption.weight(.semibold))
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(AppTheme.additionText)
+                        .controlSize(.small)
+                        .disabled(model.isPushing || model.isLoading || model.isCommitting)
+                        .help("Push \(model.unpushedCommitCount) unpushed commit\(model.unpushedCommitCount == 1 ? "" : "s") on \(model.selectedBranch)")
+                    }
+
                     CompareBranchControl(model: model)
 
                     WorktreeMenu(model: model)
