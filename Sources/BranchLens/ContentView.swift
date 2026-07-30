@@ -1127,85 +1127,118 @@ private struct CommitsPane: View {
 
                 Divider().opacity(0.45)
 
-                ScrollView {
-                    // Non-lazy top cards stay stable; lazy only the long commit list.
-                    VStack(spacing: 8) {
-                        AllChangesCard(
-                            isSelected: model.changeScope == .combined,
-                            commitCount: model.filteredCommits.count,
-                            stagedCount: model.stagedWorkingTreeFiles.count,
-                            unstagedCount: model.unstagedWorkingTreeFiles.count,
-                            includeLocal: model.includeLocalChanges,
-                            fileCount: allChangesFileCount,
-                            additions: model.snapshot?.totalAdditions ?? 0,
-                            deletions: model.snapshot?.totalDeletions ?? 0
-                        ) {
-                            model.selectCombined()
-                        }
-
-                        if model.includeLocalChanges {
-                            LocalScopeCard(
-                                title: "Staged",
-                                subtitle: "Changes in the index, ready to commit",
-                                icon: "plus.circle.fill",
-                                tint: AppTheme.additionText,
-                                fileCount: model.stagedWorkingTreeFiles.count,
-                                isSelected: model.changeScope == .staged,
-                                contextActions: stagedContextActions
+                if historyIsClean {
+                    ContentUnavailableView(
+                        "Clean",
+                        systemImage: "checkmark.circle",
+                        description: Text(cleanHistoryDescription)
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        // Non-lazy top cards stay stable; lazy only the long commit list.
+                        VStack(spacing: 8) {
+                            AllChangesCard(
+                                isSelected: model.changeScope == .combined,
+                                commitCount: model.filteredCommits.count,
+                                stagedCount: model.stagedWorkingTreeFiles.count,
+                                unstagedCount: model.unstagedWorkingTreeFiles.count,
+                                includeLocal: model.includeLocalChanges,
+                                fileCount: allChangesFileCount,
+                                additions: model.snapshot?.totalAdditions ?? 0,
+                                deletions: model.snapshot?.totalDeletions ?? 0
                             ) {
-                                model.selectStaged()
+                                model.selectCombined()
                             }
 
-                            LocalScopeCard(
-                                title: "Unstaged",
-                                subtitle: "Working tree edits not yet staged",
-                                icon: "pencil.circle.fill",
-                                tint: Color.orange,
-                                fileCount: model.unstagedWorkingTreeFiles.count,
-                                isSelected: model.changeScope == .unstaged,
-                                contextActions: model.unstagedWorkingTreeFiles.isEmpty
-                                    ? []
-                                    : [LocalScopeContextAction(title: "Stage All") {
-                                        Task { await model.stageAllUnstaged() }
-                                    }]
-                            ) {
-                                model.selectUnstaged()
+                            if model.includeLocalChanges {
+                                LocalScopeCard(
+                                    title: "Staged",
+                                    subtitle: "Changes in the index, ready to commit",
+                                    icon: "plus.circle.fill",
+                                    tint: AppTheme.additionText,
+                                    fileCount: model.stagedWorkingTreeFiles.count,
+                                    isSelected: model.changeScope == .staged,
+                                    contextActions: stagedContextActions
+                                ) {
+                                    model.selectStaged()
+                                }
+
+                                LocalScopeCard(
+                                    title: "Unstaged",
+                                    subtitle: "Working tree edits not yet staged",
+                                    icon: "pencil.circle.fill",
+                                    tint: Color.orange,
+                                    fileCount: model.unstagedWorkingTreeFiles.count,
+                                    isSelected: model.changeScope == .unstaged,
+                                    contextActions: model.unstagedWorkingTreeFiles.isEmpty
+                                        ? []
+                                        : [LocalScopeContextAction(title: "Stage All") {
+                                            Task { await model.stageAllUnstaged() }
+                                        }]
+                                ) {
+                                    model.selectUnstaged()
+                                }
                             }
-                        }
 
-                        if let notice = staleCompareHistoryNotice {
-                            StaleCompareHistoryBanner(
-                                notice: notice,
-                                isUpdating: model.isUpdatingFromCompare,
-                                onUpdate: {
-                                    Task { await model.updateLocalCompare() }
-                                }
-                            )
-                        }
+                            if let notice = staleCompareHistoryNotice {
+                                StaleCompareHistoryBanner(
+                                    notice: notice,
+                                    isUpdating: model.isUpdatingFromCompare,
+                                    onUpdate: {
+                                        Task { await model.updateLocalCompare() }
+                                    }
+                                )
+                            }
 
-                        if let merged = model.mergedIntoCompare, model.filteredCommits.isEmpty {
-                            MergedIntoCompareCard(
-                                info: merged,
-                                onOpenPullRequest: { link in
-                                    model.openCommitPullRequestInBrowser(link)
-                                }
-                            )
+                            if let merged = model.mergedIntoCompare, model.filteredCommits.isEmpty {
+                                MergedIntoCompareCard(
+                                    info: merged,
+                                    onOpenPullRequest: { link in
+                                        model.openCommitPullRequestInBrowser(link)
+                                    }
+                                )
 
-                            if model.filteredMergedCommits.isEmpty {
-                                if merged.kind == .mergedPR {
-                                    Text(model.selectedAuthors.isEmpty
-                                          ? "No merged commits to show."
-                                          : "No merged commits from selected authors.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .padding(.top, 4)
+                                if model.filteredMergedCommits.isEmpty {
+                                    if merged.kind == .mergedPR {
+                                        Text(model.selectedAuthors.isEmpty
+                                              ? "No merged commits to show."
+                                              : "No merged commits from selected authors.")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .padding(.top, 4)
+                                    }
+                                } else {
+                                    LazyVStack(spacing: 8) {
+                                        ForEach(model.filteredMergedCommits) { commit in
+                                            CommitCard(
+                                                commit: commit,
+                                                pullRequest: model.pullRequest(forCommitHash: commit.hash) ?? merged.pullRequest,
+                                                isSelected: {
+                                                    if case .commit(let hash) = model.changeScope {
+                                                        return hash == commit.hash
+                                                    }
+                                                    return false
+                                                }(),
+                                                onSelect: { model.selectCommit(commit) },
+                                                onOpenPullRequest: { link in
+                                                    model.openCommitPullRequestInBrowser(link)
+                                                }
+                                            )
+                                        }
+                                    }
                                 }
+                            } else if model.filteredCommits.isEmpty {
+                                Text(model.selectedAuthors.isEmpty ? "No commits on this branch." : "No commits from selected authors.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 4)
                             } else {
                                 LazyVStack(spacing: 8) {
-                                    ForEach(model.filteredMergedCommits) { commit in
+                                    ForEach(model.filteredCommits) { commit in
                                         CommitCard(
                                             commit: commit,
-                                            pullRequest: model.pullRequest(forCommitHash: commit.hash) ?? merged.pullRequest,
+                                            pullRequest: model.pullRequest(forCommitHash: commit.hash),
                                             isSelected: {
                                                 if case .commit(let hash) = model.changeScope {
                                                     return hash == commit.hash
@@ -1220,35 +1253,11 @@ private struct CommitsPane: View {
                                     }
                                 }
                             }
-                        } else if model.filteredCommits.isEmpty {
-                            Text(model.selectedAuthors.isEmpty ? "No commits on this branch." : "No commits from selected authors.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .padding(.top, 4)
-                        } else {
-                            LazyVStack(spacing: 8) {
-                                ForEach(model.filteredCommits) { commit in
-                                    CommitCard(
-                                        commit: commit,
-                                        pullRequest: model.pullRequest(forCommitHash: commit.hash),
-                                        isSelected: {
-                                            if case .commit(let hash) = model.changeScope {
-                                                return hash == commit.hash
-                                            }
-                                            return false
-                                        }(),
-                                        onSelect: { model.selectCommit(commit) },
-                                        onOpenPullRequest: { link in
-                                            model.openCommitPullRequestInBrowser(link)
-                                        }
-                                    )
-                                }
-                            }
                         }
+                        .padding(10)
                     }
-                    .padding(10)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
@@ -1267,6 +1276,41 @@ private struct CommitsPane: View {
         let branchCount = model.snapshot?.files.count ?? 0
         guard model.includeLocalChanges else { return branchCount }
         return Set(model.snapshot?.files.map(\.path) ?? []).union(model.workingTreeFiles.map(\.path)).count
+    }
+
+    /// No unique branch commits, no local edits to browse, and nothing useful in the merged fallback.
+    private var historyIsClean: Bool {
+        if !model.filteredCommits.isEmpty { return false }
+        if model.includeLocalChanges && model.hasLocalChanges { return false }
+        if let notice = staleCompareHistoryNotice, notice.inheritedCommitCount > 0 { return false }
+        if !model.selectedAuthors.isEmpty,
+           let snapshot = model.snapshot,
+           !snapshot.commits.isEmpty {
+            return false
+        }
+        if let merged = model.mergedIntoCompare {
+            switch merged.kind {
+            case .mergedPR:
+                return model.filteredMergedCommits.isEmpty && model.selectedAuthors.isEmpty
+            case .inSync, .contained:
+                return true
+            }
+        }
+        return model.selectedAuthors.isEmpty
+    }
+
+    private var cleanHistoryDescription: String {
+        if let merged = model.mergedIntoCompare {
+            switch merged.kind {
+            case .inSync:
+                return "In sync with \(merged.compareLabel) — nothing unique to review."
+            case .contained:
+                return "Contained in \(merged.compareLabel) — nothing unique to review."
+            case .mergedPR:
+                return "Nothing left to review on this branch."
+            }
+        }
+        return "No commits or local changes in this scope."
     }
 
     private var stagedContextActions: [LocalScopeContextAction] {
