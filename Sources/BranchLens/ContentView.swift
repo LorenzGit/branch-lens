@@ -1092,58 +1092,77 @@ private struct CommitsPane: View {
                         Text("History")
                             .font(.headline)
                         Spacer()
-                        if model.isLoadingWorkingTree {
+                        if model.isLoadingWorkingTree || model.isLoadingChronologicalCommits {
                             ProgressView().controlSize(.mini)
                         }
                         authorFilterMenu
                     }
 
-                    HStack(spacing: 10) {
-                        Toggle(isOn: Binding(
-                            get: { model.includeLocalChanges },
-                            set: { model.setIncludeLocalChanges($0) }
-                        )) {
-                            Text("Include local changes")
-                                .font(.caption.weight(.semibold))
+                    Picker("History mode", selection: Binding(
+                        get: { model.historyBrowseMode },
+                        set: { model.setHistoryBrowseMode($0) }
+                    )) {
+                        ForEach(HistoryBrowseMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
                         }
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                        .tint(Color.accentColor)
-                        .help("Show Staged/Unstaged scopes and merge local edits into All changes")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .help("Current: commits since Compare. All: full chronological history of this branch.")
 
-                        Spacer(minLength: 0)
-
-                        if model.isLoadingWorkingTree && !model.hasLocalChanges {
-                            ProgressView()
-                                .controlSize(.mini)
-                        } else if model.hasLocalChanges {
-                            HStack(spacing: 6) {
-                                Text("\(model.localChangeFileCount)f")
-                                    .foregroundStyle(.secondary)
-                                    .help("\(model.localChangeFileCount) local file\(model.localChangeFileCount == 1 ? "" : "s") changed")
-                                Text("+\(model.localChangeAdditions)")
-                                    .foregroundStyle(AppTheme.additionText)
-                                    .help("\(model.localChangeAdditions) lines added locally")
-                                Text("−\(model.localChangeDeletions)")
-                                    .foregroundStyle(AppTheme.deletionText)
-                                    .help("\(model.localChangeDeletions) lines deleted locally")
+                    if model.historyBrowseMode == .current {
+                        HStack(spacing: 10) {
+                            Toggle(isOn: Binding(
+                                get: { model.includeLocalChanges },
+                                set: { model.setIncludeLocalChanges($0) }
+                            )) {
+                                Text("Include local changes")
+                                    .font(.caption.weight(.semibold))
                             }
-                            .font(.caption.monospacedDigit().weight(.semibold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(
-                                (model.includeLocalChanges
-                                 ? Color.accentColor.opacity(0.12)
-                                 : Color.orange.opacity(0.12)),
-                                in: Capsule()
-                            )
-                            .help("Local working-tree changes (shown even when Include local changes is off)")
-                        } else {
-                            Text("Clean")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.tertiary)
-                                .help("No local staged or unstaged changes")
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .tint(Color.accentColor)
+                            .help("Show Staged/Unstaged scopes and merge local edits into All changes")
+
+                            Spacer(minLength: 0)
+
+                            if model.isLoadingWorkingTree && !model.hasLocalChanges {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else if model.hasLocalChanges {
+                                HStack(spacing: 6) {
+                                    Text("\(model.localChangeFileCount)f")
+                                        .foregroundStyle(.secondary)
+                                        .help("\(model.localChangeFileCount) local file\(model.localChangeFileCount == 1 ? "" : "s") changed")
+                                    Text("+\(model.localChangeAdditions)")
+                                        .foregroundStyle(AppTheme.additionText)
+                                        .help("\(model.localChangeAdditions) lines added locally")
+                                    Text("−\(model.localChangeDeletions)")
+                                        .foregroundStyle(AppTheme.deletionText)
+                                        .help("\(model.localChangeDeletions) lines deleted locally")
+                                }
+                                .font(.caption.monospacedDigit().weight(.semibold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(
+                                    (model.includeLocalChanges
+                                     ? Color.accentColor.opacity(0.12)
+                                     : Color.orange.opacity(0.12)),
+                                    in: Capsule()
+                                )
+                                .help("Local working-tree changes (shown even when Include local changes is off)")
+                            } else {
+                                Text("Clean")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                                    .help("No local staged or unstaged changes")
+                            }
                         }
+                    } else {
+                        Text("Newest first · scrolls to load more on \(model.selectedBranch.isEmpty ? "this branch" : model.selectedBranch)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
                     }
                 }
                 .padding(.horizontal, 14)
@@ -1151,7 +1170,9 @@ private struct CommitsPane: View {
 
                 Divider().opacity(0.45)
 
-                if historyIsClean {
+                if model.historyBrowseMode == .all {
+                    allCommitsHistoryList
+                } else if historyIsClean {
                     ContentUnavailableView(
                         "Clean",
                         systemImage: "checkmark.circle",
@@ -1288,11 +1309,73 @@ private struct CommitsPane: View {
         .onAppear {
             // Always refresh local stats so the toggle row can show counts even when off.
             Task { await model.reloadWorkingTree() }
+            if model.historyBrowseMode == .all, model.chronologicalCommits.isEmpty {
+                Task { await model.reloadChronologicalCommits(reset: true) }
+            }
         }
         .onChange(of: model.includeLocalChanges) { _, enabled in
             if enabled {
                 Task { await model.reloadWorkingTree() }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var allCommitsHistoryList: some View {
+        if model.isLoadingChronologicalCommits && model.chronologicalCommits.isEmpty {
+            ProgressView("Loading commits…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.displayedHistoryCommits.isEmpty {
+            ContentUnavailableView(
+                model.selectedAuthors.isEmpty ? "No commits" : "No matching commits",
+                systemImage: "clock",
+                description: Text(model.selectedAuthors.isEmpty
+                                   ? "This branch has no commit history."
+                                   : "No commits from the selected authors.")
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 8) {
+                    ForEach(model.displayedHistoryCommits) { commit in
+                        CommitCard(
+                            commit: commit,
+                            pullRequest: model.pullRequest(forCommitHash: commit.hash),
+                            isSelected: {
+                                if case .commit(let hash) = model.changeScope {
+                                    return hash == commit.hash
+                                }
+                                return false
+                            }(),
+                            onSelect: { model.selectCommit(commit) },
+                            onOpenPullRequest: { link in
+                                model.openCommitPullRequestInBrowser(link)
+                            }
+                        )
+                        .onAppear {
+                            Task {
+                                await model.ensureCommitPullRequest(for: commit)
+                                await model.loadMoreChronologicalCommitsIfNeeded(near: commit)
+                            }
+                        }
+                    }
+
+                    if model.isLoadingChronologicalCommits {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                    } else if model.hasMoreChronologicalCommits {
+                        Text("Scroll for older commits")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                    }
+                }
+                .padding(10)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 

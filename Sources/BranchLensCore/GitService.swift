@@ -619,6 +619,24 @@ public actor GitService {
         return result.stdoutText
     }
 
+    /// Newest-first chronological log of `branch` (not limited to COMPARE…BRANCH).
+    /// Use `skip` for progressive infinite loading without a pagination UI.
+    public func listCommitsChronological(
+        in repo: URL,
+        branch: String,
+        limit: Int = 200,
+        skip: Int = 0
+    ) async throws -> [GitCommit] {
+        let capped = max(1, min(limit, 500))
+        let skipped = max(0, skip)
+        var range = "--date-order -\(capped)"
+        if skipped > 0 {
+            range += " --skip=\(skipped)"
+        }
+        range += " \(branch)"
+        return try await listCommits(in: repo, range: range)
+    }
+
     // MARK: - Private
 
     private func listCommits(in repo: URL, from mergeBase: String, to branch: String) async throws -> [GitCommit] {

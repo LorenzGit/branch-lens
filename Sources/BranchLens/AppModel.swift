@@ -49,6 +49,15 @@ enum SidePaneMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum HistoryBrowseMode: String, CaseIterable, Identifiable {
+    /// Commits on BRANCH since COMPARE (default inspector mode).
+    case current = "Current"
+    /// Full chronological log of BRANCH (read-only browsing).
+    case all = "All"
+
+    var id: String { rawValue }
+}
+
 enum InspectorMode: Equatable {
     case file
     case fileLog(path: String)
@@ -95,6 +104,10 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var baseBranch: String = ""
     @Published var snapshot: BranchSnapshot?
     @Published var changeScope: ChangeScope = .combined
+    @Published var historyBrowseMode: HistoryBrowseMode = .current
+    @Published var chronologicalCommits: [GitCommit] = []
+    @Published var isLoadingChronologicalCommits = false
+    @Published var hasMoreChronologicalCommits = false
     @Published var selectedFileID: String?
     /// Multi-select set (⌘/⇧ click). Primary/last focus stays in `selectedFileID`.
     @Published var selectedFileIDs: Set<String> = []
@@ -344,6 +357,26 @@ final class RepoSession: ObservableObject, Identifiable {
         return snapshot.commits.filter { selectedAuthors.contains($0.authorName) }
     }
 
+    /// Commits shown in the History list for the active browse mode.
+    var displayedHistoryCommits: [GitCommit] {
+        let source: [GitCommit]
+        switch historyBrowseMode {
+        case .current:
+            source = snapshot?.commits ?? []
+        case .all:
+            source = chronologicalCommits
+        }
+        if selectedAuthors.isEmpty { return source }
+        return source.filter { selectedAuthors.contains($0.authorName) }
+    }
+
+    /// Staging actions only apply while reviewing Current (COMPARE…BRANCH) work, not full history.
+    var showsStagingActions: Bool {
+        historyBrowseMode == .current
+    }
+
+    private static let chronologicalBatchSize = 200
+
     /// Commits shown under the “fully merged” History banner (author filter applied).
     var filteredMergedCommits: [GitCommit] {
         guard let merged = mergedIntoCompare else { return [] }
@@ -394,6 +427,7 @@ final class RepoSession: ObservableObject, Identifiable {
         case .commit(let hash):
             return snapshot?.commits.first(where: { $0.hash == hash })
                 ?? filteredCommits.first(where: { $0.hash == hash })
+                ?? chronologicalCommits.first(where: { $0.hash == hash })
                 ?? mergedIntoCompare?.commits.first(where: { $0.hash == hash })
         case .combined:
             return filteredCommits.first
@@ -402,6 +436,97 @@ final class RepoSession: ObservableObject, Identifiable {
         case .staged, .unstaged:
             return nil
         }
+    }
+
+    func setHistoryBrowseMode(_ mode: HistoryBrowseMode) {
+        guard historyBrowseMode != mode else { return }
+        historyBrowseMode = mode
+        notifyStateChange()
+        Task { await applyHistoryBrowseModeChange() }
+    }
+
+    /// Keep Changed files / inspector aligned with Current vs All History.
+    private func applyHistoryBrowseModeChange() async {
+        switch historyBrowseMode {
+        case .all:
+            await reloadChronologicalCommits(reset: true)
+            if case .commit(let hash) = changeScope,
+               chronologicalCommits.contains(where: { $0.hash == hash }) {
+                await reloadVisibleFiles(forceInspectorReload: true)
+            } else if let tip = chronologicalCommits.first {
+                changeScope = .commit(tip.hash)
+                notifyStateChange()
+                await reloadVisibleFiles(forceInspectorReload: true)
+            } else {
+                changeScope = .combined
+                notifyStateChange()
+                await reloadVisibleFiles(forceInspectorReload: true)
+            }
+        case .current:
+            if case .commit(let hash) = changeScope,
+               snapshot?.commits.contains(where: { $0.hash == hash }) == true {
+                await reloadVisibleFiles(forceInspectorReload: true)
+            } else {
+                changeScope = .combined
+                notifyStateChange()
+                await reloadVisibleFiles(forceInspectorReload: true)
+            }
+        }
+        contentRefreshNonce &+= 1
+        notifyStateChange()
+    }
+
+    func reloadChronologicalCommits(reset: Bool = true) async {
+        guard let repoPath, !selectedBranch.isEmpty else {
+            chronologicalCommits = []
+            hasMoreChronologicalCommits = false
+            return
+        }
+        if isLoadingChronologicalCommits { return }
+        if !reset, !hasMoreChronologicalCommits { return }
+
+        isLoadingChronologicalCommits = true
+        let skip = reset ? 0 : chronologicalCommits.count
+        do {
+            let batch = try await git.listCommitsChronological(
+                in: repoPath,
+                branch: selectedBranch,
+                limit: Self.chronologicalBatchSize,
+                skip: skip
+            )
+            if reset {
+                chronologicalCommits = batch
+            } else {
+                // Avoid rare overlaps if the tip moved while scrolling.
+                let existing = Set(chronologicalCommits.map(\.hash))
+                chronologicalCommits.append(contentsOf: batch.filter { !existing.contains($0.hash) })
+            }
+            hasMoreChronologicalCommits = batch.count >= Self.chronologicalBatchSize
+        } catch {
+            if reset {
+                chronologicalCommits = []
+                hasMoreChronologicalCommits = false
+            }
+            if historyBrowseMode == .all {
+                errorMessage = error.localizedDescription
+            }
+        }
+        isLoadingChronologicalCommits = false
+        notifyStateChange()
+    }
+
+    /// Infinite-scroll helper: load the next batch when a near-end row appears.
+    func loadMoreChronologicalCommitsIfNeeded(near commit: GitCommit) async {
+        guard historyBrowseMode == .all, hasMoreChronologicalCommits, !isLoadingChronologicalCommits else { return }
+        guard let index = chronologicalCommits.firstIndex(where: { $0.hash == commit.hash }) else { return }
+        let threshold = max(chronologicalCommits.count - 30, 0)
+        guard index >= threshold else { return }
+        await reloadChronologicalCommits(reset: false)
+    }
+
+    /// Lazy PR badge fetch for a single visible History card.
+    func ensureCommitPullRequest(for commit: GitCommit) async {
+        await loadCommitPullRequests(for: [commit])
     }
 
     var scopeCommitSummary: String {
@@ -640,12 +765,14 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     func isUnstaged(_ file: ChangedFile) -> Bool {
+        guard showsStagingActions else { return false }
         if changeScope == .unstaged { return true }
         if changeScope == .staged { return false }
         return workingTreeFiles.contains { $0.path == file.path && $0.area == .unstaged }
     }
 
     func isStaged(_ file: ChangedFile) -> Bool {
+        guard showsStagingActions else { return false }
         if changeScope == .staged { return true }
         if changeScope == .unstaged { return false }
         return workingTreeFiles.contains { $0.path == file.path && $0.area == .staged }
@@ -1062,6 +1189,9 @@ final class RepoSession: ObservableObject, Identifiable {
                 // Snapshot path always rebuilds visible files below — skip nested reload.
                 await reloadWorkingTree(updateVisibleFiles: false)
                 await worktreesReload
+                if historyBrowseMode == .all {
+                    await reloadChronologicalCommits(reset: true)
+                }
                 guard !Task.isCancelled else { return }
                 // Rebuild Changed files from the fresh snapshot + working tree, and
                 // force-reload file contents after fetch/refresh.
@@ -1070,10 +1200,11 @@ final class RepoSession: ObservableObject, Identifiable {
                     contentRefreshNonce &+= 1
                 }
                 notifyStateChange()
-                // Fill PR badges on History cards in the background (don't block refresh).
-                let commitsForPR = snap.commits
-                let forcePR = shouldRefreshPanes
-                Task { await loadCommitPullRequests(for: commitsForPR, force: forcePR) }
+                // PR badges: Current loads the small unique set; All loads lazily per visible card.
+                if historyBrowseMode == .current {
+                    let forcePR = shouldRefreshPanes
+                    Task { await loadCommitPullRequests(for: snap.commits, force: forcePR) }
+                }
                 Task { await loadMergedIntoCompareIfNeeded(for: snap) }
             } catch is CancellationError {
                 // ignore
