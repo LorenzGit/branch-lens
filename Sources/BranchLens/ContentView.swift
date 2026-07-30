@@ -1153,6 +1153,16 @@ private struct CommitsPane: View {
                             }
                         }
 
+                        if let notice = staleCompareHistoryNotice {
+                            StaleCompareHistoryBanner(
+                                notice: notice,
+                                isUpdating: model.isUpdatingFromCompare,
+                                onUpdate: {
+                                    Task { await model.updateLocalCompare() }
+                                }
+                            )
+                        }
+
                         if let merged = model.mergedIntoCompare, model.filteredCommits.isEmpty {
                             MergedIntoCompareCard(
                                 info: merged,
@@ -1237,6 +1247,19 @@ private struct CommitsPane: View {
         let branchCount = model.snapshot?.files.count ?? 0
         guard model.includeLocalChanges else { return branchCount }
         return Set(model.snapshot?.files.map(\.path) ?? []).union(model.workingTreeFiles.map(\.path)).count
+    }
+
+    private var staleCompareHistoryNotice: StaleCompareHistoryNotice? {
+        guard let snapshot = model.snapshot else { return nil }
+        let behind = snapshot.localCompareBehindCount
+        let inherited = snapshot.staleCompareInheritedCommitCount
+        guard behind > 0, inherited > 0, snapshot.compareTip != snapshot.baseBranch else { return nil }
+        return StaleCompareHistoryNotice(
+            localCompare: snapshot.baseBranch,
+            compareTip: snapshot.compareTip,
+            behindCount: behind,
+            inheritedCommitCount: inherited
+        )
     }
 
     @ViewBuilder
@@ -1399,6 +1422,68 @@ private struct LocalScopeCard: View {
                 Button(contextActionTitle, action: onContextAction)
             }
         }
+    }
+}
+
+private struct StaleCompareHistoryNotice: Equatable {
+    let localCompare: String
+    let compareTip: String
+    let behindCount: Int
+    let inheritedCommitCount: Int
+}
+
+private struct StaleCompareHistoryBanner: View {
+    let notice: StaleCompareHistoryNotice
+    let isUpdating: Bool
+    let onUpdate: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "info.circle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Why extra commits / PR badges?")
+                        .font(.caption.weight(.semibold))
+                    Text(explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button {
+                onUpdate()
+            } label: {
+                if isUpdating {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Label("Update \(notice.localCompare)", systemImage: "arrow.down.circle")
+                        .font(.caption.weight(.semibold))
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(isUpdating)
+            .help("Fast-forward local \(notice.localCompare) to \(notice.compareTip) so History only lists commits unique to this branch")
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.28), lineWidth: 1)
+        )
+    }
+
+    private var explanation: String {
+        let commitWord = notice.inheritedCommitCount == 1 ? "commit" : "commits"
+        let behindWord = notice.behindCount == 1 ? "commit" : "commits"
+        return "\(notice.inheritedCommitCount) \(commitWord) below (and their PR badges) are already on \(notice.compareTip). They show up because History compares against local \(notice.localCompare), which is \(notice.behindCount) \(behindWord) behind. Update \(notice.localCompare) to hide them."
     }
 }
 

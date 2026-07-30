@@ -250,10 +250,19 @@ public actor GitService {
         let compareTip = await resolveFreshTip(for: baseBranch, in: repo)
         let compareAheadCount = try await commitCount(in: repo, from: branch, to: compareTip)
         let localCompareBehindCount: Int
+        let staleCompareInheritedCommitCount: Int
         if compareTip == baseBranch {
             localCompareBehindCount = 0
+            staleCompareInheritedCommitCount = 0
         } else {
             localCompareBehindCount = (try? await commitCount(in: repo, from: baseBranch, to: compareTip)) ?? 0
+            // Commits shown via local COMPARE that are already on the fresh tip (noise in History).
+            if localCompareBehindCount > 0 {
+                let uniqueVsCompareTip = (try? await commitCount(in: repo, from: compareTip, to: branch)) ?? commits.count
+                staleCompareInheritedCommitCount = max(0, commits.count - uniqueVsCompareTip)
+            } else {
+                staleCompareInheritedCommitCount = 0
+            }
         }
         let remote = try await remoteTrackingInfo(in: repo, branch: branch)
 
@@ -268,6 +277,7 @@ public actor GitService {
             compareAheadCount: compareAheadCount,
             compareTip: compareTip,
             localCompareBehindCount: localCompareBehindCount,
+            staleCompareInheritedCommitCount: staleCompareInheritedCommitCount,
             aheadOfRemote: remote.ahead,
             behindRemote: remote.behind,
             remoteTrackingBranch: remote.tracking

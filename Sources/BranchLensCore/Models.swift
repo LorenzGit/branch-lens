@@ -101,6 +101,8 @@ public struct BranchSnapshot: Sendable {
     public let compareTip: String
     /// Commits on `compareTip` that are missing from the local COMPARE branch name (stale local `main`).
     public let localCompareBehindCount: Int
+    /// History commits that are already on `compareTip` and only appear because local COMPARE is stale.
+    public let staleCompareInheritedCommitCount: Int
     public let aheadOfRemote: Int?
     public let behindRemote: Int?
     public let remoteTrackingBranch: String?
@@ -119,6 +121,7 @@ public struct BranchSnapshot: Sendable {
         compareAheadCount: Int,
         compareTip: String,
         localCompareBehindCount: Int,
+        staleCompareInheritedCommitCount: Int = 0,
         aheadOfRemote: Int?,
         behindRemote: Int?,
         remoteTrackingBranch: String?
@@ -133,6 +136,7 @@ public struct BranchSnapshot: Sendable {
         self.compareAheadCount = compareAheadCount
         self.compareTip = compareTip
         self.localCompareBehindCount = localCompareBehindCount
+        self.staleCompareInheritedCommitCount = staleCompareInheritedCommitCount
         self.aheadOfRemote = aheadOfRemote
         self.behindRemote = behindRemote
         self.remoteTrackingBranch = remoteTrackingBranch
