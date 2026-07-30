@@ -114,6 +114,11 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var isSearchingCrossFile = false
     /// Find-in-files tool sheet (not always visible in the Files pane).
     @Published var isCrossFileSearchPresented = false
+    /// Commit-staged sheet (from History → Staged card).
+    @Published var isCommitSheetPresented = false
+    @Published var commitMessageDraft = ""
+    @Published var commitShouldPush = false
+    @Published var isCommitting = false
     @Published var filesLayout: FilesLayoutMode = .folders
     @Published var showHistory = true
     @Published var showFiles = true
@@ -705,6 +710,53 @@ final class RepoSession: ObservableObject, Identifiable {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func openCommitSheet() {
+        guard !stagedWorkingTreeFiles.isEmpty else { return }
+        commitMessageDraft = ""
+        commitShouldPush = false
+        errorMessage = nil
+        isCommitSheetPresented = true
+    }
+
+    func commitStaged(message: String, push: Bool) async {
+        guard let repoPath else { return }
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            errorMessage = "Commit message cannot be empty."
+            return
+        }
+        guard !stagedWorkingTreeFiles.isEmpty else {
+            errorMessage = "Nothing staged to commit."
+            return
+        }
+
+        isCommitting = true
+        statusMessage = push ? "Committing and pushing…" : "Committing…"
+        do {
+            try await git.commit(message: trimmed, in: repoPath)
+            if push {
+                try await git.pushCurrentBranch(in: repoPath, branch: selectedBranch)
+            }
+            isCommitSheetPresented = false
+            commitMessageDraft = ""
+            commitShouldPush = false
+            clearInspectorCache()
+            await reloadWorkingTree(updateVisibleFiles: false)
+            await reloadSnapshot(resetScope: false, fetchFirst: false, refreshPanes: true)
+            if changeScope == .staged || changeScope == .unstaged || includeLocalChanges {
+                await reloadVisibleFiles(forceInspectorReload: true)
+            }
+            contentRefreshNonce &+= 1
+            statusMessage = push ? "Committed and pushed." : "Committed."
+            clearStatusEventually(statusMessage)
+            notifyStateChange()
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+        }
+        isCommitting = false
     }
 
     func stageSelectedFiles() async {

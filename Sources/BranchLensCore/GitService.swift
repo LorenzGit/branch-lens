@@ -457,6 +457,32 @@ public actor GitService {
         _ = try await runGit(["restore", "--staged", "--"] + cleaned, in: repo)
     }
 
+    /// Create a commit from the current index with the given message.
+    public func commit(message: String, in repo: URL) async throws {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw GitError.commandFailed("Commit message cannot be empty.")
+        }
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-commit-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: temp) }
+        try trimmed.data(using: .utf8)?.write(to: temp)
+        _ = try await runGit(["commit", "-F", temp.path], in: repo)
+    }
+
+    /// Push the current branch. Sets upstream to `origin/<branch>` when none is configured.
+    public func pushCurrentBranch(in repo: URL, branch: String) async throws {
+        let tracking = try? await runGit(
+            ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+            in: repo
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let tracking, !tracking.isEmpty {
+            _ = try await runGit(["push"], in: repo)
+        } else {
+            _ = try await runGit(["push", "-u", "origin", branch], in: repo)
+        }
+    }
+
     /// Apply a unified diff to the index. `reverse: true` unstages the hunk.
     public func applyPatchToIndex(
         _ patch: String,

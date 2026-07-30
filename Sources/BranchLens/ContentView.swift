@@ -113,6 +113,9 @@ private struct SessionContainer: View {
         .sheet(isPresented: $session.isCrossFileSearchPresented) {
             CrossFileSearchSheet(model: session)
         }
+        .sheet(isPresented: $session.isCommitSheetPresented) {
+            CommitSheet(model: session)
+        }
         .onChange(of: session.searchFocusNonce) { _, _ in
             focusedSearch = session.searchFocusTarget
         }
@@ -1129,10 +1132,7 @@ private struct CommitsPane: View {
                                 tint: AppTheme.additionText,
                                 fileCount: model.stagedWorkingTreeFiles.count,
                                 isSelected: model.changeScope == .staged,
-                                contextActionTitle: model.stagedWorkingTreeFiles.isEmpty ? nil : "Unstage All",
-                                onContextAction: {
-                                    Task { await model.unstageAllStaged() }
-                                }
+                                contextActions: stagedContextActions
                             ) {
                                 model.selectStaged()
                             }
@@ -1144,10 +1144,11 @@ private struct CommitsPane: View {
                                 tint: Color.orange,
                                 fileCount: model.unstagedWorkingTreeFiles.count,
                                 isSelected: model.changeScope == .unstaged,
-                                contextActionTitle: model.unstagedWorkingTreeFiles.isEmpty ? nil : "Stage All",
-                                onContextAction: {
-                                    Task { await model.stageAllUnstaged() }
-                                }
+                                contextActions: model.unstagedWorkingTreeFiles.isEmpty
+                                    ? []
+                                    : [LocalScopeContextAction(title: "Stage All") {
+                                        Task { await model.stageAllUnstaged() }
+                                    }]
                             ) {
                                 model.selectUnstaged()
                             }
@@ -1247,6 +1248,18 @@ private struct CommitsPane: View {
         let branchCount = model.snapshot?.files.count ?? 0
         guard model.includeLocalChanges else { return branchCount }
         return Set(model.snapshot?.files.map(\.path) ?? []).union(model.workingTreeFiles.map(\.path)).count
+    }
+
+    private var stagedContextActions: [LocalScopeContextAction] {
+        guard !model.stagedWorkingTreeFiles.isEmpty else { return [] }
+        return [
+            LocalScopeContextAction(title: "Commit") {
+                model.openCommitSheet()
+            },
+            LocalScopeContextAction(title: "Unstage All") {
+                Task { await model.unstageAllStaged() }
+            },
+        ]
     }
 
     private var staleCompareHistoryNotice: StaleCompareHistoryNotice? {
@@ -1372,6 +1385,12 @@ private struct AllChangesCard: View {
     }
 }
 
+private struct LocalScopeContextAction: Identifiable {
+    var id: String { title }
+    let title: String
+    let action: () -> Void
+}
+
 private struct LocalScopeCard: View {
     let title: String
     let subtitle: String
@@ -1379,8 +1398,7 @@ private struct LocalScopeCard: View {
     let tint: Color
     let fileCount: Int
     let isSelected: Bool
-    var contextActionTitle: String? = nil
-    var onContextAction: (() -> Void)? = nil
+    var contextActions: [LocalScopeContextAction] = []
     let action: () -> Void
 
     var body: some View {
@@ -1418,8 +1436,117 @@ private struct LocalScopeCard: View {
         .buttonStyle(.plain)
         .help("\(title): \(fileCount) file\(fileCount == 1 ? "" : "s")")
         .contextMenu {
-            if let contextActionTitle, let onContextAction {
-                Button(contextActionTitle, action: onContextAction)
+            ForEach(contextActions) { item in
+                Button(item.title, action: item.action)
+            }
+        }
+    }
+}
+
+private struct CommitSheet: View {
+    @ObservedObject var model: RepoSession
+    @FocusState private var messageFocused: Bool
+    @Environment(\.dismiss) private var dismiss
+
+    private var canCommit: Bool {
+        !model.commitMessageDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !model.stagedWorkingTreeFiles.isEmpty
+            && !model.isCommitting
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Text("Commit")
+                    .font(.headline)
+                Spacer()
+                Text("\(model.stagedWorkingTreeFiles.count) staged")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+
+            Divider().opacity(0.45)
+
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Message")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $model.commitMessageDraft)
+                        .font(.body.monospaced())
+                        .focused($messageFocused)
+                        .frame(minHeight: 120, maxHeight: 220)
+                        .padding(8)
+                        .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                        )
+                        .disabled(model.isCommitting)
+                }
+
+                Toggle(isOn: $model.commitShouldPush) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Push after commit")
+                            .font(.callout.weight(.medium))
+                        Text(model.selectedBranch.isEmpty
+                              ? "Push to the remote"
+                              : "Push \(model.selectedBranch) to its remote")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+                .disabled(model.isCommitting)
+
+                if let error = model.errorMessage, model.isCommitSheetPresented {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(16)
+
+            Divider().opacity(0.45)
+
+            HStack {
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                .disabled(model.isCommitting)
+
+                Spacer()
+
+                Button {
+                    Task {
+                        await model.commitStaged(
+                            message: model.commitMessageDraft,
+                            push: model.commitShouldPush
+                        )
+                    }
+                } label: {
+                    if model.isCommitting {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text(model.commitShouldPush ? "Commit & Push" : "Commit")
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(!canCommit)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .frame(minWidth: 440, idealWidth: 480, minHeight: 340)
+        .onAppear {
+            DispatchQueue.main.async {
+                messageFocused = true
             }
         }
     }
