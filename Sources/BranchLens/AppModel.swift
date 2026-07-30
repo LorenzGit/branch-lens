@@ -90,6 +90,8 @@ final class RepoSession: ObservableObject, Identifiable {
         Dictionary(uniqueKeysWithValues: branchRecords.map { ($0.name, $0.tipDate) })
     }
     @Published var selectedBranch: String = ""
+    /// Branch currently checked out in this worktree (`git branch --show-current`).
+    @Published var checkedOutBranch: String?
     @Published var baseBranch: String = ""
     @Published var snapshot: BranchSnapshot?
     @Published var changeScope: ChangeScope = .combined
@@ -474,6 +476,7 @@ final class RepoSession: ObservableObject, Identifiable {
             let names = listed.map(\.name)
             let memory = RepoMemory.load(for: root)
             let current = try await git.currentBranch(in: root)
+            checkedOutBranch = current
             let detectedBase = try await git.detectBaseBranch(in: root, branches: names) ?? ""
 
             if let preferredBranch, names.contains(preferredBranch) {
@@ -1032,6 +1035,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 let snap = try await git.loadSnapshot(repo: repoPath, branch: branch, baseBranch: base)
                 guard !Task.isCancelled else { return }
                 snapshot = snap
+                checkedOutBranch = try? await git.currentBranch(in: repoPath)
                 selectedAuthors = selectedAuthors.filter { author in
                     snap.commits.contains { $0.authorName == author }
                 }

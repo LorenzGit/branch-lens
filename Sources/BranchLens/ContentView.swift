@@ -251,6 +251,7 @@ private struct ToolbarView: View {
                         options: model.branches,
                         tipDates: model.branchTipDates,
                         emphasized: true,
+                        checkedOutBranch: model.checkedOutBranch,
                         badge: upstreamBadge(for: model.snapshot),
                         badgeHelp: upstreamBadgeHelp(for: model.snapshot),
                         badgeStyle: upstreamBadgeStyle(for: model.snapshot),
@@ -633,6 +634,8 @@ private struct BranchMenu: View {
     let options: [String]
     var tipDates: [String: Date] = [:]
     let emphasized: Bool
+    /// Git HEAD in this worktree — highlighted in the list when set.
+    var checkedOutBranch: String? = nil
     var badge: String? = nil
     var badgeHelp: String? = nil
     var badgeStyle: BranchBadgeStyle = .neutral
@@ -782,19 +785,31 @@ private struct BranchMenu: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(filteredOptions, id: \.self) { branch in
+                            let isCheckedOut = checkedOutBranch == branch
+                            let isInspecting = branch == value
                             Button {
                                 onSelect(branch)
                                 isOpen = false
                             } label: {
                                 HStack(spacing: 8) {
-                                    Image(systemName: branch == value ? "checkmark" : "arrow.triangle.branch")
+                                    Image(systemName: isCheckedOut
+                                          ? "checkmark.circle.fill"
+                                          : (isInspecting ? "checkmark" : "arrow.triangle.branch"))
                                         .font(.caption2.weight(.bold))
-                                        .foregroundStyle(branch == value ? Color.accentColor : .secondary)
+                                        .foregroundStyle(isCheckedOut || isInspecting ? Color.accentColor : .secondary)
                                         .frame(width: 14)
                                     Text(branch)
-                                        .font(.callout.monospaced())
+                                        .font(.callout.monospaced().weight(isCheckedOut ? .semibold : .regular))
                                         .lineLimit(1)
                                         .fixedSize(horizontal: true, vertical: false)
+                                    if isCheckedOut {
+                                        Text("HEAD")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(Color.accentColor)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.accentColor.opacity(0.16), in: Capsule())
+                                    }
                                     Spacer(minLength: 0)
                                     if sortMode == .date, let date = tipDates[branch] {
                                         Text(date, style: .relative)
@@ -807,12 +822,18 @@ private struct BranchMenu: View {
                                 .padding(.vertical, 6)
                                 .background(
                                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(branch == value ? Color.accentColor.opacity(0.14) : Color.clear)
+                                        .fill(isCheckedOut
+                                              ? Color.accentColor.opacity(0.18)
+                                              : (isInspecting ? Color.accentColor.opacity(0.08) : Color.clear))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .strokeBorder(isCheckedOut ? Color.accentColor.opacity(0.45) : Color.clear, lineWidth: 1)
                                 )
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .help(branchHelp(for: branch))
+                            .help(branchHelp(for: branch, isCheckedOut: isCheckedOut, isInspecting: isInspecting))
                         }
                     }
                 }
@@ -823,12 +844,15 @@ private struct BranchMenu: View {
         .frame(width: popoverWidth)
     }
 
-    private func branchHelp(for branch: String) -> String {
+    private func branchHelp(for branch: String, isCheckedOut: Bool = false, isInspecting: Bool = false) -> String {
+        var lines: [String] = ["Select \(branch)"]
+        if isCheckedOut { lines.append("Checked out in this worktree (HEAD)") }
+        if isInspecting, !isCheckedOut { lines.append("Currently inspecting in BranchLens") }
         if let date = tipDates[branch] {
             let formatted = date.formatted(date: .abbreviated, time: .shortened)
-            return "Select \(branch)\nTip: \(formatted)"
+            lines.append("Tip: \(formatted)")
         }
-        return "Select \(branch)"
+        return lines.joined(separator: "\n")
     }
 }
 
