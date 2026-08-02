@@ -2774,50 +2774,108 @@ private struct FileInspectorView: View {
             }
 
             HStack(spacing: 10) {
-                if showsRevisionModes {
-                    Picker(selection: $model.fileViewMode) {
-                        ForEach(FileViewMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
+                if model.isEditingFile {
+                    Button {
+                        model.undoFileEdit()
                     } label: {
-                        EmptyView()
+                        Label("Undo", systemImage: "arrow.uturn.backward")
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 360)
-                    .help("View mode: Diff, Before, After, or side-by-side Compare")
-                }
-
-                if model.selectedFileIsMarkdown {
-                    Toggle(isOn: $model.showMarkdownPreview) {
-                        Text("Preview")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .toggleStyle(.switch)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("Render Markdown instead of raw source")
-                }
+                    .disabled(!model.editCanUndo)
+                    .help("Undo edit (⌘Z)")
 
-                if let file = model.selectedFile, model.isUnstaged(file) {
-                    Button("Stage File") {
-                        Task { await model.stageFile(file) }
+                    Button {
+                        model.redoFileEdit()
+                    } label: {
+                        Label("Redo", systemImage: "arrow.uturn.forward")
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!model.editCanRedo)
+                    .help("Redo edit (⌘⇧Z)")
+
+                    Button("Cancel") {
+                        model.cancelEditingFile()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .keyboardShortcut(.cancelAction)
+                    .help("Discard edits and return to the viewer")
+
+                    Button {
+                        Task { await model.saveEditingFile() }
+                    } label: {
+                        if model.isSavingEdit {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Save")
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .help("Stage this file into the index")
-                }
-                if let file = model.selectedFile, model.isStaged(file) {
-                    Button("Unstage File") {
-                        Task { await model.unstageFile(file) }
+                    .disabled(model.isSavingEdit)
+                    .keyboardShortcut("s", modifiers: [.command])
+                    .help("Write edits to the working tree (⌘S)")
+                } else {
+                    if showsRevisionModes {
+                        Picker(selection: $model.fileViewMode) {
+                            ForEach(FileViewMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        } label: {
+                            EmptyView()
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 360)
+                        .help("View mode: Diff, Before, After, or side-by-side Compare")
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .help("Unstage this file from the index")
+
+                    if model.selectedFileIsMarkdown {
+                        Toggle(isOn: $model.showMarkdownPreview) {
+                            Text("Preview")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .help("Render Markdown instead of raw source")
+                    }
+
+                    if model.canEditWorkingTreeContents {
+                        Button("Edit") {
+                            model.beginEditingFile()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Edit this file in the working tree")
+                    }
+
+                    if let file = model.selectedFile, model.isUnstaged(file) {
+                        Button("Stage File") {
+                            Task { await model.stageFile(file) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .help("Stage this file into the index")
+                    }
+                    if let file = model.selectedFile, model.isStaged(file) {
+                        Button("Unstage File") {
+                            Task { await model.unstageFile(file) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .help("Unstage this file from the index")
+                    }
                 }
 
                 Spacer(minLength: 8)
 
-                if !model.hasImagePreview && !(model.selectedFileIsMarkdown && model.showMarkdownPreview) {
+                if !model.isEditingFile,
+                   !model.hasImagePreview,
+                   !(model.selectedFileIsMarkdown && model.showMarkdownPreview) {
                     HStack(spacing: 6) {
                         Image(systemName: "text.magnifyingglass")
                             .foregroundStyle(.secondary)
@@ -2847,6 +2905,13 @@ private struct FileInspectorView: View {
                     .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .help("Search in the current file view")
                     .onTapGesture { model.preferContentSearch() }
+                } else if model.isEditingFile && model.isEditDraftDirty {
+                    Text("Unsaved")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.orange)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.orange.opacity(0.16), in: Capsule())
                 }
             }
         }
@@ -2878,6 +2943,19 @@ private struct FileInspectorView: View {
                 systemImage: "doc.text.magnifyingglass",
                 description: Text("Choose a changed file to inspect Diff, Before, or After.")
             )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.isEditingFile {
+            EditableCodePane(
+                title: "Editing",
+                subtitle: model.selectedFile?.path ?? "Working tree",
+                accent: Color.orange,
+                text: $model.editDraft,
+                onUndoStateChange: { canUndo, canRedo in
+                    model.updateEditUndoState(canUndo: canUndo, canRedo: canRedo)
+                }
+            )
+            .id("edit-\(model.editSessionNonce)-\(model.selectedFileID ?? "")")
+            .padding(10)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.hasImagePreview {
             imageInspectorContent

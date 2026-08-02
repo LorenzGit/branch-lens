@@ -87,6 +87,32 @@ final class GitServiceTests: XCTestCase {
         XCTAssertEqual(netFile.deletions, 0)
     }
 
+    func testWriteWorkingTreeFileRoundTrip() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-write-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "old\n".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        let git = GitService()
+        try await git.writeWorkingTreeFile(in: root, path: "nested/dir/note.txt", contents: "hello\nworld\n")
+        let read = try await git.workingTreeFileContents(in: root, path: "nested/dir/note.txt")
+        XCTAssertEqual(read, "hello\nworld\n")
+
+        do {
+            try await git.writeWorkingTreeFile(in: root, path: "../outside.txt", contents: "nope")
+            XCTFail("Expected path escape to fail")
+        } catch {
+            // expected
+        }
+    }
+
     private func run(in directory: URL, _ executable: String, _ args: String...) async throws {
         let result = try await ProcessRunner.run(
             executable: URL(fileURLWithPath: executable),

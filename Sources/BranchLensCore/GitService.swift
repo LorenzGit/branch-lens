@@ -602,6 +602,28 @@ public actor GitService {
         return Self.cappedBlob(data)
     }
 
+    /// Write UTF-8 text to a working-tree path (creates intermediate directories).
+    public func writeWorkingTreeFile(in repo: URL, path: String, contents: String) async throws {
+        let cleaned = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty, !cleaned.hasPrefix("/"), !cleaned.contains("\0") else {
+            throw GitError.commandFailed("Invalid path for write.")
+        }
+        // Refuse path escape outside the repo.
+        let url = repo.appendingPathComponent(cleaned).standardizedFileURL
+        let repoPath = repo.standardizedFileURL.path
+        guard url.path == repoPath || url.path.hasPrefix(repoPath + "/") else {
+            throw GitError.commandFailed("Refusing to write outside the repository.")
+        }
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard let data = contents.data(using: .utf8) else {
+            throw GitError.commandFailed("Could not encode file as UTF-8.")
+        }
+        try data.write(to: url, options: .atomic)
+    }
+
     public func listWorktrees(in repo: URL) async throws -> [GitWorktree] {
         let output = try await runGit(["worktree", "list", "--porcelain"], in: repo)
         var worktrees: [GitWorktree] = []

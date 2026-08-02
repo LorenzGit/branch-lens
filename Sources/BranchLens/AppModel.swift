@@ -120,6 +120,16 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var fileViewMode: FileViewMode = .diff
     /// Render Markdown instead of raw source when the selected file is `.md`.
     @Published var showMarkdownPreview = false
+    /// Inline editing of the working-tree file in the inspector.
+    @Published var isEditingFile = false
+    @Published var editDraft = ""
+    /// Contents when the edit session started (for dirty detection).
+    private var editBaseline = ""
+    @Published var editCanUndo = false
+    @Published var editCanRedo = false
+    @Published var isSavingEdit = false
+    /// Remount key so each edit session starts with a clean undo stack.
+    @Published var editSessionNonce = 0
     @Published var visibleFiles: [ChangedFile] = []
     @Published var fileDiff: String = ""
     @Published var beforeContents: String?
@@ -730,12 +740,14 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     func selectCombined() {
+        cancelEditingFile()
         changeScope = .combined
         notifyStateChange()
         Task { await reloadVisibleFiles() }
     }
 
     func selectStaged() {
+        cancelEditingFile()
         includeLocalChanges = true
         changeScope = .staged
         notifyStateChange()
@@ -743,6 +755,7 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     func selectUnstaged() {
+        cancelEditingFile()
         includeLocalChanges = true
         changeScope = .unstaged
         notifyStateChange()
@@ -750,6 +763,7 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     func selectCommit(_ commit: GitCommit) {
+        cancelEditingFile()
         changeScope = .commit(commit.hash)
         notifyStateChange()
         Task { await reloadVisibleFiles() }
@@ -1362,6 +1376,9 @@ final class RepoSession: ObservableObject, Identifiable {
         if case .fileLog = inspectorMode {
             closeFileLog()
         }
+        if isEditingFile, selectedFileID != file.id {
+            cancelEditingFile()
+        }
         let alreadySelected = selectedFileID == file.id && selectedFileIDs == [file.id]
         selectedFileID = file.id
         selectedFileIDs = [file.id]
@@ -1959,6 +1976,7 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func clearFileInspector() {
+        cancelEditingFile()
         fileDiff = ""
         beforeContents = nil
         afterContents = nil
@@ -1975,6 +1993,111 @@ final class RepoSession: ObservableObject, Identifiable {
 
     var hasImagePreview: Bool {
         beforeImageData != nil || afterImageData != nil
+    }
+
+    /// True when the inspector can open an inline editor for the on-disk working tree file.
+    var canEditWorkingTreeContents: Bool {
+        guard showsStagingActions else { return false }
+        guard !hasMultiFileSelection, !hasImagePreview, !isLoadingFile else { return false }
+        guard let file = selectedFile, file.status != .deleted else { return false }
+        switch changeScope {
+        case .combined, .unstaged:
+            // Text must be loadable (or empty new file). Binary/image → afterContents nil.
+            if file.status == .added { return true }
+            return afterContents != nil || afterLabel == "Working tree"
+        case .staged, .commit:
+            return false
+        }
+    }
+
+    var isEditDraftDirty: Bool {
+        guard isEditingFile else { return false }
+        return editDraft != editBaseline
+    }
+
+    func beginEditingFile() {
+        guard canEditWorkingTreeContents, let file = selectedFile else { return }
+        showMarkdownPreview = false
+        if file.status != .added && file.status != .deleted {
+            fileViewMode = .after
+        }
+        let needsLocal = {
+            if case .combined = changeScope { return !includeLocalChanges }
+            return false
+        }()
+        Task {
+            if needsLocal {
+                includeLocalChanges = true
+                await reloadWorkingTree(updateVisibleFiles: false)
+                await reloadAllChangesWithLocal()
+            }
+            await startEditingSession(for: file)
+        }
+    }
+
+    private func startEditingSession(for file: ChangedFile) async {
+        guard let repoPath else { return }
+        do {
+            let disk = try await git.workingTreeFileContents(in: repoPath, path: file.path)
+            editDraft = disk ?? afterContents ?? ""
+        } catch {
+            editDraft = afterContents ?? ""
+        }
+        editBaseline = editDraft
+        editCanUndo = false
+        editCanRedo = false
+        editSessionNonce &+= 1
+        isEditingFile = true
+        notifyStateChange()
+    }
+
+    func cancelEditingFile() {
+        guard isEditingFile else { return }
+        isEditingFile = false
+        editDraft = ""
+        editBaseline = ""
+        editCanUndo = false
+        editCanRedo = false
+        isSavingEdit = false
+        notifyStateChange()
+    }
+
+    func updateEditUndoState(canUndo: Bool, canRedo: Bool) {
+        if editCanUndo != canUndo { editCanUndo = canUndo }
+        if editCanRedo != canRedo { editCanRedo = canRedo }
+    }
+
+    func undoFileEdit() {
+        NSApp.sendAction(Selector(("undo:")), to: nil, from: nil)
+    }
+
+    func redoFileEdit() {
+        NSApp.sendAction(Selector(("redo:")), to: nil, from: nil)
+    }
+
+    func saveEditingFile() async {
+        guard isEditingFile, let file = selectedFile, let repoPath else { return }
+        isSavingEdit = true
+        errorMessage = nil
+        do {
+            try await git.writeWorkingTreeFile(in: repoPath, path: file.path, contents: editDraft)
+            isEditingFile = false
+            editDraft = ""
+            editBaseline = ""
+            editCanUndo = false
+            editCanRedo = false
+            clearInspectorCache()
+            await reloadWorkingTree(updateVisibleFiles: false)
+            await reloadAllChangesWithLocal()
+            await reloadVisibleFiles(forceInspectorReload: true)
+            contentRefreshNonce &+= 1
+            statusMessage = "Saved \(file.path)"
+            clearStatusEventually(statusMessage)
+            notifyStateChange()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isSavingEdit = false
     }
 
     var selectedFileIsMarkdown: Bool {
