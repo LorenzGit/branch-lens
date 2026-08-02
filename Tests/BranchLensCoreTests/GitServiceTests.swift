@@ -47,6 +47,46 @@ final class GitServiceTests: XCTestCase {
         XCTAssertTrue(diff.contains("+more"))
     }
 
+    func testChangedFilesToWorktreeNetsOverlappingBranchAndLocalEdits() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-net-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+
+        try "keep\n".write(to: root.appendingPathComponent("story.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        try await run(in: root, "/usr/bin/git", "checkout", "-b", "feature")
+        // Branch adds 3 lines (analogous to the +35 case).
+        try "keep\na\nb\nc\n".write(to: root.appendingPathComponent("story.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "add lines")
+
+        // Locally remove 1 of the newly added lines (analogous to the −2 case).
+        try "keep\na\nc\n".write(to: root.appendingPathComponent("story.txt"), atomically: true, encoding: .utf8)
+
+        let git = GitService()
+        let snapshot = try await git.loadSnapshot(repo: root, branch: "feature", baseBranch: "main")
+        let branchFile = try XCTUnwrap(snapshot.files.first { $0.path == "story.txt" })
+        XCTAssertEqual(branchFile.additions, 3)
+        XCTAssertEqual(branchFile.deletions, 0)
+
+        let local = try await git.workingTreeStatus(in: root)
+        let unstaged = try XCTUnwrap(local.first { $0.path == "story.txt" && $0.area == .unstaged })
+        XCTAssertEqual(unstaged.additions, 0)
+        XCTAssertEqual(unstaged.deletions, 1)
+
+        let net = try await git.changedFilesToWorktree(in: root, from: snapshot.mergeBase)
+        let netFile = try XCTUnwrap(net.first { $0.path == "story.txt" })
+        XCTAssertEqual(netFile.additions, 2)
+        XCTAssertEqual(netFile.deletions, 0)
+    }
+
     private func run(in directory: URL, _ executable: String, _ args: String...) async throws {
         let result = try await ProcessRunner.run(
             executable: URL(fileURLWithPath: executable),

@@ -526,24 +526,80 @@ public actor GitService {
         return try await runGit(args, in: repo)
     }
 
+    /// Net file list from `revision` to the working tree (branch commits + staged/unstaged),
+    /// with additions/deletions that cancel overlapping edits (unlike summing separate diffs).
+    public func changedFilesToWorktree(in repo: URL, from revision: String) async throws -> [ChangedFile] {
+        let nameStatus = try await runGit(
+            ["diff", "--name-status", "--find-renames", revision],
+            in: repo
+        )
+        let numStat = try await runGit(
+            ["diff", "--numstat", "--find-renames", revision],
+            in: repo
+        )
+        var files = parseChangedFiles(nameStatus: nameStatus, numStat: numStat)
+        let tracked = Set(files.map(\.path))
+
+        let untrackedOutput = try await runGit(
+            ["ls-files", "--others", "--exclude-standard"],
+            in: repo
+        )
+        for path in untrackedOutput.split(whereSeparator: \.isNewline).map(String.init) {
+            guard !path.isEmpty, !tracked.contains(path) else { continue }
+            let additions = Self.lineCount(ofFileAt: repo.appendingPathComponent(path))
+            files.append(ChangedFile(
+                status: .added,
+                path: path,
+                additions: additions,
+                deletions: 0
+            ))
+        }
+
+        return files.sorted {
+            $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending
+        }
+    }
+
+    private static func lineCount(ofFileAt url: URL) -> Int {
+        guard let data = try? Data(contentsOf: url), !data.contains(0) else { return 0 }
+        guard let text = String(data: data, encoding: .utf8) else { return 0 }
+        if text.isEmpty { return 0 }
+        let count = text.split(separator: "\n", omittingEmptySubsequences: false).count
+        // Trailing newline does not add an extra empty line for numstat-style counts.
+        return text.hasSuffix("\n") ? max(count - 1, 0) : count
+    }
+
     /// Blob currently in the index (`:path`).
     public func indexFileContents(in repo: URL, path: String) async throws -> String? {
+        guard let data = try await indexFileData(in: repo, path: path) else { return nil }
+        if data.contains(0) { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Raw index blob bytes (`:path`).
+    public func indexFileData(in repo: URL, path: String) async throws -> Data? {
         let result = try await ProcessRunner.run(
             executable: gitURL,
             arguments: ["show", ":\(path)"],
             currentDirectory: repo
         )
-        if result.status != 0 || result.stdout.contains(0) { return nil }
-        return result.stdoutText
+        if result.status != 0 { return nil }
+        return Self.cappedBlob(result.stdout)
     }
 
     /// On-disk working tree file contents.
     public func workingTreeFileContents(in repo: URL, path: String) async throws -> String? {
+        guard let data = try await workingTreeFileData(in: repo, path: path) else { return nil }
+        if data.contains(0) { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// On-disk working tree file bytes.
+    public func workingTreeFileData(in repo: URL, path: String) async throws -> Data? {
         let url = repo.appendingPathComponent(path)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url)
-        if data.contains(0) { return nil }
-        return String(data: data, encoding: .utf8)
+        return Self.cappedBlob(data)
     }
 
     public func listWorktrees(in repo: URL) async throws -> [GitWorktree] {
@@ -595,6 +651,18 @@ public actor GitService {
         revision: String,
         path: String
     ) async throws -> String? {
+        guard let data = try await fileData(in: repo, revision: revision, path: path) else { return nil }
+        // Avoid dumping huge binaries into the UI as text.
+        if data.contains(0) { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    /// Raw file bytes at a revision. Returns `nil` when missing.
+    public func fileData(
+        in repo: URL,
+        revision: String,
+        path: String
+    ) async throws -> Data? {
         let result = try await ProcessRunner.run(
             executable: gitURL,
             arguments: ["show", "\(revision):\(path)"],
@@ -612,11 +680,14 @@ public actor GitService {
             let message = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
             throw GitError.commandFailed(message.isEmpty ? "git show failed (\(result.status))" : message)
         }
-        // Avoid dumping huge binaries into the UI.
-        if result.stdout.contains(0) {
-            return nil
-        }
-        return result.stdoutText
+        return Self.cappedBlob(result.stdout)
+    }
+
+    private static let maxBlobBytes = 25 * 1024 * 1024
+
+    private static func cappedBlob(_ data: Data) -> Data? {
+        guard data.count <= maxBlobBytes else { return nil }
+        return data
     }
 
     /// Newest-first chronological log of `branch` (not limited to COMPARE…BRANCH).

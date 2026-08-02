@@ -84,4 +84,22 @@ enum TextUtilities {
         }
         return count
     }
+
+    private static let imageExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "ico", "heic", "heif",
+    ]
+
+    private static let markdownExtensions: Set<String> = [
+        "md", "markdown", "mdown", "mkd", "mdx",
+    ]
+
+    static func isImagePath(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return imageExtensions.contains(ext)
+    }
+
+    static func isMarkdownPath(_ path: String) -> Bool {
+        let ext = (path as NSString).pathExtension.lowercased()
+        return markdownExtensions.contains(ext)
+    }
 }

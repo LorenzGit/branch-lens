@@ -1189,9 +1189,9 @@ private struct CommitsPane: View {
                                 stagedCount: model.stagedWorkingTreeFiles.count,
                                 unstagedCount: model.unstagedWorkingTreeFiles.count,
                                 includeLocal: model.includeLocalChanges,
-                                fileCount: allChangesFileCount,
-                                additions: model.snapshot?.totalAdditions ?? 0,
-                                deletions: model.snapshot?.totalDeletions ?? 0
+                                fileCount: model.allChangesDisplayedFileCount,
+                                additions: model.allChangesDisplayedAdditions,
+                                deletions: model.allChangesDisplayedDeletions
                             ) {
                                 model.selectCombined()
                             }
@@ -1379,12 +1379,6 @@ private struct CommitsPane: View {
         }
     }
 
-    private var allChangesFileCount: Int {
-        let branchCount = model.snapshot?.files.count ?? 0
-        guard model.includeLocalChanges else { return branchCount }
-        return Set(model.snapshot?.files.map(\.path) ?? []).union(model.workingTreeFiles.map(\.path)).count
-    }
-
     /// No unique branch commits, no local edits to browse, and nothing useful in the merged fallback.
     private var historyIsClean: Bool {
         if !model.filteredCommits.isEmpty { return false }
@@ -1515,7 +1509,7 @@ private struct AllChangesCard: View {
                         .background(tint.opacity(0.16), in: Capsule())
                 }
                 Text(includeLocal
-                     ? "Branch commits plus staged and unstaged local edits."
+                     ? "Net of branch commits and local edits versus COMPARE."
                      : "Review the whole branch as a single change set.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -2794,6 +2788,16 @@ private struct FileInspectorView: View {
                     .help("View mode: Diff, Before, After, or side-by-side Compare")
                 }
 
+                if model.selectedFileIsMarkdown {
+                    Toggle(isOn: $model.showMarkdownPreview) {
+                        Text("Preview")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .help("Render Markdown instead of raw source")
+                }
+
                 if let file = model.selectedFile, model.isUnstaged(file) {
                     Button("Stage File") {
                         Task { await model.stageFile(file) }
@@ -2813,35 +2817,37 @@ private struct FileInspectorView: View {
 
                 Spacer(minLength: 8)
 
-                HStack(spacing: 6) {
-                    Image(systemName: "text.magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    TextField("Search in view…", text: $model.contentQuery)
-                        .textFieldStyle(.plain)
-                        .focused(focusedSearch, equals: .content)
-                        .frame(minWidth: 140, maxWidth: 220)
-                        .help("Search in the current file view (⌘F)")
-                        .onTapGesture { model.preferContentSearch() }
-                    if !model.contentQuery.isEmpty {
-                        Text("\(model.contentMatchCount)")
-                            .font(.caption.monospacedDigit().weight(.semibold))
+                if !model.hasImagePreview && !(model.selectedFileIsMarkdown && model.showMarkdownPreview) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "text.magnifyingglass")
                             .foregroundStyle(.secondary)
-                            .help("\(model.contentMatchCount) match\(model.contentMatchCount == 1 ? "" : "es")")
-                        Button {
-                            model.contentQuery = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
+                        TextField("Search in view…", text: $model.contentQuery)
+                            .textFieldStyle(.plain)
+                            .focused(focusedSearch, equals: .content)
+                            .frame(minWidth: 140, maxWidth: 220)
+                            .help("Search in the current file view (⌘F)")
+                            .onTapGesture { model.preferContentSearch() }
+                        if !model.contentQuery.isEmpty {
+                            Text("\(model.contentMatchCount)")
+                                .font(.caption.monospacedDigit().weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .help("\(model.contentMatchCount) match\(model.contentMatchCount == 1 ? "" : "es")")
+                            Button {
+                                model.contentQuery = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Clear content search")
                         }
-                        .buttonStyle(.plain)
-                        .help("Clear content search")
                     }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .help("Search in the current file view")
+                    .onTapGesture { model.preferContentSearch() }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .help("Search in the current file view")
-                .onTapGesture { model.preferContentSearch() }
             }
         }
         .padding(.horizontal, 12)
@@ -2859,7 +2865,11 @@ private struct FileInspectorView: View {
 
     @ViewBuilder
     private var content: some View {
-        if model.isLoadingFile && model.fileDiff.isEmpty && model.beforeContents == nil && model.afterContents == nil {
+        if model.isLoadingFile
+            && model.fileDiff.isEmpty
+            && model.beforeContents == nil
+            && model.afterContents == nil
+            && !model.hasImagePreview {
             ProgressView("Loading file…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.selectedFile == nil {
@@ -2869,6 +2879,8 @@ private struct FileInspectorView: View {
                 description: Text("Choose a changed file to inspect Diff, Before, or After.")
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.hasImagePreview {
+            imageInspectorContent
         } else if model.selectedFile?.status == .added {
             CodePane(
                 title: "Contents",
@@ -2878,9 +2890,10 @@ private struct FileInspectorView: View {
                 path: model.selectedFile?.path ?? "file.txt",
                 placeholder: "New file is empty or could not be loaded.",
                 lineCount: model.afterLineCount,
-                searchQuery: model.contentQuery
+                searchQuery: model.contentQuery,
+                markdownPreview: model.selectedFileIsMarkdown && model.showMarkdownPreview
             )
-            .id("added-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+            .id("added-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")-\(model.showMarkdownPreview)")
             .padding(10)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.selectedFile?.status == .deleted {
@@ -2892,39 +2905,52 @@ private struct FileInspectorView: View {
                 path: model.selectedFile?.oldPath ?? model.selectedFile?.path ?? "file.txt",
                 placeholder: "Deleted file could not be loaded.",
                 lineCount: model.beforeLineCount,
-                searchQuery: model.contentQuery
+                searchQuery: model.contentQuery,
+                markdownPreview: model.selectedFileIsMarkdown && model.showMarkdownPreview
             )
-            .id("deleted-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+            .id("deleted-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")-\(model.showMarkdownPreview)")
             .padding(10)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
+            let mdPreview = model.selectedFileIsMarkdown && model.showMarkdownPreview
             switch model.fileViewMode {
             case .diff:
-                if let file = model.selectedFile,
-                   model.changeScope == .unstaged || model.changeScope == .staged {
-                    HunkDiffView(
-                        text: model.fileDiff,
-                        path: file.path,
-                        searchQuery: model.contentQuery,
-                        actionTitle: model.changeScope == .staged ? "Unstage Hunk" : "Stage Hunk"
-                    ) { hunk in
-                        Task {
-                            if model.changeScope == .staged {
-                                await model.unstageHunk(hunk, for: file)
-                            } else {
-                                await model.stageHunk(hunk, for: file)
-                            }
-                        }
-                    }
-                    .id("hunks-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                if mdPreview {
+                    // Rendered After (Diff hunks aren't meaningful in preview mode).
+                    MarkdownPreviewPane(
+                        title: "Preview",
+                        subtitle: model.afterLabel,
+                        accent: AppTheme.additionText,
+                        source: model.afterContents ?? model.beforeContents,
+                        placeholder: "Markdown could not be loaded."
+                    )
+                    .id("md-diff-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                    .padding(10)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    DiffScrollView(
+                    let path = model.selectedFile?.path ?? "file.txt"
+                    let canStageHunks = model.changeScope == .unstaged || model.changeScope == .staged
+                    HunkDiffView(
                         text: model.fileDiff,
-                        path: model.selectedFile?.path ?? "file.txt",
-                        searchQuery: model.contentQuery
+                        path: path,
+                        searchQuery: model.contentQuery,
+                        actionTitle: canStageHunks
+                            ? (model.changeScope == .staged ? "Unstage Hunk" : "Stage Hunk")
+                            : nil,
+                        onHunkAction: canStageHunks
+                            ? { hunk in
+                                guard let file = model.selectedFile else { return }
+                                Task {
+                                    if model.changeScope == .staged {
+                                        await model.unstageHunk(hunk, for: file)
+                                    } else {
+                                        await model.stageHunk(hunk, for: file)
+                                    }
+                                }
+                            }
+                            : nil
                     )
-                    .id("diff-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                    .id("hunks-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")-\(canStageHunks)")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             case .before:
@@ -2938,9 +2964,10 @@ private struct FileInspectorView: View {
                     lineCount: model.beforeLineCount,
                     searchQuery: model.contentQuery,
                     emphasizedLines: model.compareChangedLineNumbers.deleted,
-                    lineEmphasis: .deletion
+                    lineEmphasis: .deletion,
+                    markdownPreview: mdPreview
                 )
-                .id("before-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                .id("before-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")-\(mdPreview)")
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .after:
@@ -2954,9 +2981,10 @@ private struct FileInspectorView: View {
                     lineCount: model.afterLineCount,
                     searchQuery: model.contentQuery,
                     emphasizedLines: model.compareChangedLineNumbers.added,
-                    lineEmphasis: .addition
+                    lineEmphasis: .addition,
+                    markdownPreview: mdPreview
                 )
-                .id("after-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                .id("after-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")-\(mdPreview)")
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .compare:
@@ -2972,7 +3000,8 @@ private struct FileInspectorView: View {
                         lineCount: model.beforeLineCount,
                         searchQuery: model.contentQuery,
                         emphasizedLines: changed.deleted,
-                        lineEmphasis: .deletion
+                        lineEmphasis: .deletion,
+                        markdownPreview: mdPreview
                     )
                     CodePane(
                         title: "After",
@@ -2984,10 +3013,84 @@ private struct FileInspectorView: View {
                         lineCount: model.afterLineCount,
                         searchQuery: model.contentQuery,
                         emphasizedLines: changed.added,
-                        lineEmphasis: .addition
+                        lineEmphasis: .addition,
+                        markdownPreview: mdPreview
                     )
                 }
-                .id("compare-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                .id("compare-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")-\(mdPreview)")
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var imageInspectorContent: some View {
+        let status = model.selectedFile?.status
+        if status == .added {
+            ImagePreviewPane(
+                title: "Image",
+                subtitle: model.afterLabel,
+                accent: AppTheme.additionText,
+                data: model.afterImageData,
+                placeholder: "New image could not be loaded."
+            )
+            .id("img-added-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+            .padding(10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if status == .deleted {
+            ImagePreviewPane(
+                title: "Image",
+                subtitle: model.beforeLabel,
+                accent: AppTheme.deletionText,
+                data: model.beforeImageData,
+                placeholder: "Deleted image could not be loaded."
+            )
+            .id("img-deleted-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+            .padding(10)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            switch model.fileViewMode {
+            case .diff, .compare:
+                HStack(spacing: 10) {
+                    ImagePreviewPane(
+                        title: "Before",
+                        subtitle: model.beforeLabel,
+                        accent: AppTheme.deletionText,
+                        data: model.beforeImageData,
+                        placeholder: "Image did not exist in this revision."
+                    )
+                    ImagePreviewPane(
+                        title: "After",
+                        subtitle: model.afterLabel,
+                        accent: AppTheme.additionText,
+                        data: model.afterImageData,
+                        placeholder: "Image does not exist in this revision."
+                    )
+                }
+                .id("img-compare-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .before:
+                ImagePreviewPane(
+                    title: "Before",
+                    subtitle: model.beforeLabel,
+                    accent: AppTheme.deletionText,
+                    data: model.beforeImageData,
+                    placeholder: "Image did not exist in this revision."
+                )
+                .id("img-before-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .after:
+                ImagePreviewPane(
+                    title: "After",
+                    subtitle: model.afterLabel,
+                    accent: AppTheme.additionText,
+                    data: model.afterImageData,
+                    placeholder: "Image does not exist in this revision."
+                )
+                .id("img-after-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")")
                 .padding(10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }

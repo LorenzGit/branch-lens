@@ -83,8 +83,14 @@ struct FileInspectorPayload: Sendable {
     var diff: String
     var before: String?
     var after: String?
+    var beforeImageData: Data? = nil
+    var afterImageData: Data? = nil
     var beforeLabel: String
     var afterLabel: String
+
+    var hasImagePreview: Bool {
+        beforeImageData != nil || afterImageData != nil
+    }
 }
 
 @MainActor
@@ -112,10 +118,14 @@ final class RepoSession: ObservableObject, Identifiable {
     /// Multi-select set (⌘/⇧ click). Primary/last focus stays in `selectedFileID`.
     @Published var selectedFileIDs: Set<String> = []
     @Published var fileViewMode: FileViewMode = .diff
+    /// Render Markdown instead of raw source when the selected file is `.md`.
+    @Published var showMarkdownPreview = false
     @Published var visibleFiles: [ChangedFile] = []
     @Published var fileDiff: String = ""
     @Published var beforeContents: String?
     @Published var afterContents: String?
+    @Published var beforeImageData: Data?
+    @Published var afterImageData: Data?
     @Published var beforeLabel: String = "Before"
     @Published var afterLabel: String = "After"
     @Published var selectedAuthors: Set<String> = []
@@ -155,6 +165,8 @@ final class RepoSession: ObservableObject, Identifiable {
 
     // Working tree (local staged / unstaged)
     @Published var workingTreeFiles: [WorkingTreeFile] = []
+    /// Net merge-base → worktree files when “Include local changes” is on (cancels overlapping +/-).
+    @Published private(set) var allChangesWithLocalFiles: [ChangedFile] = []
     @Published var isLoadingWorkingTree = false
 
     // Worktrees
@@ -323,6 +335,27 @@ final class RepoSession: ObservableObject, Identifiable {
 
     var localChangeAdditions: Int {
         workingTreeFiles.reduce(0) { $0 + $1.additions }
+    }
+
+    var allChangesDisplayedAdditions: Int {
+        if includeLocalChanges {
+            return allChangesWithLocalFiles.reduce(0) { $0 + $1.additions }
+        }
+        return snapshot?.totalAdditions ?? 0
+    }
+
+    var allChangesDisplayedDeletions: Int {
+        if includeLocalChanges {
+            return allChangesWithLocalFiles.reduce(0) { $0 + $1.deletions }
+        }
+        return snapshot?.totalDeletions ?? 0
+    }
+
+    var allChangesDisplayedFileCount: Int {
+        if includeLocalChanges {
+            return allChangesWithLocalFiles.count
+        }
+        return snapshot?.files.count ?? 0
     }
 
     var localChangeDeletions: Int {
@@ -727,6 +760,9 @@ final class RepoSession: ObservableObject, Identifiable {
         if !enabled, changeScope == .staged || changeScope == .unstaged {
             changeScope = .combined
         }
+        if !enabled {
+            allChangesWithLocalFiles = []
+        }
         notifyStateChange()
         Task {
             if enabled {
@@ -997,6 +1033,7 @@ final class RepoSession: ObservableObject, Identifiable {
     func reloadWorkingTree(updateVisibleFiles: Bool = true) async {
         guard let repoPath else {
             workingTreeFiles = []
+            allChangesWithLocalFiles = []
             return
         }
         workingTreeTask?.cancel()
@@ -1008,6 +1045,9 @@ final class RepoSession: ObservableObject, Identifiable {
                 let previous = workingTreeFiles
                 workingTreeFiles = files
                 isLoadingWorkingTree = false
+                if includeLocalChanges {
+                    await reloadAllChangesWithLocal()
+                }
                 // Avoid needless list reloads (they jump the Changed files scroller).
                 // Callers that already rebuild panes (refresh / reloadSnapshot) pass false.
                 let scopeNeedsLocal = changeScope == .staged
@@ -1026,6 +1066,24 @@ final class RepoSession: ObservableObject, Identifiable {
             }
         }
         await workingTreeTask?.value
+    }
+
+    /// Refresh net All-changes file list (merge-base → worktree).
+    private func reloadAllChangesWithLocal() async {
+        guard includeLocalChanges, let snap = snapshot else {
+            allChangesWithLocalFiles = []
+            return
+        }
+        do {
+            allChangesWithLocalFiles = try await git.changedFilesToWorktree(
+                in: snap.repoPath,
+                from: snap.mergeBase
+            )
+        } catch is CancellationError {
+            // ignore
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func reloadWorktrees() async {
@@ -1212,6 +1270,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 guard !Task.isCancelled else { return }
                 snapshot = nil
                 visibleFiles = []
+                allChangesWithLocalFiles = []
                 mergedIntoCompare = nil
                 clearFileInspector()
                 errorMessage = error.localizedDescription
@@ -1313,7 +1372,8 @@ final class RepoSession: ObservableObject, Identifiable {
             contentQuery = cross
         }
         notifyStateChange()
-        if alreadySelected, !(beforeContents == nil && afterContents == nil && fileDiff.isEmpty) {
+        if alreadySelected,
+           !(beforeContents == nil && afterContents == nil && fileDiff.isEmpty && !hasImagePreview) {
             return
         }
         Task { await loadFileInspector(for: file) }
@@ -1816,10 +1876,11 @@ final class RepoSession: ObservableObject, Identifiable {
                 switch changeScope {
                 case .combined:
                     if includeLocalChanges {
-                        files = Self.mergeBranchAndLocalFiles(
-                            branchFiles: snapshot.files,
-                            localFiles: workingTreeFiles
-                        )
+                        // Net merge-base → worktree (not max of separate branch/local stats).
+                        if allChangesWithLocalFiles.isEmpty, !workingTreeFiles.isEmpty || !snapshot.files.isEmpty {
+                            await reloadAllChangesWithLocal()
+                        }
+                        files = allChangesWithLocalFiles
                     } else {
                         files = snapshot.files
                     }
@@ -1897,37 +1958,39 @@ final class RepoSession: ObservableObject, Identifiable {
         }
     }
 
-    private static func mergeBranchAndLocalFiles(
-        branchFiles: [ChangedFile],
-        localFiles: [WorkingTreeFile]
-    ) -> [ChangedFile] {
-        var byPath: [String: ChangedFile] = [:]
-        for file in branchFiles {
-            byPath[file.path] = file
-        }
-        for local in localFiles {
-            if let existing = byPath[local.path] {
-                byPath[local.path] = ChangedFile(
-                    status: local.status == .unknown ? existing.status : local.status,
-                    path: local.path,
-                    oldPath: local.oldPath ?? existing.oldPath,
-                    additions: max(existing.additions, local.additions),
-                    deletions: max(existing.deletions, local.deletions)
-                )
-            } else {
-                byPath[local.path] = local.asChangedFile
-            }
-        }
-        return byPath.values.sorted {
-            $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending
-        }
-    }
-
     private func clearFileInspector() {
         fileDiff = ""
         beforeContents = nil
         afterContents = nil
+        beforeImageData = nil
+        afterImageData = nil
         isLoadingFile = false
+    }
+
+    var selectedFileIsImage: Bool {
+        guard let file = selectedFile else { return false }
+        return TextUtilities.isImagePath(file.path)
+            || TextUtilities.isImagePath(file.oldPath ?? "")
+    }
+
+    var hasImagePreview: Bool {
+        beforeImageData != nil || afterImageData != nil
+    }
+
+    var selectedFileIsMarkdown: Bool {
+        guard let file = selectedFile else { return false }
+        return TextUtilities.isMarkdownPath(file.path)
+            || TextUtilities.isMarkdownPath(file.oldPath ?? "")
+    }
+
+    /// Active markdown source for single-pane preview (After preferred).
+    var markdownPreviewSource: String? {
+        switch fileViewMode {
+        case .before:
+            return beforeContents
+        case .after, .diff, .compare:
+            return afterContents ?? beforeContents
+        }
     }
 
     private func clearInspectorCache() {
@@ -1936,9 +1999,17 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func cacheKey(for file: ChangedFile, snapshot: BranchSnapshot) -> String {
-        let localMarker = (includeLocalChanges && workingTreeFiles.contains(where: { $0.path == file.path }))
-            ? "local"
-            : "clean"
+        // With local included, After is always the worktree — fingerprint on-disk size.
+        let localMarker: String
+        if includeLocalChanges {
+            let url = snapshot.repoPath.appendingPathComponent(file.path)
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs?[.size] as? NSNumber)?.intValue ?? -1
+            let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            localMarker = "wt-\(size)-\(mtime)"
+        } else {
+            localMarker = "clean"
+        }
         return [
             snapshot.repoPath.path,
             snapshot.branch,
@@ -1956,6 +2027,8 @@ final class RepoSession: ObservableObject, Identifiable {
         fileDiff = payload.diff
         beforeContents = payload.before
         afterContents = payload.after
+        beforeImageData = payload.beforeImageData
+        afterImageData = payload.afterImageData
         beforeLabel = payload.beforeLabel
         afterLabel = payload.afterLabel
         isLoadingFile = false
@@ -2008,6 +2081,8 @@ final class RepoSession: ObservableObject, Identifiable {
                     fileDiff = error.localizedDescription
                     beforeContents = nil
                     afterContents = nil
+                    beforeImageData = nil
+                    afterImageData = nil
                     isLoadingFile = false
                 }
             }
@@ -2024,19 +2099,21 @@ final class RepoSession: ObservableObject, Identifiable {
         let afterPath = file.path
         let scope = changeScope
         let snap = snapshot
-        let localMatch = workingTreeFiles.first { $0.path == file.path }
+        let wantsImages = TextUtilities.isImagePath(afterPath) || TextUtilities.isImagePath(beforePath)
 
         let diff: String
         let before: String?
         let after: String?
+        var beforeImage: Data?
+        var afterImage: Data?
         let beforeName: String
         let afterName: String
 
         switch scope {
         case .combined:
             if let snap {
-                let hasLocal = includeLocalChanges && localMatch != nil
-                if hasLocal {
+                // Include-local All changes is always merge-base → worktree (net).
+                if includeLocalChanges {
                     async let diffTask = git.worktreeDiff(
                         in: repoPath,
                         from: snap.mergeBase,
@@ -2046,6 +2123,11 @@ final class RepoSession: ObservableObject, Identifiable {
                     async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
                     async let afterTask = git.workingTreeFileContents(in: repoPath, path: afterPath)
                     (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                    if wantsImages {
+                        async let beforeImageTask = git.fileData(in: repoPath, revision: snap.mergeBase, path: beforePath)
+                        async let afterImageTask = git.workingTreeFileData(in: repoPath, path: afterPath)
+                        (beforeImage, afterImage) = try await (beforeImageTask, afterImageTask)
+                    }
                     beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
                     afterName = "Working tree"
                 } else {
@@ -2059,6 +2141,11 @@ final class RepoSession: ObservableObject, Identifiable {
                     async let beforeTask = git.fileContents(in: repoPath, revision: snap.mergeBase, path: beforePath)
                     async let afterTask = git.fileContents(in: repoPath, revision: snap.branch, path: afterPath)
                     (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                    if wantsImages {
+                        async let beforeImageTask = git.fileData(in: repoPath, revision: snap.mergeBase, path: beforePath)
+                        async let afterImageTask = git.fileData(in: repoPath, revision: snap.branch, path: afterPath)
+                        (beforeImage, afterImage) = try await (beforeImageTask, afterImageTask)
+                    }
                     beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
                     afterName = snap.branch
                 }
@@ -2078,6 +2165,11 @@ final class RepoSession: ObservableObject, Identifiable {
             async let beforeTask = git.fileContents(in: repoPath, revision: parent, path: beforePath)
             async let afterTask = git.fileContents(in: repoPath, revision: hash, path: afterPath)
             (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+            if wantsImages {
+                async let beforeImageTask = git.fileData(in: repoPath, revision: parent, path: beforePath)
+                async let afterImageTask = git.fileData(in: repoPath, revision: hash, path: afterPath)
+                (beforeImage, afterImage) = try await (beforeImageTask, afterImageTask)
+            }
             beforeName = "parent of \(short)"
             afterName = short
         case .staged:
@@ -2085,27 +2177,51 @@ final class RepoSession: ObservableObject, Identifiable {
             async let beforeTask = git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
             async let afterTask = git.indexFileContents(in: repoPath, path: afterPath)
             (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+            if wantsImages {
+                async let beforeImageTask = git.fileData(in: repoPath, revision: "HEAD", path: beforePath)
+                async let afterImageTask = git.indexFileData(in: repoPath, path: afterPath)
+                (beforeImage, afterImage) = try await (beforeImageTask, afterImageTask)
+            }
             beforeName = "HEAD"
             afterName = "Index (staged)"
         case .unstaged:
             let unstaged = try await git.unstagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
+            let worktreeData = wantsImages ? try await git.workingTreeFileData(in: repoPath, path: afterPath) : nil
             let worktree = try await git.workingTreeFileContents(in: repoPath, path: afterPath)
             let index: String?
-            if let fromIndex = try await git.indexFileContents(in: repoPath, path: beforePath) {
+            let indexData: Data?
+            if wantsImages {
+                if let fromIndex = try await git.indexFileData(in: repoPath, path: beforePath) {
+                    indexData = fromIndex
+                    index = fromIndex.contains(0) ? nil : String(data: fromIndex, encoding: .utf8)
+                } else if let fromHead = try await git.fileData(in: repoPath, revision: "HEAD", path: beforePath) {
+                    indexData = fromHead
+                    index = fromHead.contains(0) ? nil : String(data: fromHead, encoding: .utf8)
+                } else {
+                    indexData = nil
+                    index = nil
+                }
+            } else if let fromIndex = try await git.indexFileContents(in: repoPath, path: beforePath) {
                 index = fromIndex
+                indexData = nil
             } else {
                 index = try await git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
+                indexData = nil
             }
-            if unstaged.isEmpty, file.status == .added, let worktree, !worktree.isEmpty {
+            if unstaged.isEmpty, file.status == .added, (worktree != nil || worktreeData != nil) {
                 diff = "--- /dev/null\n+++ b/\(afterPath)\n@@ untracked @@\n"
                 before = nil
                 after = worktree
+                beforeImage = nil
+                afterImage = worktreeData
                 beforeName = "(new file)"
                 afterName = "Working tree"
             } else {
                 diff = unstaged
                 before = index
                 after = worktree
+                beforeImage = indexData
+                afterImage = worktreeData
                 beforeName = "Index / HEAD"
                 afterName = "Working tree"
             }
@@ -2115,6 +2231,8 @@ final class RepoSession: ObservableObject, Identifiable {
             diff: diff.isEmpty ? "(No textual diff — binary or empty change.)" : diff,
             before: before,
             after: after,
+            beforeImageData: beforeImage,
+            afterImageData: afterImage,
             beforeLabel: beforeName,
             afterLabel: afterName
         )

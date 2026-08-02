@@ -1,13 +1,13 @@
 import BranchLensCore
 import SwiftUI
 
-/// Diff viewer with per-hunk Stage / Unstage actions for local working-tree scopes.
+/// Diff viewer split into per-hunk cards. Optional Stage / Unstage actions for local scopes.
 struct HunkDiffView: View {
     let text: String
     let path: String
     let searchQuery: String
-    let actionTitle: String
-    let onHunkAction: (DiffHunk) -> Void
+    var actionTitle: String? = nil
+    var onHunkAction: ((DiffHunk) -> Void)? = nil
 
     private var hunks: [DiffHunk] {
         DiffParser.hunks(in: text)
@@ -19,7 +19,11 @@ struct HunkDiffView: View {
             ContentUnavailableView(
                 "No textual diff",
                 systemImage: "doc.plaintext",
-                description: Text("Binary or empty change. Use Stage File / Unstage File from the file list.")
+                description: Text(
+                    onHunkAction == nil
+                        ? "Binary or empty change."
+                        : "Binary or empty change. Use Stage File / Unstage File from the file list."
+                )
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if hunks.isEmpty {
@@ -34,7 +38,9 @@ struct HunkDiffView: View {
                             path: path,
                             searchQuery: searchQuery,
                             actionTitle: actionTitle,
-                            onAction: { onHunkAction(hunk) }
+                            onAction: onHunkAction.map { action in
+                                { action(hunk) }
+                            }
                         )
                     }
                 }
@@ -49,8 +55,8 @@ private struct HunkCard: View {
     let hunk: DiffHunk
     let path: String
     let searchQuery: String
-    let actionTitle: String
-    let onAction: () -> Void
+    let actionTitle: String?
+    let onAction: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -66,16 +72,18 @@ private struct HunkCard: View {
                         .font(.caption2.monospacedDigit().weight(.bold))
                         .foregroundStyle(.secondary)
                 }
-                if hunk.isSyntheticUntracked {
-                    Button("Stage File") { onAction() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .help("Untracked file — stage the whole file")
-                } else {
-                    Button(actionTitle) { onAction() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .help("\(actionTitle) this hunk")
+                if let onAction, let actionTitle {
+                    if hunk.isSyntheticUntracked {
+                        Button("Stage File") { onAction() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .help("Untracked file — stage the whole file")
+                    } else {
+                        Button(actionTitle) { onAction() }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .help("\(actionTitle) this hunk")
+                    }
                 }
             }
             .padding(.horizontal, 10)
@@ -86,7 +94,8 @@ private struct HunkCard: View {
                 text: hunkDisplayText,
                 path: path,
                 searchQuery: searchQuery,
-                allowsScrolling: false
+                allowsScrolling: false,
+                omitHunkHeaders: true
             )
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -98,8 +107,9 @@ private struct HunkCard: View {
         )
     }
 
-    /// Body only — the `@@` header is already shown in the card chrome.
+    /// Include the `@@` header so DiffScrollView can recover before/after line numbers;
+    /// the header itself is omitted from the rendered body (shown in card chrome).
     private var hunkDisplayText: String {
-        hunk.body.map(\.raw).joined(separator: "\n")
+        ([hunk.header] + hunk.body.map(\.raw)).joined(separator: "\n")
     }
 }

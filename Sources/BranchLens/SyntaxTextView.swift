@@ -192,6 +192,9 @@ struct DiffScrollView: NSViewRepresentable {
     var searchQuery: String = ""
     /// When false, sizes to content (no nested scroller) via intrinsic height.
     var allowsScrolling: Bool = true
+    /// Keep `@@` headers in `text` for line-number parsing, but hide them in the render
+    /// (used by hunk cards that already show the header in chrome).
+    var omitHunkHeaders: Bool = false
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -296,7 +299,8 @@ struct DiffScrollView: NSViewRepresentable {
     }
 
     private func contentKey() -> String {
-        HighlightRenderCache.key(kind: "diff", path: path, source: text, searchQuery: searchQuery)
+        let kind = omitHunkHeaders ? "diff-nohunk" : "diff"
+        return HighlightRenderCache.key(kind: kind, path: path, source: text, searchQuery: searchQuery)
     }
 
     private func scheduleApply(to textView: NSTextView, coordinator: Coordinator, cacheKey: String? = nil) {
@@ -314,6 +318,7 @@ struct DiffScrollView: NSViewRepresentable {
         let text = self.text
         let path = self.path
         let searchQuery = self.searchQuery
+        let omitHunkHeaders = self.omitHunkHeaders
         let colors = SyntaxRenderBuilder.Colors.current()
         let font = AppTheme.monoNS
         let boldFont = AppTheme.monoBoldNS
@@ -327,7 +332,8 @@ struct DiffScrollView: NSViewRepresentable {
                     path: path,
                     font: font,
                     boldFont: boldFont,
-                    colors: colors
+                    colors: colors,
+                    omitHunkHeaders: omitHunkHeaders
                 )
             )
             _ = SearchHighlight.apply(to: attributed, query: searchQuery)
@@ -488,10 +494,17 @@ enum SyntaxRenderBuilder {
         path: String,
         font: NSFont,
         boldFont: NSFont,
-        colors: Colors
+        colors: Colors,
+        omitHunkHeaders: Bool = false
     ) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        let lines = DiffParser.parse(text).filter { $0.kind != .meta && $0.kind != .header }
+        let lines = DiffParser.parse(text).filter { line in
+            switch line.kind {
+            case .meta, .header: return false
+            case .hunk: return !omitHunkHeaders
+            default: return true
+            }
+        }
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineBreakMode = .byClipping
 
