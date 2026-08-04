@@ -582,6 +582,7 @@ private struct CompareBranchControl: View {
             ) { model.selectBaseBranch($0) }
 
             if behindCount > 0 {
+                let sameBranch = model.selectedBranch == model.baseBranch
                 Button {
                     Task { await model.updateFromCompare() }
                 } label: {
@@ -590,8 +591,12 @@ private struct CompareBranchControl: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .disabled(model.isLoading || model.isUpdatingFromCompare || model.selectedBranch == model.baseBranch)
-                .help("Merge \(behindCount) commit\(behindCount == 1 ? "" : "s") from \(compareTip) into \(model.selectedBranch)")
+                .disabled(model.isLoading || model.isUpdatingFromCompare)
+                .help(
+                    sameBranch
+                        ? "Fast-forward \(model.selectedBranch) by \(behindCount) commit\(behindCount == 1 ? "" : "s") to \(compareTip)"
+                        : "Merge \(behindCount) commit\(behindCount == 1 ? "" : "s") from \(compareTip) into \(model.selectedBranch)"
+                )
             } else if localCompareBehind > 0, compareTip != model.baseBranch {
                 Text("↓\(localCompareBehind)")
                     .font(.caption.monospacedDigit().weight(.bold))
@@ -1183,17 +1188,20 @@ private struct CommitsPane: View {
                     ScrollView {
                         // Non-lazy top cards stay stable; lazy only the long commit list.
                         VStack(spacing: 8) {
-                            AllChangesCard(
-                                isSelected: model.changeScope == .combined,
-                                commitCount: model.filteredCommits.count,
-                                stagedCount: model.stagedWorkingTreeFiles.count,
-                                unstagedCount: model.unstagedWorkingTreeFiles.count,
-                                includeLocal: model.includeLocalChanges,
-                                fileCount: model.allChangesDisplayedFileCount,
-                                additions: model.allChangesDisplayedAdditions,
-                                deletions: model.allChangesDisplayedDeletions
-                            ) {
-                                model.selectCombined()
+                            // In sync + only local work: All changes / In sync are noise — keep Staged/Unstaged.
+                            if !showsLocalScopesOnly {
+                                AllChangesCard(
+                                    isSelected: model.changeScope == .combined,
+                                    commitCount: model.filteredCommits.count,
+                                    stagedCount: model.stagedWorkingTreeFiles.count,
+                                    unstagedCount: model.unstagedWorkingTreeFiles.count,
+                                    includeLocal: model.includeLocalChanges,
+                                    fileCount: model.allChangesDisplayedFileCount,
+                                    additions: model.allChangesDisplayedAdditions,
+                                    deletions: model.allChangesDisplayedDeletions
+                                ) {
+                                    model.selectCombined()
+                                }
                             }
 
                             if model.includeLocalChanges {
@@ -1236,7 +1244,9 @@ private struct CommitsPane: View {
                                 )
                             }
 
-                            if let merged = model.mergedIntoCompare, model.filteredCommits.isEmpty {
+                            if showsLocalScopesOnly {
+                                // No unique commits and no In sync card — local scopes are enough.
+                            } else if let merged = model.mergedIntoCompare, model.filteredCommits.isEmpty {
                                 MergedIntoCompareCard(
                                     info: merged,
                                     onOpenPullRequest: { link in
@@ -1312,11 +1322,38 @@ private struct CommitsPane: View {
             if model.historyBrowseMode == .all, model.chronologicalCommits.isEmpty {
                 Task { await model.reloadChronologicalCommits(reset: true) }
             }
+            preferLocalScopeIfNeeded(onlyLocal: showsLocalScopesOnly)
         }
         .onChange(of: model.includeLocalChanges) { _, enabled in
             if enabled {
                 Task { await model.reloadWorkingTree() }
             }
+        }
+        .onChange(of: showsLocalScopesOnly) { _, onlyLocal in
+            preferLocalScopeIfNeeded(onlyLocal: onlyLocal)
+        }
+    }
+
+    /// Branch tip matches COMPARE and History is just local work — drop All changes / In sync.
+    private var showsLocalScopesOnly: Bool {
+        guard model.includeLocalChanges, model.hasLocalChanges else { return false }
+        guard model.filteredCommits.isEmpty else { return false }
+        guard let merged = model.mergedIntoCompare else { return false }
+        switch merged.kind {
+        case .inSync, .contained:
+            return true
+        case .mergedPR:
+            return false
+        }
+    }
+
+    private func preferLocalScopeIfNeeded(onlyLocal: Bool) {
+        guard onlyLocal else { return }
+        guard case .combined = model.changeScope else { return }
+        if !model.unstagedWorkingTreeFiles.isEmpty {
+            model.selectUnstaged()
+        } else if !model.stagedWorkingTreeFiles.isEmpty {
+            model.selectStaged()
         }
     }
 
@@ -2697,6 +2734,25 @@ private struct FileInspectorView: View {
                 model.preferContentSearch()
             }
         })
+        .confirmationDialog(
+            model.pendingEditDiscard?.title ?? "Discard unsaved edits?",
+            isPresented: Binding(
+                get: { model.pendingEditDiscard != nil },
+                set: { if !$0 { model.dismissPendingEditDiscard() } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Discard Edits", role: .destructive) {
+                model.confirmPendingEditDiscard()
+            }
+            Button("Keep Editing", role: .cancel) {
+                model.dismissPendingEditDiscard()
+            }
+        } message: {
+            if let pending = model.pendingEditDiscard {
+                Text(pending.message)
+            }
+        }
     }
 
     private var multiSelectPanel: some View {
@@ -2798,7 +2854,7 @@ private struct FileInspectorView: View {
                     .help("Redo edit (⌘⇧Z)")
 
                     Button("Cancel") {
-                        model.cancelEditingFile()
+                        model.requestCancelEditingFile()
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -2950,6 +3006,13 @@ private struct FileInspectorView: View {
                 subtitle: model.selectedFile?.path ?? "Working tree",
                 accent: Color.orange,
                 text: $model.editDraft,
+                externallyChanged: model.editExternallyChanged,
+                onReloadFromDisk: {
+                    Task { await model.reloadEditingFileFromDisk() }
+                },
+                onKeepEditing: {
+                    model.dismissExternalEditChange()
+                },
                 onUndoStateChange: { canUndo, canRedo in
                     model.updateEditUndoState(canUndo: canUndo, canRedo: canRedo)
                 }

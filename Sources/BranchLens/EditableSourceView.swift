@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// Plain monospace editor with AppKit undo/redo (⌘Z / ⌘⇧Z).
+/// Plain monospace editor with AppKit undo/redo (⌘Z / ⌘⇧Z) and a line-number gutter.
 struct EditableSourceView: NSViewRepresentable {
     @Binding var text: String
     var onUndoStateChange: (Bool, Bool) -> Void = { _, _ in }
@@ -17,6 +17,8 @@ struct EditableSourceView: NSViewRepresentable {
         scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
+        scroll.hasVerticalRuler = true
+        scroll.rulersVisible = true
 
         let textView = NSTextView()
         textView.isEditable = true
@@ -31,7 +33,7 @@ struct EditableSourceView: NSViewRepresentable {
         textView.smartInsertDeleteEnabled = false
         textView.drawsBackground = true
         textView.backgroundColor = .textBackgroundColor
-        textView.textContainerInset = NSSize(width: 10, height: 12)
+        textView.textContainerInset = NSSize(width: 8, height: 12)
         textView.isHorizontallyResizable = true
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
@@ -48,11 +50,18 @@ struct EditableSourceView: NSViewRepresentable {
         textView.insertionPointColor = .labelColor
         textView.string = text
         textView.delegate = context.coordinator
+        textView.postsFrameChangedNotifications = true
 
         scroll.documentView = textView
+
+        let ruler = LineNumberRulerView(textView: textView)
+        scroll.verticalRulerView = ruler
         context.coordinator.textView = textView
+        context.coordinator.rulerView = ruler
         context.coordinator.observeUndoManager(textView.undoManager)
+        context.coordinator.observeTextView(textView)
         context.coordinator.publishUndoState()
+        ruler.needsDisplay = true
 
         DispatchQueue.main.async {
             textView.window?.makeFirstResponder(textView)
@@ -69,6 +78,7 @@ struct EditableSourceView: NSViewRepresentable {
             textView.string = text
             let max = (text as NSString).length
             textView.setSelectedRange(NSRange(location: min(selected.location, max), length: 0))
+            context.coordinator.rulerView?.invalidateLineNumbers()
             context.coordinator.publishUndoState()
         }
     }
@@ -77,8 +87,10 @@ struct EditableSourceView: NSViewRepresentable {
         var text: Binding<String>
         var onUndoStateChange: (Bool, Bool) -> Void
         weak var textView: NSTextView?
+        weak var rulerView: LineNumberRulerView?
         var isUpdatingFromUI = false
         private var undoObservers: [NSObjectProtocol] = []
+        private var viewObservers: [NSObjectProtocol] = []
 
         init(text: Binding<String>, onUndoStateChange: @escaping (Bool, Bool) -> Void) {
             self.text = text
@@ -86,7 +98,7 @@ struct EditableSourceView: NSViewRepresentable {
         }
 
         deinit {
-            for observer in undoObservers {
+            for observer in undoObservers + viewObservers {
                 NotificationCenter.default.removeObserver(observer)
             }
         }
@@ -116,11 +128,40 @@ struct EditableSourceView: NSViewRepresentable {
             }
         }
 
+        func observeTextView(_ textView: NSTextView) {
+            for observer in viewObservers {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            viewObservers.removeAll()
+
+            let frameToken = NotificationCenter.default.addObserver(
+                forName: NSView.frameDidChangeNotification,
+                object: textView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.rulerView?.needsDisplay = true
+            }
+            viewObservers.append(frameToken)
+
+            if let scroll = textView.enclosingScrollView?.contentView {
+                let boundsToken = NotificationCenter.default.addObserver(
+                    forName: NSView.boundsDidChangeNotification,
+                    object: scroll,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.rulerView?.needsDisplay = true
+                }
+                viewObservers.append(boundsToken)
+                scroll.postsBoundsChangedNotifications = true
+            }
+        }
+
         func textDidChange(_ notification: Notification) {
             guard let textView else { return }
             isUpdatingFromUI = true
             text.wrappedValue = textView.string
             isUpdatingFromUI = false
+            rulerView?.invalidateLineNumbers()
             publishUndoState()
         }
 
@@ -128,16 +169,123 @@ struct EditableSourceView: NSViewRepresentable {
             let undoManager = textView?.undoManager
             onUndoStateChange(undoManager?.canUndo ?? false, undoManager?.canRedo ?? false)
         }
+    }
+}
 
-        func undo() {
-            textView?.undoManager?.undo()
-            publishUndoState()
+/// Vertical gutter showing 1-based line numbers for an `NSTextView`.
+final class LineNumberRulerView: NSRulerView {
+    private weak var textView: NSTextView?
+    private let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+
+    init(textView: NSTextView) {
+        self.textView = textView
+        super.init(scrollView: textView.enclosingScrollView, orientation: .verticalRuler)
+        clientView = textView
+        ruleThickness = 36
+        clipsToBounds = true
+    }
+
+    @available(*, unavailable)
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func invalidateLineNumbers() {
+        updateThickness()
+        needsDisplay = true
+    }
+
+    private func updateThickness() {
+        guard let textView else { return }
+        let lines = max(lineCount(in: textView.string), 1)
+        let digits = max(String(lines).count, 2)
+        let width = CGFloat(digits) * numberFont.maximumAdvancement.width + 16
+        if abs(ruleThickness - width) > 0.5 {
+            ruleThickness = width
+        }
+    }
+
+    override func drawHashMarksAndLabels(in rect: NSRect) {
+        guard
+            let textView,
+            let layoutManager = textView.layoutManager,
+            let textContainer = textView.textContainer,
+            let scrollView = scrollView
+        else { return }
+
+        updateThickness()
+
+        NSColor.textBackgroundColor.withAlphaComponent(0.92).setFill()
+        rect.fill()
+        NSColor.separatorColor.withAlphaComponent(0.55).setStroke()
+        let edge = NSBezierPath()
+        edge.move(to: NSPoint(x: bounds.maxX - 0.5, y: bounds.minY))
+        edge.line(to: NSPoint(x: bounds.maxX - 0.5, y: bounds.maxY))
+        edge.stroke()
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: numberFont,
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let relative = convert(NSPoint.zero, from: textView)
+        let insetY = textView.textContainerInset.height
+        let fontHeight = numberFont.boundingRectForFont.height
+
+        if textView.string.isEmpty {
+            drawNumber(1, atY: insetY, attributes: attrs)
+            return
         }
 
-        func redo() {
-            textView?.undoManager?.redo()
-            publishUndoState()
+        let visibleRect = scrollView.contentView.bounds
+        let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
+        let nsString = textView.string as NSString
+        var drawnLineStarts = Set<Int>()
+
+        if glyphRange.length > 0 {
+            layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, usedRect, _, fragmentGlyphs, _ in
+                let charRange = layoutManager.characterRange(forGlyphRange: fragmentGlyphs, actualGlyphRange: nil)
+                guard charRange.location != NSNotFound else { return }
+                let lineStart = nsString.lineRange(for: NSRange(location: charRange.location, length: 0)).location
+                guard drawnLineStarts.insert(lineStart).inserted else { return }
+                let number = self.lineNumber(forCharacterLocation: lineStart, in: nsString)
+                let y = relative.y + usedRect.minY + insetY + (usedRect.height - fontHeight) / 2
+                self.drawNumber(number, atY: y, attributes: attrs)
+            }
         }
+
+        let extra = layoutManager.extraLineFragmentUsedRect
+        if extra.height > 0, textView.string.hasSuffix("\n") {
+            let number = lineCount(in: textView.string)
+            let y = relative.y + extra.minY + insetY + (extra.height - fontHeight) / 2
+            drawNumber(number, atY: y, attributes: attrs)
+        }
+    }
+
+    private func drawNumber(_ number: Int, atY y: CGFloat, attributes: [NSAttributedString.Key: Any]) {
+        let string = "\(number)" as NSString
+        let size = string.size(withAttributes: attributes)
+        string.draw(
+            at: NSPoint(x: bounds.maxX - size.width - 6, y: y),
+            withAttributes: attributes
+        )
+    }
+
+    private func lineNumber(forCharacterLocation location: Int, in string: NSString) -> Int {
+        if location <= 0 { return 1 }
+        var count = 1
+        string.enumerateSubstrings(
+            in: NSRange(location: 0, length: location),
+            options: [.byLines, .substringNotRequired]
+        ) { _, _, _, _ in
+            count += 1
+        }
+        return count
+    }
+
+    private func lineCount(in text: String) -> Int {
+        if text.isEmpty { return 1 }
+        let count = text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+        return count
     }
 }
 
@@ -147,12 +295,14 @@ struct EditableCodePane: View {
     let subtitle: String
     let accent: Color
     @Binding var text: String
+    var externallyChanged: Bool = false
+    var onReloadFromDisk: (() -> Void)? = nil
+    var onKeepEditing: (() -> Void)? = nil
     var onUndoStateChange: (Bool, Bool) -> Void = { _, _ in }
 
     private var lineCount: Int {
-        if text.isEmpty { return 0 }
-        let count = text.split(separator: "\n", omittingEmptySubsequences: false).count
-        return text.hasSuffix("\n") ? max(count - 1, 1) : count
+        if text.isEmpty { return 1 }
+        return text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
     }
 
     var body: some View {
@@ -185,6 +335,31 @@ struct EditableCodePane: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .background(AppTheme.subtleFill)
+
+            if externallyChanged {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("This file changed on disk.")
+                        .font(.caption.weight(.semibold))
+                    Spacer(minLength: 0)
+                    Button("Keep Editing") {
+                        onKeepEditing?()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Keep your buffer and ignore the external change")
+                    Button("Reload") {
+                        onReloadFromDisk?()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .help("Replace the editor buffer with the file on disk")
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.orange.opacity(0.12))
+            }
 
             Divider().opacity(0.45)
 

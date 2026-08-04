@@ -3,6 +3,18 @@ import BranchLensCore
 import Foundation
 import SwiftUI
 
+struct PendingEditDiscard: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+    let onDiscard: () -> Void
+}
+
+private struct EditFileStamp: Equatable {
+    var mtime: TimeInterval
+    var size: UInt64
+}
+
 enum FileViewMode: String, CaseIterable, Identifiable {
     case diff = "Diff"
     case before = "Before"
@@ -130,6 +142,14 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var isSavingEdit = false
     /// Remount key so each edit session starts with a clean undo stack.
     @Published var editSessionNonce = 0
+    /// Asked when leaving edit mode with unsaved changes.
+    @Published var pendingEditDiscard: PendingEditDiscard?
+    /// File on disk changed while this edit session is open.
+    @Published var editExternallyChanged = false
+    private var editWatchedURL: URL?
+    private var editKnownStamp: EditFileStamp?
+    private var editWatchTask: Task<Void, Never>?
+    private var editActiveObserver: NSObjectProtocol?
     @Published var visibleFiles: [ChangedFile] = []
     @Published var fileDiff: String = ""
     @Published var beforeContents: String?
@@ -740,33 +760,37 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     func selectCombined() {
-        cancelEditingFile()
-        changeScope = .combined
-        notifyStateChange()
-        Task { await reloadVisibleFiles() }
+        requestLeaveEditingIfNeeded {
+            self.changeScope = .combined
+            self.notifyStateChange()
+            Task { await self.reloadVisibleFiles() }
+        }
     }
 
     func selectStaged() {
-        cancelEditingFile()
-        includeLocalChanges = true
-        changeScope = .staged
-        notifyStateChange()
-        Task { await reloadVisibleFiles() }
+        requestLeaveEditingIfNeeded {
+            self.includeLocalChanges = true
+            self.changeScope = .staged
+            self.notifyStateChange()
+            Task { await self.reloadVisibleFiles() }
+        }
     }
 
     func selectUnstaged() {
-        cancelEditingFile()
-        includeLocalChanges = true
-        changeScope = .unstaged
-        notifyStateChange()
-        Task { await reloadVisibleFiles() }
+        requestLeaveEditingIfNeeded {
+            self.includeLocalChanges = true
+            self.changeScope = .unstaged
+            self.notifyStateChange()
+            Task { await self.reloadVisibleFiles() }
+        }
     }
 
     func selectCommit(_ commit: GitCommit) {
-        cancelEditingFile()
-        changeScope = .commit(commit.hash)
-        notifyStateChange()
-        Task { await reloadVisibleFiles() }
+        requestLeaveEditingIfNeeded {
+            self.changeScope = .commit(commit.hash)
+            self.notifyStateChange()
+            Task { await self.reloadVisibleFiles() }
+        }
     }
 
     func setIncludeLocalChanges(_ enabled: Bool) {
@@ -1120,31 +1144,43 @@ final class RepoSession: ObservableObject, Identifiable {
         statusMessage = nil
     }
 
-    /// Merge COMPARE tip into the inspected BRANCH.
+    /// Bring BRANCH up to date with COMPARE tip.
+    /// When BRANCH == COMPARE (e.g. inspecting `main` vs `main`), fast-forward to the
+    /// fresh remote tip instead of trying to merge a branch into itself.
     func updateFromCompare() async {
         guard let repoPath else { return }
         guard !selectedBranch.isEmpty, !baseBranch.isEmpty else { return }
-        guard selectedBranch != baseBranch else {
-            errorMessage = "Branch and Compare are the same — nothing to update."
-            return
-        }
 
         isUpdatingFromCompare = true
         errorMessage = nil
         statusMessage = "Updating \(selectedBranch) from \(baseBranch)…"
 
         do {
-            // Prefer fresh remote tips before merging.
+            // Prefer fresh remote tips before merging / fast-forwarding.
             try? await git.fetchRemotes(in: repoPath)
             let tip = await git.resolveFreshTip(for: baseBranch, in: repoPath)
-            statusMessage = "Updating \(selectedBranch) from \(tip)…"
-            try await git.merge(source: tip, into: selectedBranch, in: repoPath)
-            // Keep local COMPARE from staying stale after a successful update.
-            if tip != baseBranch {
-                try? await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
+
+            if selectedBranch == baseBranch {
+                guard tip != selectedBranch else {
+                    errorMessage = "No fresher tip than local \(selectedBranch)."
+                    statusMessage = nil
+                    isUpdatingFromCompare = false
+                    return
+                }
+                statusMessage = "Fast-forwarding \(selectedBranch) to \(tip)…"
+                try await git.fastForwardLocalBranch(selectedBranch, to: tip, in: repoPath)
+                await reloadSnapshot(resetScope: true, fetchFirst: false)
+                statusMessage = "Updated \(selectedBranch) to \(tip)."
+            } else {
+                statusMessage = "Updating \(selectedBranch) from \(tip)…"
+                try await git.merge(source: tip, into: selectedBranch, in: repoPath)
+                // Keep local COMPARE from staying stale after a successful update.
+                if tip != baseBranch {
+                    try? await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
+                }
+                await reloadSnapshot(resetScope: true, fetchFirst: false)
+                statusMessage = "Updated \(selectedBranch) with \(tip)."
             }
-            await reloadSnapshot(resetScope: true, fetchFirst: false)
-            statusMessage = "Updated \(selectedBranch) with \(tip)."
             isUpdatingFromCompare = false
             clearStatusEventually(statusMessage)
         } catch {
@@ -1377,8 +1413,15 @@ final class RepoSession: ObservableObject, Identifiable {
             closeFileLog()
         }
         if isEditingFile, selectedFileID != file.id {
-            cancelEditingFile()
+            requestLeaveEditingIfNeeded {
+                self.applyFileSelection(file)
+            }
+            return
         }
+        applyFileSelection(file)
+    }
+
+    private func applyFileSelection(_ file: ChangedFile) {
         let alreadySelected = selectedFileID == file.id && selectedFileIDs == [file.id]
         selectedFileID = file.id
         selectedFileIDs = [file.id]
@@ -1398,6 +1441,14 @@ final class RepoSession: ObservableObject, Identifiable {
 
     /// ⌘-click: add/remove file from the selection.
     func toggleFileInSelection(_ file: ChangedFile) {
+        if isEditingFile {
+            requestLeaveEditingIfNeeded { self.performToggleFileInSelection(file) }
+            return
+        }
+        performToggleFileInSelection(file)
+    }
+
+    private func performToggleFileInSelection(_ file: ChangedFile) {
         if case .fileLog = inspectorMode {
             closeFileLog()
         }
@@ -1423,6 +1474,14 @@ final class RepoSession: ObservableObject, Identifiable {
 
     /// ⇧-click: select contiguous range from the anchor through `file` (name-filtered order).
     func selectFileRange(to file: ChangedFile) {
+        if isEditingFile {
+            requestLeaveEditingIfNeeded { self.performSelectFileRange(to: file) }
+            return
+        }
+        performSelectFileRange(to: file)
+    }
+
+    private func performSelectFileRange(to file: ChangedFile) {
         if case .fileLog = inspectorMode {
             closeFileLog()
         }
@@ -1457,6 +1516,18 @@ final class RepoSession: ObservableObject, Identifiable {
     func applyListSelection(_ ids: Set<String>) {
         let previous = selectedFileIDs
         if ids == previous { return }
+        if isEditingFile {
+            let current = selectedFileID.map { Set([$0]) } ?? []
+            if ids != current {
+                requestLeaveEditingIfNeeded { self.performApplyListSelection(ids) }
+                return
+            }
+        }
+        performApplyListSelection(ids)
+    }
+
+    private func performApplyListSelection(_ ids: Set<String>) {
+        let previous = selectedFileIDs
 
         if case .fileLog = inspectorMode, ids.count != 1 {
             closeFileLog()
@@ -1976,7 +2047,7 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func clearFileInspector() {
-        cancelEditingFile()
+        forceEndEditing()
         fileDiff = ""
         beforeContents = nil
         afterContents = nil
@@ -2046,20 +2117,70 @@ final class RepoSession: ObservableObject, Identifiable {
         editBaseline = editDraft
         editCanUndo = false
         editCanRedo = false
+        editExternallyChanged = false
         editSessionNonce &+= 1
+        let url = repoPath.appendingPathComponent(file.path)
+        editWatchedURL = url
+        editKnownStamp = Self.fileStamp(at: url)
         isEditingFile = true
+        startEditFileWatcher()
         notifyStateChange()
     }
 
-    func cancelEditingFile() {
-        guard isEditingFile else { return }
+    /// Cancel from the UI — confirms when there are unsaved edits.
+    func requestCancelEditingFile() {
+        requestLeaveEditingIfNeeded {}
+    }
+
+    func confirmPendingEditDiscard() {
+        let action = pendingEditDiscard?.onDiscard
+        pendingEditDiscard = nil
+        forceEndEditing()
+        action?()
+    }
+
+    func dismissPendingEditDiscard() {
+        pendingEditDiscard = nil
+    }
+
+    /// Discard the edit buffer without prompting.
+    func forceEndEditing() {
+        let wasEditing = isEditingFile
+        stopEditFileWatcher()
+        resetEditState()
+        if wasEditing {
+            notifyStateChange()
+        }
+    }
+
+    private func resetEditState() {
         isEditingFile = false
         editDraft = ""
         editBaseline = ""
         editCanUndo = false
         editCanRedo = false
         isSavingEdit = false
-        notifyStateChange()
+        editExternallyChanged = false
+        editWatchedURL = nil
+        editKnownStamp = nil
+    }
+
+    private func requestLeaveEditingIfNeeded(proceed: @escaping () -> Void) {
+        guard isEditingFile else {
+            proceed()
+            return
+        }
+        if isEditDraftDirty {
+            let name = selectedFile?.path ?? "this file"
+            pendingEditDiscard = PendingEditDiscard(
+                title: "Discard unsaved edits?",
+                message: "You have unsaved changes to \(name). Discard them?",
+                onDiscard: proceed
+            )
+            return
+        }
+        forceEndEditing()
+        proceed()
     }
 
     func updateEditUndoState(canUndo: Bool, canRedo: Bool) {
@@ -2081,11 +2202,11 @@ final class RepoSession: ObservableObject, Identifiable {
         errorMessage = nil
         do {
             try await git.writeWorkingTreeFile(in: repoPath, path: file.path, contents: editDraft)
-            isEditingFile = false
-            editDraft = ""
-            editBaseline = ""
-            editCanUndo = false
-            editCanRedo = false
+            let url = repoPath.appendingPathComponent(file.path)
+            editKnownStamp = Self.fileStamp(at: url)
+            editExternallyChanged = false
+            stopEditFileWatcher()
+            resetEditState()
             clearInspectorCache()
             await reloadWorkingTree(updateVisibleFiles: false)
             await reloadAllChangesWithLocal()
@@ -2098,6 +2219,84 @@ final class RepoSession: ObservableObject, Identifiable {
             errorMessage = error.localizedDescription
         }
         isSavingEdit = false
+    }
+
+    func reloadEditingFileFromDisk() async {
+        guard isEditingFile, let file = selectedFile, let repoPath else { return }
+        do {
+            let disk = try await git.workingTreeFileContents(in: repoPath, path: file.path) ?? ""
+            editDraft = disk
+            editBaseline = disk
+            editExternallyChanged = false
+            editSessionNonce &+= 1
+            editCanUndo = false
+            editCanRedo = false
+            let url = repoPath.appendingPathComponent(file.path)
+            editWatchedURL = url
+            editKnownStamp = Self.fileStamp(at: url)
+            notifyStateChange()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Keep the in-memory buffer; treat the current on-disk stamp as acknowledged.
+    func dismissExternalEditChange() {
+        if let url = editWatchedURL {
+            editKnownStamp = Self.fileStamp(at: url)
+        }
+        editExternallyChanged = false
+    }
+
+    private func startEditFileWatcher() {
+        stopEditFileWatcher()
+        editWatchTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled, self.isEditingFile {
+                self.pollEditExternalChange()
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+        editActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.pollEditExternalChange()
+            }
+        }
+    }
+
+    private func stopEditFileWatcher() {
+        editWatchTask?.cancel()
+        editWatchTask = nil
+        if let editActiveObserver {
+            NotificationCenter.default.removeObserver(editActiveObserver)
+            self.editActiveObserver = nil
+        }
+    }
+
+    private func pollEditExternalChange() {
+        guard isEditingFile, let url = editWatchedURL else { return }
+        guard let stamp = Self.fileStamp(at: url) else {
+            // File vanished — treat as external change if we still have a buffer.
+            if editKnownStamp != nil {
+                editExternallyChanged = true
+            }
+            return
+        }
+        if let known = editKnownStamp, stamp != known {
+            editExternallyChanged = true
+        }
+    }
+
+    private static func fileStamp(at url: URL) -> EditFileStamp? {
+        guard FileManager.default.fileExists(atPath: url.path),
+              let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        else { return nil }
+        let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+        return EditFileStamp(mtime: mtime, size: size)
     }
 
     var selectedFileIsMarkdown: Bool {
