@@ -61,6 +61,7 @@ struct EditableSourceView: NSViewRepresentable {
         context.coordinator.observeUndoManager(textView.undoManager)
         context.coordinator.observeTextView(textView)
         context.coordinator.publishUndoState()
+        ruler.rebuildLineStarts(for: textView.string)
         ruler.needsDisplay = true
 
         DispatchQueue.main.async {
@@ -78,7 +79,7 @@ struct EditableSourceView: NSViewRepresentable {
             textView.string = text
             let max = (text as NSString).length
             textView.setSelectedRange(NSRange(location: min(selected.location, max), length: 0))
-            context.coordinator.rulerView?.invalidateLineNumbers()
+            context.coordinator.rulerView?.rebuildLineStarts(for: text)
             context.coordinator.publishUndoState()
         }
     }
@@ -161,7 +162,7 @@ struct EditableSourceView: NSViewRepresentable {
             isUpdatingFromUI = true
             text.wrappedValue = textView.string
             isUpdatingFromUI = false
-            rulerView?.invalidateLineNumbers()
+            rulerView?.rebuildLineStarts(for: textView.string)
             publishUndoState()
         }
 
@@ -176,6 +177,8 @@ struct EditableSourceView: NSViewRepresentable {
 final class LineNumberRulerView: NSRulerView {
     private weak var textView: NSTextView?
     private let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    /// Character offsets of each line start (including a trailing empty line after `\n`).
+    private var lineStarts: [Int] = [0]
 
     init(textView: NSTextView) {
         self.textView = textView
@@ -190,15 +193,23 @@ final class LineNumberRulerView: NSRulerView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func invalidateLineNumbers() {
+    func rebuildLineStarts(for text: String) {
+        var starts: [Int] = [0]
+        var index = 0
+        for ch in text.utf16 {
+            index += 1
+            if ch == 10 { // \n
+                starts.append(index)
+            }
+        }
+        lineStarts = starts
         updateThickness()
         needsDisplay = true
     }
 
+    /// Never call this from `drawHashMarksAndLabels` — changing thickness during draw can hang layout.
     private func updateThickness() {
-        guard let textView else { return }
-        let lines = max(lineCount(in: textView.string), 1)
-        let digits = max(String(lines).count, 2)
+        let digits = max(String(max(lineStarts.count, 1)).count, 2)
         let width = CGFloat(digits) * numberFont.maximumAdvancement.width + 16
         if abs(ruleThickness - width) > 0.5 {
             ruleThickness = width
@@ -212,8 +223,6 @@ final class LineNumberRulerView: NSRulerView {
             let textContainer = textView.textContainer,
             let scrollView = scrollView
         else { return }
-
-        updateThickness()
 
         NSColor.textBackgroundColor.withAlphaComponent(0.92).setFill()
         rect.fill()
@@ -247,7 +256,7 @@ final class LineNumberRulerView: NSRulerView {
                 guard charRange.location != NSNotFound else { return }
                 let lineStart = nsString.lineRange(for: NSRange(location: charRange.location, length: 0)).location
                 guard drawnLineStarts.insert(lineStart).inserted else { return }
-                let number = self.lineNumber(forCharacterLocation: lineStart, in: nsString)
+                let number = self.lineNumber(forCharacterLocation: lineStart)
                 let y = relative.y + usedRect.minY + insetY + (usedRect.height - fontHeight) / 2
                 self.drawNumber(number, atY: y, attributes: attrs)
             }
@@ -255,7 +264,7 @@ final class LineNumberRulerView: NSRulerView {
 
         let extra = layoutManager.extraLineFragmentUsedRect
         if extra.height > 0, textView.string.hasSuffix("\n") {
-            let number = lineCount(in: textView.string)
+            let number = lineStarts.count
             let y = relative.y + extra.minY + insetY + (extra.height - fontHeight) / 2
             drawNumber(number, atY: y, attributes: attrs)
         }
@@ -270,22 +279,23 @@ final class LineNumberRulerView: NSRulerView {
         )
     }
 
-    private func lineNumber(forCharacterLocation location: Int, in string: NSString) -> Int {
-        if location <= 0 { return 1 }
-        var count = 1
-        string.enumerateSubstrings(
-            in: NSRange(location: 0, length: location),
-            options: [.byLines, .substringNotRequired]
-        ) { _, _, _, _ in
-            count += 1
+    private func lineNumber(forCharacterLocation location: Int) -> Int {
+        // Binary search into cached line starts — O(log n) instead of rescanning the file.
+        var low = 0
+        var high = lineStarts.count - 1
+        while low <= high {
+            let mid = (low + high) / 2
+            let start = lineStarts[mid]
+            let next = mid + 1 < lineStarts.count ? lineStarts[mid + 1] : Int.max
+            if location < start {
+                high = mid - 1
+            } else if location >= next {
+                low = mid + 1
+            } else {
+                return mid + 1
+            }
         }
-        return count
-    }
-
-    private func lineCount(in text: String) -> Int {
-        if text.isEmpty { return 1 }
-        let count = text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
-        return count
+        return max(low, 1)
     }
 }
 

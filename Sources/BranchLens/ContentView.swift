@@ -1322,15 +1322,16 @@ private struct CommitsPane: View {
             if model.historyBrowseMode == .all, model.chronologicalCommits.isEmpty {
                 Task { await model.reloadChronologicalCommits(reset: true) }
             }
-            preferLocalScopeIfNeeded(onlyLocal: showsLocalScopesOnly)
+            // Defer — mutating @Published during view update can hang SwiftUI.
+            schedulePreferLocalScopeIfNeeded()
         }
         .onChange(of: model.includeLocalChanges) { _, enabled in
             if enabled {
                 Task { await model.reloadWorkingTree() }
             }
         }
-        .onChange(of: showsLocalScopesOnly) { _, onlyLocal in
-            preferLocalScopeIfNeeded(onlyLocal: onlyLocal)
+        .onChange(of: showsLocalScopesOnly) { _, _ in
+            schedulePreferLocalScopeIfNeeded()
         }
     }
 
@@ -1347,8 +1348,15 @@ private struct CommitsPane: View {
         }
     }
 
-    private func preferLocalScopeIfNeeded(onlyLocal: Bool) {
-        guard onlyLocal else { return }
+    private func schedulePreferLocalScopeIfNeeded() {
+        // Bounce out of the current SwiftUI transaction before publishing.
+        Task { @MainActor in
+            preferLocalScopeIfNeeded()
+        }
+    }
+
+    private func preferLocalScopeIfNeeded() {
+        guard showsLocalScopesOnly else { return }
         guard case .combined = model.changeScope else { return }
         if !model.unstagedWorkingTreeFiles.isEmpty {
             model.selectUnstaged()
@@ -2112,7 +2120,9 @@ private struct FilesPane: View {
                 expandNewFolders()
             }
         }
-        .onChange(of: model.fileTree) { _, _ in
+        // Fingerprint paths only — rebuilding the full tree for Equatable onChange is expensive
+        // and can churn updates when stats flicker.
+        .onChange(of: model.fileTreePathSignature) { _, _ in
             if model.filesLayout == .folders {
                 // Only open newly appeared folders — don't reset expansion (avoids scroll jumps).
                 expandNewFolders()
@@ -2329,7 +2339,10 @@ private struct FilesPane: View {
     }
 
     private func expandNewFolders() {
-        expandedFolderIDs.formUnion(collectFolderIDs(model.fileTree))
+        let folderIDs = collectFolderIDs(model.fileTree)
+        let missing = folderIDs.filter { !expandedFolderIDs.contains($0) }
+        guard !missing.isEmpty else { return }
+        expandedFolderIDs.formUnion(missing)
     }
 
     private func collectFolderIDs(_ nodes: [FileTreeNode]) -> [FileTreeNode.ID] {

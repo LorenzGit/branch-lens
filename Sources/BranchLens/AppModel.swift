@@ -484,6 +484,11 @@ final class RepoSession: ObservableObject, Identifiable {
         FileTreeNode.build(from: filteredFiles)
     }
 
+    /// Stable path list for folder-expansion onChange (ignores add/del count flicker).
+    var fileTreePathSignature: String {
+        filteredFiles.map(\.path).sorted().joined(separator: "\n")
+    }
+
     /// Commit currently driving the Changed files scope (selected commit, or tip when combined).
     var activeScopeCommit: GitCommit? {
         switch changeScope {
@@ -2280,12 +2285,12 @@ final class RepoSession: ObservableObject, Identifiable {
         guard isEditingFile, let url = editWatchedURL else { return }
         guard let stamp = Self.fileStamp(at: url) else {
             // File vanished — treat as external change if we still have a buffer.
-            if editKnownStamp != nil {
+            if editKnownStamp != nil, !editExternallyChanged {
                 editExternallyChanged = true
             }
             return
         }
-        if let known = editKnownStamp, stamp != known {
+        if let known = editKnownStamp, stamp != known, !editExternallyChanged {
             editExternallyChanged = true
         }
     }
