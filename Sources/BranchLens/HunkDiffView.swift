@@ -9,13 +9,16 @@ struct HunkDiffView: View {
     var actionTitle: String? = nil
     var onHunkAction: ((DiffHunk) -> Void)? = nil
 
-    private var hunks: [DiffHunk] {
-        DiffParser.hunks(in: text)
-    }
+    /// Prefer a single scrollable diff when the hunk UI would create too many NSTextViews
+    /// (common for large PR / All-changes files and a frequent hang source).
+    private static let maxHunkCardsForReview = 28
+    private static let maxDiffLinesForReviewCards = 2_000
+    /// Hunks taller than this get an internal scroller instead of expanding the outer stack.
+    private static let maxHunkBodyLinesExpanded = 140
 
     var body: some View {
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || text.hasPrefix("(No textual diff") {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || text.hasPrefix("(No textual diff") {
             ContentUnavailableView(
                 "No textual diff",
                 systemImage: "doc.plaintext",
@@ -26,28 +29,48 @@ struct HunkDiffView: View {
                 )
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if hunks.isEmpty {
-            DiffScrollView(text: text, path: path, searchQuery: searchQuery)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(hunks) { hunk in
-                        HunkCard(
-                            hunk: hunk,
-                            path: path,
-                            searchQuery: searchQuery,
-                            actionTitle: actionTitle,
-                            onAction: onHunkAction.map { action in
-                                { action(hunk) }
-                            }
-                        )
+            let hunks = DiffParser.hunks(in: text)
+            let lineCount = Self.newlineCount(in: text)
+            let needsActions = onHunkAction != nil
+            let useCards = !hunks.isEmpty && (
+                needsActions
+                || (hunks.count <= Self.maxHunkCardsForReview
+                    && lineCount <= Self.maxDiffLinesForReviewCards)
+            )
+
+            if useCards {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(hunks) { hunk in
+                            HunkCard(
+                                hunk: hunk,
+                                path: path,
+                                searchQuery: searchQuery,
+                                actionTitle: actionTitle,
+                                expandBodyLines: Self.maxHunkBodyLinesExpanded,
+                                onAction: onHunkAction.map { action in
+                                    { action(hunk) }
+                                }
+                            )
+                            // Stable identity — avoids remount/highlight storms while scrolling.
+                            .id(hunk.id)
+                        }
                     }
+                    .padding(10)
                 }
-                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                // Review-only large diffs: one DiffScrollView is far cheaper than N fitted cards.
+                DiffScrollView(text: text, path: path, searchQuery: searchQuery)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    private static func newlineCount(in text: String) -> Int {
+        if text.isEmpty { return 0 }
+        return text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
     }
 }
 
@@ -56,7 +79,11 @@ private struct HunkCard: View {
     let path: String
     let searchQuery: String
     let actionTitle: String?
+    let expandBodyLines: Int
     let onAction: (() -> Void)?
+
+    private var bodyLineCount: Int { max(hunk.body.count, 1) }
+    private var usesInnerScroll: Bool { bodyLineCount > expandBodyLines }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -94,11 +121,12 @@ private struct HunkCard: View {
                 text: hunkDisplayText,
                 path: path,
                 searchQuery: searchQuery,
-                allowsScrolling: false,
+                allowsScrolling: usesInnerScroll,
                 omitHunkHeaders: true
             )
-            .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .topLeading)
+            .frame(maxHeight: usesInnerScroll ? 320 : nil)
+            .fixedSize(horizontal: false, vertical: !usesInnerScroll)
         }
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(

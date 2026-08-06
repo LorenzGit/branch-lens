@@ -28,10 +28,29 @@ enum HighlightRenderCache {
         searchQuery: String,
         extra: String = ""
     ) -> String {
-        // Avoid hashing entire files: length + prefix/suffix fingerprint.
+        // Length + ends + a cheap mid-content fingerprint (avoids hunk cache collisions).
         let prefix = source.prefix(96)
         let suffix = source.suffix(96)
-        return "\(kind)|\(path)|\(source.count)|\(prefix)|\(suffix)|\(searchQuery)|\(extra)"
+        let fingerprint = fnv1a64(source)
+        return "\(kind)|\(path)|\(source.count)|\(fingerprint)|\(prefix)|\(suffix)|\(searchQuery)|\(extra)"
+    }
+
+    private static func fnv1a64(_ text: String) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        let prime: UInt64 = 0x100000001b3
+        // Sample the string so huge diffs stay cheap to key.
+        let step = max(text.utf8.count / 4096, 1)
+        var index = 0
+        for byte in text.utf8 {
+            if index % step == 0 {
+                hash ^= UInt64(byte)
+                hash &*= prime
+            }
+            index += 1
+        }
+        hash ^= UInt64(text.utf8.count)
+        hash &*= prime
+        return hash
     }
 
     static func get(_ key: String) -> Entry? {

@@ -630,8 +630,12 @@ final class RepoSession: ObservableObject, Identifiable {
     var beforeLineCount: Int { TextUtilities.lineCount(beforeContents) }
 
     /// Line numbers from the current unified diff for Compare pane tinting.
+    /// Cached — parsing a large PR diff on every SwiftUI body eval was a hang risk.
+    private var cachedCompareChangedLineNumbers: (deleted: Set<Int>, added: Set<Int>) = ([], [])
+    private var cachedCompareChangedLineNumbersDiffID: Int = 0
+
     var compareChangedLineNumbers: (deleted: Set<Int>, added: Set<Int>) {
-        DiffParser.changedLineNumbers(in: fileDiff)
+        cachedCompareChangedLineNumbers
     }
     var afterLineCount: Int { TextUtilities.lineCount(afterContents) }
 
@@ -2058,6 +2062,8 @@ final class RepoSession: ObservableObject, Identifiable {
         afterContents = nil
         beforeImageData = nil
         afterImageData = nil
+        cachedCompareChangedLineNumbers = ([], [])
+        cachedCompareChangedLineNumbersDiffID = 0
         isLoadingFile = false
     }
 
@@ -2351,14 +2357,34 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func applyPayload(_ payload: FileInspectorPayload) {
-        fileDiff = payload.diff
-        beforeContents = payload.before
-        afterContents = payload.after
+        fileDiff = Self.cappedText(payload.diff, label: "diff")
+        beforeContents = payload.before.map { Self.cappedText($0, label: "file") }
+        afterContents = payload.after.map { Self.cappedText($0, label: "file") }
         beforeImageData = payload.beforeImageData
         afterImageData = payload.afterImageData
         beforeLabel = payload.beforeLabel
         afterLabel = payload.afterLabel
+        refreshCompareChangedLineNumbersCache()
         isLoadingFile = false
+    }
+
+    private func refreshCompareChangedLineNumbersCache() {
+        let id = fileDiff.hashValue
+        guard id != cachedCompareChangedLineNumbersDiffID else { return }
+        cachedCompareChangedLineNumbersDiffID = id
+        cachedCompareChangedLineNumbers = DiffParser.changedLineNumbers(in: fileDiff)
+    }
+
+    /// Keep inspector text bounded so syntax highlight / hunk cards can't pin the UI.
+    private static let maxInspectorTextUTF8Bytes = 1_500_000
+
+    private static func cappedText(_ text: String, label: String) -> String {
+        guard let data = text.data(using: .utf8), data.count > maxInspectorTextUTF8Bytes else {
+            return text
+        }
+        let truncated = String(data: data.prefix(maxInspectorTextUTF8Bytes), encoding: .utf8) ?? String(text.prefix(maxInspectorTextUTF8Bytes / 2))
+        return truncated
+            + "\n\n… [BranchLens truncated this \(label) for performance — open in an editor for the full content]\n"
     }
 
     private func storeCache(key: String, payload: FileInspectorPayload) {
@@ -2410,6 +2436,7 @@ final class RepoSession: ObservableObject, Identifiable {
                     afterContents = nil
                     beforeImageData = nil
                     afterImageData = nil
+                    refreshCompareChangedLineNumbersCache()
                     isLoadingFile = false
                 }
             }
