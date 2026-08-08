@@ -1269,6 +1269,7 @@ private struct CommitsPane: View {
                                             CommitCard(
                                                 commit: commit,
                                                 pullRequest: model.pullRequest(forCommitHash: commit.hash) ?? merged.pullRequest,
+                                                changeStats: model.changeStats(forCommitHash: commit.hash),
                                                 isSelected: {
                                                     if case .commit(let hash) = model.changeScope {
                                                         return hash == commit.hash
@@ -1280,6 +1281,9 @@ private struct CommitsPane: View {
                                                     model.openCommitPullRequestInBrowser(link)
                                                 }
                                             )
+                                            .onAppear {
+                                                Task { await model.ensureCommitChangeStats(for: commit) }
+                                            }
                                         }
                                     }
                                 }
@@ -1294,6 +1298,7 @@ private struct CommitsPane: View {
                                         CommitCard(
                                             commit: commit,
                                             pullRequest: model.pullRequest(forCommitHash: commit.hash),
+                                            changeStats: model.changeStats(forCommitHash: commit.hash),
                                             isSelected: {
                                                 if case .commit(let hash) = model.changeScope {
                                                     return hash == commit.hash
@@ -1305,6 +1310,9 @@ private struct CommitsPane: View {
                                                 model.openCommitPullRequestInBrowser(link)
                                             }
                                         )
+                                        .onAppear {
+                                            Task { await model.ensureCommitChangeStats(for: commit) }
+                                        }
                                     }
                                 }
                             }
@@ -1386,6 +1394,7 @@ private struct CommitsPane: View {
                         CommitCard(
                             commit: commit,
                             pullRequest: model.pullRequest(forCommitHash: commit.hash),
+                            changeStats: model.changeStats(forCommitHash: commit.hash),
                             isSelected: {
                                 if case .commit(let hash) = model.changeScope {
                                     return hash == commit.hash
@@ -1400,6 +1409,7 @@ private struct CommitsPane: View {
                         .onAppear {
                             Task {
                                 await model.ensureCommitPullRequest(for: commit)
+                                await model.ensureCommitChangeStats(for: commit)
                                 await model.loadMoreChronologicalCommitsIfNeeded(near: commit)
                             }
                         }
@@ -1925,6 +1935,7 @@ private struct MergedIntoCompareCard: View {
 private struct CommitCard: View {
     let commit: GitCommit
     let pullRequest: CommitPullRequestLink?
+    var changeStats: CommitChangeStats? = nil
     let isSelected: Bool
     let onSelect: () -> Void
     let onOpenPullRequest: (CommitPullRequestLink) -> Void
@@ -1953,6 +1964,23 @@ private struct CommitCard: View {
                     Text(commit.authoredDate, style: .relative)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
+                    if let changeStats {
+                        Text("·")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Text("\(changeStats.fileCount)f")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .help("\(changeStats.fileCount) file\(changeStats.fileCount == 1 ? "" : "s") changed")
+                        Text("+\(changeStats.additions)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.additionText)
+                            .help("\(changeStats.additions) lines added")
+                        Text("−\(changeStats.deletions)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.deletionText)
+                            .help("\(changeStats.deletions) lines deleted")
+                    }
                     Spacer(minLength: 0)
                     if let pullRequest {
                         Button {

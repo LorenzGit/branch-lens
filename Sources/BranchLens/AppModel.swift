@@ -222,6 +222,9 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var commitPullRequests: [String: CommitPullRequestLink] = [:]
     /// SHAs already queried (including commits with no PR).
     private var commitPRResolved: Set<String> = []
+    /// Commit SHA → files / +/- for History cards.
+    @Published var commitChangeStats: [String: CommitChangeStats] = [:]
+    private var commitStatsResolved: Set<String> = []
     /// When BRANCH has no unique commits vs COMPARE because it was already merged.
     @Published var mergedIntoCompare: MergedIntoCompareInfo?
 
@@ -597,6 +600,23 @@ final class RepoSession: ObservableObject, Identifiable {
         await loadCommitPullRequests(for: [commit])
     }
 
+    func changeStats(forCommitHash hash: String) -> CommitChangeStats? {
+        commitChangeStats[hash]
+    }
+
+    /// Lazy files/+/- fetch for a visible History card.
+    func ensureCommitChangeStats(for commit: GitCommit) async {
+        guard let repoPath else { return }
+        guard !commitStatsResolved.contains(commit.hash) else { return }
+        commitStatsResolved.insert(commit.hash)
+        do {
+            let stats = try await git.commitChangeStats(in: repoPath, commit: commit.hash)
+            commitChangeStats[commit.hash] = stats
+        } catch {
+            // Leave unresolved visually; don't retry forever on hard failures.
+        }
+    }
+
     var scopeCommitSummary: String {
         switch changeScope {
         case .combined:
@@ -704,6 +724,8 @@ final class RepoSession: ObservableObject, Identifiable {
                 selectedFileID = nil
                 commitPullRequests = [:]
                 commitPRResolved = []
+                commitChangeStats = [:]
+                commitStatsResolved = []
                 mergedIntoCompare = nil
             }
             clearInspectorCache()

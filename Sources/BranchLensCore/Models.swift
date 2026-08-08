@@ -40,6 +40,19 @@ public struct GitCommit: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Aggregate change size for one commit (`git show --numstat`).
+public struct CommitChangeStats: Hashable, Sendable {
+    public let fileCount: Int
+    public let additions: Int
+    public let deletions: Int
+
+    public init(fileCount: Int, additions: Int, deletions: Int) {
+        self.fileCount = fileCount
+        self.additions = additions
+        self.deletions = deletions
+    }
+}
+
 public enum FileChangeStatus: String, Sendable, Hashable {
     case added = "A"
     case modified = "M"

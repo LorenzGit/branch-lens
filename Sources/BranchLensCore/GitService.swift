@@ -326,6 +326,25 @@ public actor GitService {
         return parseChangedFiles(nameStatus: nameStatus, numStat: numStat)
     }
 
+    /// Files / insertions / deletions for a single commit.
+    public func commitChangeStats(in repo: URL, commit: String) async throws -> CommitChangeStats {
+        let numStat = try await runGit(
+            ["show", "--numstat", "--format=", "--find-renames", commit],
+            in: repo
+        )
+        var fileCount = 0
+        var additions = 0
+        var deletions = 0
+        for line in numStat.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 3 else { continue }
+            fileCount += 1
+            additions += Int(parts[0]) ?? 0
+            deletions += Int(parts[1]) ?? 0
+        }
+        return CommitChangeStats(fileCount: fileCount, additions: additions, deletions: deletions)
+    }
+
     /// History of commits that touched `path` (follows renames).
     public func fileHistory(
         in repo: URL,
