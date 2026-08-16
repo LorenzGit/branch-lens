@@ -1,6 +1,7 @@
 import AppKit
 import BranchLensCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var workspace = WorkspaceModel()
@@ -131,6 +132,7 @@ private struct SessionContainer: View {
 
 private struct TabBarView: View {
     @ObservedObject var workspace: WorkspaceModel
+    @State private var draggingTabID: UUID?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -141,13 +143,32 @@ private struct TabBarView: View {
                             session: tab,
                             workspace: workspace,
                             isActive: tab.id == workspace.activeSession?.id,
+                            isDragging: draggingTabID == tab.id,
                             onSelect: { workspace.selectTab(tab.id) },
                             onClose: { workspace.requestClose(tab) }
                         )
+                        .onDrag {
+                            draggingTabID = tab.id
+                            return NSItemProvider(object: tab.id.uuidString as NSString)
+                        }
+                        .onDrop(
+                            of: [UTType.plainText],
+                            delegate: TabReorderDropDelegate(
+                                targetID: tab.id,
+                                tabs: workspace.tabs,
+                                draggingTabID: $draggingTabID,
+                                move: { workspace.moveTab(from: $0, to: $1) }
+                            )
+                        )
                     }
                 }
+                .animation(.easeInOut(duration: 0.15), value: workspace.tabs.map(\.id))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 6)
+                .onDrop(of: [UTType.plainText], isTargeted: nil) { _ in
+                    draggingTabID = nil
+                    return true
+                }
             }
 
             Menu {
@@ -185,10 +206,38 @@ private struct TabBarView: View {
     }
 }
 
+private struct TabReorderDropDelegate: DropDelegate {
+    let targetID: UUID
+    let tabs: [RepoSession]
+    @Binding var draggingTabID: UUID?
+    let move: (IndexSet, Int) -> Void
+
+    func dropEntered(info: DropInfo) {
+        guard let draggingTabID, draggingTabID != targetID,
+              let from = tabs.firstIndex(where: { $0.id == draggingTabID }),
+              let to = tabs.firstIndex(where: { $0.id == targetID })
+        else { return }
+        guard from != to else { return }
+        move(IndexSet(integer: from), to > from ? to + 1 : to)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggingTabID = nil
+        return true
+    }
+
+    func dropExited(info: DropInfo) {}
+}
+
 private struct TabChip: View {
     @ObservedObject var session: RepoSession
     @ObservedObject var workspace: WorkspaceModel
     let isActive: Bool
+    var isDragging: Bool = false
     let onSelect: () -> Void
     let onClose: () -> Void
 
@@ -198,18 +247,17 @@ private struct TabChip: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Button(action: onSelect) {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(.caption2)
-                        .foregroundStyle(isActive ? Color.accentColor : .secondary)
-                    Text(title)
-                        .font(.callout.weight(isActive ? .semibold : .regular))
-                        .lineLimit(1)
-                }
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.caption2)
+                    .foregroundStyle(isActive ? Color.accentColor : .secondary)
+                Text(title)
+                    .font(.callout.weight(isActive ? .semibold : .regular))
+                    .lineLimit(1)
             }
-            .buttonStyle(.plain)
-            .help(session.repoPath?.path ?? "Switch to \(title)")
+            .contentShape(Rectangle())
+            .onTapGesture(perform: onSelect)
+            .help("\(session.repoPath?.path ?? title)\nDrag to rearrange")
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -232,6 +280,7 @@ private struct TabChip: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(isActive ? Color.accentColor.opacity(0.35) : Color.clear, lineWidth: 1)
         )
+        .opacity(isDragging ? 0.55 : 1)
     }
 }
 

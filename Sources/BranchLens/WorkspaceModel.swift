@@ -63,6 +63,12 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
+    func moveTab(from source: IndexSet, to destination: Int) {
+        guard !source.isEmpty else { return }
+        tabs.move(fromOffsets: source, toOffset: destination)
+        scheduleSave()
+    }
+
     /// Fetch+reload the active tab if its auto-fetch cooldown has elapsed.
     func refreshActiveTabIfNeeded() async {
         await activeSession?.refreshIfStale()
