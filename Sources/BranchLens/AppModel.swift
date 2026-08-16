@@ -423,6 +423,21 @@ final class RepoSession: ObservableObject, Identifiable {
         return snapshot.commits.filter { selectedAuthors.contains($0.authorName) }
     }
 
+    /// Commits already on the fresh COMPARE tip that only appear because local COMPARE is stale.
+    var staleInheritedCommitHashes: Set<String> {
+        guard let snapshot else { return [] }
+        let inherited = snapshot.staleCompareInheritedCommitCount
+        guard inherited > 0 else { return [] }
+        return Set(snapshot.commits.suffix(inherited).map(\.hash))
+    }
+
+    /// Current-mode History: unique branch commits only (hide stale COMPARE leftovers).
+    var uniqueFilteredCommits: [GitCommit] {
+        let inherited = staleInheritedCommitHashes
+        guard !inherited.isEmpty else { return filteredCommits }
+        return filteredCommits.filter { !inherited.contains($0.hash) }
+    }
+
     /// Commits shown in the History list for the active browse mode.
     var displayedHistoryCommits: [GitCommit] {
         let source: [GitCommit]

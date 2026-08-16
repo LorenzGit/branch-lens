@@ -680,9 +680,9 @@ private struct BranchMenu: View {
         let longest = options
             .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 180
-        // Icon + paddings + optional relative-date column; clamp for extreme names.
+        // Icon + paddings + Viewing/Checked out badges + optional date column.
         let dateExtra: CGFloat = sortMode == .date ? 78 : 0
-        return min(max(ceil(longest) + 52 + dateExtra, 260), 720)
+        return min(max(ceil(longest) + 148 + dateExtra, 300), 760)
     }
 
     var body: some View {
@@ -780,6 +780,13 @@ private struct BranchMenu: View {
             .labelsHidden()
             .help("Sort branches by name or newest tip date")
 
+            if checkedOutBranch != nil {
+                Text("Viewing is what BranchLens inspects. Checked out is git HEAD.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if filteredOptions.isEmpty {
                 Text(options.isEmpty ? "No branches" : "No matches")
                     .font(.caption)
@@ -797,23 +804,29 @@ private struct BranchMenu: View {
                                 isOpen = false
                             } label: {
                                 HStack(spacing: 8) {
-                                    Image(systemName: isCheckedOut
-                                          ? "checkmark.circle.fill"
-                                          : (isInspecting ? "checkmark" : "arrow.triangle.branch"))
+                                    Image(systemName: isInspecting ? "eye.fill" : "arrow.triangle.branch")
                                         .font(.caption2.weight(.bold))
-                                        .foregroundStyle(isCheckedOut || isInspecting ? Color.accentColor : .secondary)
+                                        .foregroundStyle(isInspecting ? Color.accentColor : .secondary)
                                         .frame(width: 14)
                                     Text(branch)
-                                        .font(.callout.monospaced().weight(isCheckedOut ? .semibold : .regular))
+                                        .font(.callout.monospaced().weight(isInspecting ? .semibold : .regular))
                                         .lineLimit(1)
                                         .fixedSize(horizontal: true, vertical: false)
-                                    if isCheckedOut {
-                                        Text("HEAD")
+                                    if isInspecting {
+                                        Text("Viewing")
                                             .font(.caption2.weight(.bold))
                                             .foregroundStyle(Color.accentColor)
                                             .padding(.horizontal, 5)
                                             .padding(.vertical, 1)
                                             .background(Color.accentColor.opacity(0.16), in: Capsule())
+                                    }
+                                    if isCheckedOut {
+                                        Text("Checked out")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(Color.orange)
+                                            .padding(.horizontal, 5)
+                                            .padding(.vertical, 1)
+                                            .background(Color.orange.opacity(0.16), in: Capsule())
                                     }
                                     Spacer(minLength: 0)
                                     if sortMode == .date, let date = tipDates[branch] {
@@ -827,13 +840,14 @@ private struct BranchMenu: View {
                                 .padding(.vertical, 6)
                                 .background(
                                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(isCheckedOut
-                                              ? Color.accentColor.opacity(0.18)
-                                              : (isInspecting ? Color.accentColor.opacity(0.08) : Color.clear))
+                                        .fill(isInspecting ? Color.accentColor.opacity(0.14) : Color.clear)
                                 )
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .strokeBorder(isCheckedOut ? Color.accentColor.opacity(0.45) : Color.clear, lineWidth: 1)
+                                        .strokeBorder(
+                                            isInspecting ? Color.accentColor.opacity(0.40) : Color.clear,
+                                            lineWidth: isInspecting ? 1 : 0
+                                        )
                                 )
                                 .contentShape(Rectangle())
                             }
@@ -850,9 +864,9 @@ private struct BranchMenu: View {
     }
 
     private func branchHelp(for branch: String, isCheckedOut: Bool = false, isInspecting: Bool = false) -> String {
-        var lines: [String] = ["Select \(branch)"]
-        if isCheckedOut { lines.append("Checked out in this worktree (HEAD)") }
-        if isInspecting, !isCheckedOut { lines.append("Currently inspecting in BranchLens") }
+        var lines: [String] = ["Inspect \(branch) in BranchLens"]
+        if isInspecting { lines.append("Viewing: this is the branch in the toolbar.") }
+        if isCheckedOut { lines.append("Checked out: git HEAD in this worktree.") }
         if let date = tipDates[branch] {
             let formatted = date.formatted(date: .abbreviated, time: .shortened)
             lines.append("Tip: \(formatted)")
@@ -1190,9 +1204,9 @@ private struct CommitsPane: View {
                         VStack(spacing: 8) {
                             // In sync + only local work: All changes / In sync are noise — keep Staged/Unstaged.
                             if !showsLocalScopesOnly {
-                                AllChangesCard(
-                                    isSelected: model.changeScope == .combined,
-                                    commitCount: model.filteredCommits.count,
+                            AllChangesCard(
+                                isSelected: model.changeScope == .combined,
+                                commitCount: model.uniqueFilteredCommits.count,
                                     stagedCount: model.stagedWorkingTreeFiles.count,
                                     unstagedCount: model.unstagedWorkingTreeFiles.count,
                                     includeLocal: model.includeLocalChanges,
@@ -1234,19 +1248,9 @@ private struct CommitsPane: View {
                                 }
                             }
 
-                            if let notice = staleCompareHistoryNotice {
-                                StaleCompareHistoryBanner(
-                                    notice: notice,
-                                    isUpdating: model.isUpdatingFromCompare,
-                                    onUpdate: {
-                                        Task { await model.updateLocalCompare() }
-                                    }
-                                )
-                            }
-
                             if showsLocalScopesOnly {
                                 // No unique commits and no In sync card — local scopes are enough.
-                            } else if let merged = model.mergedIntoCompare, model.filteredCommits.isEmpty {
+                            } else if let merged = model.mergedIntoCompare, model.uniqueFilteredCommits.isEmpty {
                                 MergedIntoCompareCard(
                                     info: merged,
                                     onOpenPullRequest: { link in
@@ -1287,14 +1291,14 @@ private struct CommitsPane: View {
                                         }
                                     }
                                 }
-                            } else if model.filteredCommits.isEmpty {
+                            } else if model.uniqueFilteredCommits.isEmpty {
                                 Text(model.selectedAuthors.isEmpty ? "No commits on this branch." : "No commits from selected authors.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .padding(.top, 4)
                             } else {
                                 LazyVStack(spacing: 8) {
-                                    ForEach(model.filteredCommits) { commit in
+                                    ForEach(model.uniqueFilteredCommits) { commit in
                                         CommitCard(
                                             commit: commit,
                                             pullRequest: model.pullRequest(forCommitHash: commit.hash),
@@ -1346,7 +1350,7 @@ private struct CommitsPane: View {
     /// Branch tip matches COMPARE and History is just local work — drop All changes / In sync.
     private var showsLocalScopesOnly: Bool {
         guard model.includeLocalChanges, model.hasLocalChanges else { return false }
-        guard model.filteredCommits.isEmpty else { return false }
+        guard model.uniqueFilteredCommits.isEmpty else { return false }
         guard let merged = model.mergedIntoCompare else { return false }
         switch merged.kind {
         case .inSync, .contained:
@@ -1436,9 +1440,8 @@ private struct CommitsPane: View {
 
     /// No unique branch commits, no local edits to browse, and nothing useful in the merged fallback.
     private var historyIsClean: Bool {
-        if !model.filteredCommits.isEmpty { return false }
+        if !model.uniqueFilteredCommits.isEmpty { return false }
         if model.includeLocalChanges && model.hasLocalChanges { return false }
-        if let notice = staleCompareHistoryNotice, notice.inheritedCommitCount > 0 { return false }
         if !model.selectedAuthors.isEmpty,
            let snapshot = model.snapshot,
            !snapshot.commits.isEmpty {
@@ -1479,19 +1482,6 @@ private struct CommitsPane: View {
                 Task { await model.unstageAllStaged() }
             },
         ]
-    }
-
-    private var staleCompareHistoryNotice: StaleCompareHistoryNotice? {
-        guard let snapshot = model.snapshot else { return nil }
-        let behind = snapshot.localCompareBehindCount
-        let inherited = snapshot.staleCompareInheritedCommitCount
-        guard behind > 0, inherited > 0, snapshot.compareTip != snapshot.baseBranch else { return nil }
-        return StaleCompareHistoryNotice(
-            localCompare: snapshot.baseBranch,
-            compareTip: snapshot.compareTip,
-            behindCount: behind,
-            inheritedCommitCount: inherited
-        )
     }
 
     @ViewBuilder
@@ -1768,68 +1758,6 @@ private struct CommitSheet: View {
                 messageFocused = true
             }
         }
-    }
-}
-
-private struct StaleCompareHistoryNotice: Equatable {
-    let localCompare: String
-    let compareTip: String
-    let behindCount: Int
-    let inheritedCommitCount: Int
-}
-
-private struct StaleCompareHistoryBanner: View {
-    let notice: StaleCompareHistoryNotice
-    let isUpdating: Bool
-    let onUpdate: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "info.circle.fill")
-                    .foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Why extra commits / PR badges?")
-                        .font(.caption.weight(.semibold))
-                    Text(explanation)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            Button {
-                onUpdate()
-            } label: {
-                if isUpdating {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Label("Update \(notice.localCompare)", systemImage: "arrow.down.circle")
-                        .font(.caption.weight(.semibold))
-                }
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(isUpdating)
-            .help("Fast-forward local \(notice.localCompare) to \(notice.compareTip) so History only lists commits unique to this branch")
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.orange.opacity(0.10))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color.orange.opacity(0.28), lineWidth: 1)
-        )
-    }
-
-    private var explanation: String {
-        let commitWord = notice.inheritedCommitCount == 1 ? "commit" : "commits"
-        let behindWord = notice.behindCount == 1 ? "commit" : "commits"
-        return "\(notice.inheritedCommitCount) \(commitWord) below (and their PR badges) are already on \(notice.compareTip). They show up because History compares against local \(notice.localCompare), which is \(notice.behindCount) \(behindWord) behind. Update \(notice.localCompare) to hide them."
     }
 }
 
