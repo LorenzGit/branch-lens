@@ -808,6 +808,16 @@ public actor GitService {
         return iso.date(from: value) ?? isoBasic.date(from: value) ?? Date.distantPast
     }
 
+    /// Triple-dot file list (`from...to`), same as GitHub’s PR “files changed”.
+    public func changedFiles(in repo: URL, from: String, to: String) async throws -> [ChangedFile] {
+        try await listChangedFiles(in: repo, from: from, to: to)
+    }
+
+    public func mergeBase(of a: String, and b: String, in repo: URL) async throws -> String {
+        try await runGit(["merge-base", a, b], in: repo)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func listChangedFiles(in repo: URL, from mergeBase: String, to branch: String) async throws -> [ChangedFile] {
         let nameStatus = try await runGit(
             ["diff", "--name-status", "--find-renames", "\(mergeBase)...\(branch)"],

@@ -28,6 +28,8 @@ enum ChangeScope: Equatable, Hashable {
     /// Branch commits since Compare, plus local staged/unstaged.
     case combined
     case commit(String)
+    /// Net PR files versus the fresh COMPARE tip (GitHub `base...head`).
+    case pullRequest(Int)
     case staged
     case unstaged
 
@@ -35,6 +37,7 @@ enum ChangeScope: Equatable, Hashable {
         switch self {
         case .combined: return "combined"
         case .commit(let hash): return "commit:\(hash)"
+        case .pullRequest(let number): return "pr:\(number)"
         case .staged: return "staged"
         case .unstaged: return "unstaged"
         }
@@ -225,6 +228,9 @@ final class RepoSession: ObservableObject, Identifiable {
     /// Commit SHA → files / +/- for History cards.
     @Published var commitChangeStats: [String: CommitChangeStats] = [:]
     private var commitStatsResolved: Set<String> = []
+    /// PR number → GitHub-style net stats versus the fresh COMPARE tip.
+    @Published var pullRequestChangeStats: [Int: CommitChangeStats] = [:]
+    private var pullRequestStatsResolved: Set<Int> = []
     /// When BRANCH has no unique commits vs COMPARE because it was already merged.
     @Published var mergedIntoCompare: MergedIntoCompareInfo?
 
@@ -268,6 +274,9 @@ final class RepoSession: ObservableObject, Identifiable {
         case .commit(let hash):
             combined = false
             commitHash = hash
+        case .pullRequest:
+            combined = true
+            commitHash = nil
         }
         return TabSnapshot(
             id: id,
@@ -531,7 +540,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 ?? filteredCommits.first(where: { $0.hash == hash })
                 ?? chronologicalCommits.first(where: { $0.hash == hash })
                 ?? mergedIntoCompare?.commits.first(where: { $0.hash == hash })
-        case .combined:
+        case .combined, .pullRequest:
             return filteredCommits.first
                 ?? snapshot?.commits.first
                 ?? mergedIntoCompare?.commits.first
@@ -567,6 +576,8 @@ final class RepoSession: ObservableObject, Identifiable {
         case .current:
             if case .commit(let hash) = changeScope,
                snapshot?.commits.contains(where: { $0.hash == hash }) == true {
+                await reloadVisibleFiles(forceInspectorReload: true)
+            } else if case .pullRequest = changeScope {
                 await reloadVisibleFiles(forceInspectorReload: true)
             } else {
                 changeScope = .combined
@@ -635,6 +646,31 @@ final class RepoSession: ObservableObject, Identifiable {
         commitChangeStats[hash]
     }
 
+    func changeStats(forPullRequest number: Int) -> CommitChangeStats? {
+        pullRequestChangeStats[number]
+    }
+
+    /// Net files/+/- for a PR versus the fresh COMPARE tip (`origin/<compare>...BRANCH`).
+    func ensurePullRequestChangeStats(for number: Int) async {
+        guard let repoPath, let snap = snapshot else { return }
+        guard !pullRequestStatsResolved.contains(number) else { return }
+        pullRequestStatsResolved.insert(number)
+        do {
+            let files = try await git.changedFiles(
+                in: repoPath,
+                from: snap.compareTip,
+                to: snap.branch
+            )
+            pullRequestChangeStats[number] = CommitChangeStats(
+                fileCount: files.count,
+                additions: files.reduce(0) { $0 + $1.additions },
+                deletions: files.reduce(0) { $0 + $1.deletions }
+            )
+        } catch {
+            pullRequestStatsResolved.remove(number)
+        }
+    }
+
     /// Lazy files/+/- fetch for a visible History card.
     func ensureCommitChangeStats(for commit: GitCommit) async {
         guard let repoPath else { return }
@@ -668,6 +704,15 @@ final class RepoSession: ObservableObject, Identifiable {
             guard let commit = activeScopeCommit else { return "Commit" }
             let date = commit.authoredDate.formatted(date: .abbreviated, time: .shortened)
             return "\(commit.shortHash) · \(commit.authorName) · \(date)"
+        case .pullRequest(let number):
+            let tip = snapshot?.compareTip ?? baseBranch
+            if let link = currentHistoryItems.compactMap({ item -> CommitPullRequestLink? in
+                if case .pullRequest(let pr, _) = item, pr.number == number { return pr }
+                return nil
+            }).first {
+                return "\(link.badgeLabel) · vs \(tip)"
+            }
+            return "PR #\(number) · vs \(tip)"
         }
     }
 
@@ -850,6 +895,15 @@ final class RepoSession: ObservableObject, Identifiable {
     func selectCommit(_ commit: GitCommit) {
         requestLeaveEditingIfNeeded {
             self.changeScope = .commit(commit.hash)
+            self.notifyStateChange()
+            Task { await self.reloadVisibleFiles() }
+        }
+    }
+
+    func selectPullRequestFiles(_ number: Int) {
+        requestLeaveEditingIfNeeded {
+            self.changeScope = .pullRequest(number)
+            self.selectedPullRequestID = number
             self.notifyStateChange()
             Task { await self.reloadVisibleFiles() }
         }
@@ -1332,6 +1386,8 @@ final class RepoSession: ObservableObject, Identifiable {
                 let snap = try await git.loadSnapshot(repo: repoPath, branch: branch, baseBranch: base)
                 guard !Task.isCancelled else { return }
                 snapshot = snap
+                pullRequestChangeStats = [:]
+                pullRequestStatsResolved = []
                 checkedOutBranch = try? await git.currentBranch(in: repoPath)
                 selectedAuthors = selectedAuthors.filter { author in
                     snap.commits.contains { $0.authorName == author }
@@ -1804,7 +1860,10 @@ final class RepoSession: ObservableObject, Identifiable {
             persistMemory()
             clearInspectorCache()
             notifyStateChange()
-            Task { await reloadSnapshot(resetScope: true) }
+            Task {
+                await reloadSnapshot(resetScope: true)
+                selectPullRequestFiles(pr.number)
+            }
         } else {
             statusMessage = "PR #\(pr.number) head “\(pr.headRefName)” is not a local branch"
             notifyStateChange()
@@ -2036,6 +2095,12 @@ final class RepoSession: ObservableObject, Identifiable {
                     }
                 case .commit(let hash):
                     files = try await git.commitChangedFiles(in: snapshot.repoPath, commit: hash)
+                case .pullRequest:
+                    files = try await git.changedFiles(
+                        in: snapshot.repoPath,
+                        from: snapshot.compareTip,
+                        to: snapshot.branch
+                    )
                 case .staged:
                     files = stagedWorkingTreeFiles.map(\.asChangedFile)
                 case .unstaged:
@@ -2140,7 +2205,7 @@ final class RepoSession: ObservableObject, Identifiable {
             // Text must be loadable (or empty new file). Binary/image → afterContents nil.
             if file.status == .added { return true }
             return afterContents != nil || afterLabel == "Working tree"
-        case .staged, .commit:
+        case .staged, .commit, .pullRequest:
             return false
         }
     }
@@ -2579,6 +2644,27 @@ final class RepoSession: ObservableObject, Identifiable {
             }
             beforeName = "parent of \(short)"
             afterName = short
+        case .pullRequest:
+            guard let snap else { throw GitError.commandFailed("No branch snapshot loaded.") }
+            let mergeBase = try await git.mergeBase(of: snap.compareTip, and: snap.branch, in: repoPath)
+            let mergeBaseShort = String(mergeBase.prefix(8))
+            async let diffTask = git.fileDiff(
+                in: repoPath,
+                from: mergeBase,
+                to: snap.branch,
+                path: file.path,
+                oldPath: file.oldPath
+            )
+            async let beforeTask = git.fileContents(in: repoPath, revision: mergeBase, path: beforePath)
+            async let afterTask = git.fileContents(in: repoPath, revision: snap.branch, path: afterPath)
+            (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+            if wantsImages {
+                async let beforeImageTask = git.fileData(in: repoPath, revision: mergeBase, path: beforePath)
+                async let afterImageTask = git.fileData(in: repoPath, revision: snap.branch, path: afterPath)
+                (beforeImage, afterImage) = try await (beforeImageTask, afterImageTask)
+            }
+            beforeName = "\(snap.compareTip) @ \(mergeBaseShort)"
+            afterName = snap.branch
         case .staged:
             async let diffTask = git.stagedDiff(in: repoPath, path: afterPath, oldPath: file.oldPath)
             async let beforeTask = git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)

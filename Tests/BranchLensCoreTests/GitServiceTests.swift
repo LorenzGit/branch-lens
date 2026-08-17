@@ -87,6 +87,41 @@ final class GitServiceTests: XCTestCase {
         XCTAssertEqual(netFile.deletions, 0)
     }
 
+    func testChangedFilesUsesTripleDotLikeGitHubPullRequest() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-pr-files-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "base\n".write(to: root.appendingPathComponent("keep.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        try await run(in: root, "/usr/bin/git", "checkout", "-b", "feature")
+        try "feature\n".write(to: root.appendingPathComponent("pr.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "pr work")
+
+        try await run(in: root, "/usr/bin/git", "checkout", "main")
+        try "main extra\n".write(to: root.appendingPathComponent("unrelated.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "advance main")
+        try await run(in: root, "/usr/bin/git", "branch", "origin/main", "main")
+        try await run(in: root, "/usr/bin/git", "reset", "--hard", "HEAD~1")
+        try await run(in: root, "/usr/bin/git", "checkout", "feature")
+        try await run(in: root, "/usr/bin/git", "merge", "origin/main", "-m", "sync origin/main")
+
+        let git = GitService()
+        let vsStaleMain = try await git.changedFiles(in: root, from: "main", to: "feature")
+        let vsFreshMain = try await git.changedFiles(in: root, from: "origin/main", to: "feature")
+        XCTAssertEqual(Set(vsFreshMain.map(\.path)), ["pr.txt"])
+        XCTAssertTrue(vsStaleMain.map(\.path).contains("unrelated.txt"))
+        XCTAssertGreaterThan(vsStaleMain.count, vsFreshMain.count)
+    }
+
     func testWriteWorkingTreeFileRoundTrip() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("branch-lens-write-\(UUID().uuidString)", isDirectory: true)

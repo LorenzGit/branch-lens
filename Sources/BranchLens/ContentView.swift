@@ -293,19 +293,47 @@ private struct ToolbarView: View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 if model.repoPath != nil {
-                    BranchMenu(
-                        title: "Branch",
-                        icon: "arrow.triangle.branch",
-                        value: model.selectedBranch,
-                        options: model.branches,
-                        tipDates: model.branchTipDates,
-                        emphasized: true,
-                        checkedOutBranch: model.checkedOutBranch,
-                        badge: upstreamBadge(for: model.snapshot),
-                        badgeHelp: upstreamBadgeHelp(for: model.snapshot),
-                        badgeStyle: upstreamBadgeStyle(for: model.snapshot),
-                        helpText: "Branch to inspect"
-                    ) { model.selectBranch($0) }
+                    HStack(spacing: 6) {
+                        if let checkedOut = model.checkedOutBranch,
+                           !checkedOut.isEmpty,
+                           checkedOut != model.selectedBranch {
+                            Button {
+                                model.selectBranch(checkedOut)
+                            } label: {
+                                Image(systemName: "arrow.uturn.backward")
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(Color.orange)
+                                    .frame(width: 16)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 14)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .fill(Color.orange.opacity(0.12))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .strokeBorder(Color.orange.opacity(0.30), lineWidth: 1)
+                                    )
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Inspect the checked-out branch \(checkedOut)")
+                        }
+
+                        BranchMenu(
+                            title: "Branch",
+                            icon: "arrow.triangle.branch",
+                            value: model.selectedBranch,
+                            options: model.branches,
+                            tipDates: model.branchTipDates,
+                            emphasized: true,
+                            checkedOutBranch: model.checkedOutBranch,
+                            badge: upstreamBadge(for: model.snapshot),
+                            badgeHelp: upstreamBadgeHelp(for: model.snapshot),
+                            badgeStyle: upstreamBadgeStyle(for: model.snapshot),
+                            helpText: "Branch to inspect"
+                        ) { model.selectBranch($0) }
+                    }
 
                     if model.unpushedCommitCount > 0 {
                         Button {
@@ -1498,8 +1526,15 @@ private struct CommitsPane: View {
                 commit: commit,
                 pullRequest: model.pullRequest(forCommitHash: commit.hash),
                 changeStats: model.changeStats(forCommitHash: commit.hash),
-                isSelected: isCommitSelected(commit.hash),
-                onSelect: { model.selectCommit(commit) },
+                isSelected: isCommitSelected(commit.hash)
+                    || (model.pullRequest(forCommitHash: commit.hash).map { isPullRequestSelected($0.number) } ?? false),
+                onSelect: {
+                    if let pr = model.pullRequest(forCommitHash: commit.hash) {
+                        model.selectPullRequestFiles(pr.number)
+                    } else {
+                        model.selectCommit(commit)
+                    }
+                },
                 onOpenPullRequest: { link in
                     model.openCommitPullRequestInBrowser(link)
                 }
@@ -1512,13 +1547,13 @@ private struct CommitsPane: View {
                 pullRequest: pullRequest,
                 commits: commits,
                 primary: item.primaryCommit,
-                changeStats: model.changeStats(forCommitHash: item.primaryCommit.hash),
-                isSelected: commits.contains { isCommitSelected($0.hash) },
-                onSelect: { model.selectCommit(item.primaryCommit) },
+                changeStats: model.changeStats(forPullRequest: pullRequest.number),
+                isSelected: isPullRequestSelected(pullRequest.number),
+                onSelect: { model.selectPullRequestFiles(pullRequest.number) },
                 onOpenPullRequest: { model.openCommitPullRequestInBrowser(pullRequest) }
             )
             .onAppear {
-                Task { await model.ensureCommitChangeStats(for: item.primaryCommit) }
+                Task { await model.ensurePullRequestChangeStats(for: pullRequest.number) }
             }
         }
     }
@@ -1526,6 +1561,13 @@ private struct CommitsPane: View {
     private func isCommitSelected(_ hash: String) -> Bool {
         if case .commit(let selected) = model.changeScope {
             return selected == hash
+        }
+        return false
+    }
+
+    private func isPullRequestSelected(_ number: Int) -> Bool {
+        if case .pullRequest(let selected) = model.changeScope {
+            return selected == number
         }
         return false
     }
@@ -2348,6 +2390,7 @@ private struct FilesPane: View {
         case .staged: return "staged"
         case .unstaged: return "unstaged"
         case .commit(let hash): return "commit-\(hash)"
+        case .pullRequest(let number): return "pr-\(number)"
         }
     }
 
