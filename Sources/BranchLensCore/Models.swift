@@ -38,6 +38,8 @@ public struct GitCommit: Identifiable, Hashable, Sendable {
         self.authoredDate = authoredDate
         self.parents = parents
     }
+
+    public var isMerge: Bool { parents.count > 1 }
 }
 
 /// Aggregate change size for one commit (`git show --numstat`).

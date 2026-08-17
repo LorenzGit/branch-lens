@@ -54,6 +54,7 @@ struct SyntaxTextView: NSViewRepresentable {
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
+        scroll.usesPredominantAxisScrolling = false
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
 
@@ -66,7 +67,7 @@ struct SyntaxTextView: NSViewRepresentable {
         textView.textContainerInset = NSSize(width: 10, height: 12)
         textView.isHorizontallyResizable = true
         textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
+        textView.autoresizingMask = []
         textView.minSize = .zero
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = false
@@ -165,7 +166,11 @@ struct SyntaxTextView: NSViewRepresentable {
         textView.textStorage?.setAttributedString(entry.attributed)
         textView.backgroundColor = .textBackgroundColor
         // Restore cached metrics — skip sizeToFit (major Compare switch cost).
+        // Don't width-track the clip view or long lines can't scroll horizontally.
+        textView.autoresizingMask = []
+        textView.minSize = NSSize(width: entry.width, height: entry.height)
         textView.frame = NSRect(x: 0, y: 0, width: entry.width, height: entry.height)
+        textView.textContainer?.widthTracksTextView = false
         textView.textContainer?.containerSize = NSSize(
             width: CGFloat.greatestFiniteMagnitude,
             height: CGFloat.greatestFiniteMagnitude
@@ -214,6 +219,7 @@ struct DiffScrollView: NSViewRepresentable {
         textView.textContainerInset = NSSize(width: 8, height: 10)
         textView.isHorizontallyResizable = true
         textView.isVerticallyResizable = true
+        textView.autoresizingMask = []
         textView.minSize = .zero
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = false
@@ -255,11 +261,13 @@ struct DiffScrollView: NSViewRepresentable {
             fitted.allowsScrolling = allowsScrolling
         }
         scroll.hasVerticalScroller = allowsScrolling
-        scroll.hasHorizontalScroller = allowsScrolling
+        // Fitted hunk cards still need sideways scroll for long lines.
+        scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
         scroll.scrollerStyle = .overlay
         scroll.verticalScrollElasticity = allowsScrolling ? .automatic : .none
-        scroll.horizontalScrollElasticity = allowsScrolling ? .automatic : .none
+        scroll.horizontalScrollElasticity = .automatic
+        scroll.usesPredominantAxisScrolling = false
         scroll.contentView.drawsBackground = false
         scroll.drawsBackground = false
     }
@@ -290,7 +298,8 @@ struct DiffScrollView: NSViewRepresentable {
         }
 
         override func scrollWheel(with event: NSEvent) {
-            if allowsScrolling {
+            let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
+            if allowsScrolling || horizontal {
                 super.scrollWheel(with: event)
             } else {
                 nextResponder?.scrollWheel(with: event)
@@ -359,7 +368,10 @@ struct DiffScrollView: NSViewRepresentable {
         allowsScrolling: Bool
     ) {
         textView.textStorage?.setAttributedString(entry.attributed)
+        textView.autoresizingMask = []
+        textView.minSize = NSSize(width: entry.width, height: entry.height)
         textView.frame = NSRect(x: 0, y: 0, width: entry.width, height: entry.height)
+        textView.textContainer?.widthTracksTextView = false
         textView.textContainer?.containerSize = NSSize(
             width: CGFloat.greatestFiniteMagnitude,
             height: CGFloat.greatestFiniteMagnitude

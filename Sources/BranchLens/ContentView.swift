@@ -1255,7 +1255,7 @@ private struct CommitsPane: View {
                             if !showsLocalScopesOnly {
                             AllChangesCard(
                                 isSelected: model.changeScope == .combined,
-                                commitCount: model.uniqueFilteredCommits.count,
+                                commitCount: model.currentHistoryCommits.count,
                                     stagedCount: model.stagedWorkingTreeFiles.count,
                                     unstagedCount: model.unstagedWorkingTreeFiles.count,
                                     includeLocal: model.includeLocalChanges,
@@ -1340,32 +1340,15 @@ private struct CommitsPane: View {
                                         }
                                     }
                                 }
-                            } else if model.uniqueFilteredCommits.isEmpty {
+                            } else if model.currentHistoryItems.isEmpty {
                                 Text(model.selectedAuthors.isEmpty ? "No commits on this branch." : "No commits from selected authors.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .padding(.top, 4)
                             } else {
                                 LazyVStack(spacing: 8) {
-                                    ForEach(model.uniqueFilteredCommits) { commit in
-                                        CommitCard(
-                                            commit: commit,
-                                            pullRequest: model.pullRequest(forCommitHash: commit.hash),
-                                            changeStats: model.changeStats(forCommitHash: commit.hash),
-                                            isSelected: {
-                                                if case .commit(let hash) = model.changeScope {
-                                                    return hash == commit.hash
-                                                }
-                                                return false
-                                            }(),
-                                            onSelect: { model.selectCommit(commit) },
-                                            onOpenPullRequest: { link in
-                                                model.openCommitPullRequestInBrowser(link)
-                                            }
-                                        )
-                                        .onAppear {
-                                            Task { await model.ensureCommitChangeStats(for: commit) }
-                                        }
+                                    ForEach(model.currentHistoryItems) { item in
+                                        currentHistoryRow(item)
                                     }
                                 }
                             }
@@ -1505,6 +1488,46 @@ private struct CommitsPane: View {
             }
         }
         return model.selectedAuthors.isEmpty
+    }
+
+    @ViewBuilder
+    private func currentHistoryRow(_ item: HistoryListItem) -> some View {
+        switch item {
+        case .commit(let commit):
+            CommitCard(
+                commit: commit,
+                pullRequest: model.pullRequest(forCommitHash: commit.hash),
+                changeStats: model.changeStats(forCommitHash: commit.hash),
+                isSelected: isCommitSelected(commit.hash),
+                onSelect: { model.selectCommit(commit) },
+                onOpenPullRequest: { link in
+                    model.openCommitPullRequestInBrowser(link)
+                }
+            )
+            .onAppear {
+                Task { await model.ensureCommitChangeStats(for: commit) }
+            }
+        case .pullRequest(let pullRequest, let commits):
+            PullRequestHistoryCard(
+                pullRequest: pullRequest,
+                commits: commits,
+                primary: item.primaryCommit,
+                changeStats: model.changeStats(forCommitHash: item.primaryCommit.hash),
+                isSelected: commits.contains { isCommitSelected($0.hash) },
+                onSelect: { model.selectCommit(item.primaryCommit) },
+                onOpenPullRequest: { model.openCommitPullRequestInBrowser(pullRequest) }
+            )
+            .onAppear {
+                Task { await model.ensureCommitChangeStats(for: item.primaryCommit) }
+            }
+        }
+    }
+
+    private func isCommitSelected(_ hash: String) -> Bool {
+        if case .commit(let selected) = model.changeScope {
+            return selected == hash
+        }
+        return false
     }
 
     private var cleanHistoryDescription: String {
@@ -1906,6 +1929,108 @@ private struct MergedIntoCompareCard: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(tint.opacity(info.kind == .contained ? 0.22 : 0.35), lineWidth: 1)
         )
+    }
+}
+
+private struct PullRequestHistoryCard: View {
+    let pullRequest: CommitPullRequestLink
+    let commits: [GitCommit]
+    let primary: GitCommit
+    var changeStats: CommitChangeStats? = nil
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onOpenPullRequest: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text(pullRequest.title)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                HStack(spacing: 6) {
+                    Text(primary.shortHash)
+                        .font(.caption.monospaced().weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.12), in: Capsule())
+                    Text(primary.authorName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Text("·")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Text("\(commits.count) commits")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                HStack(spacing: 6) {
+                    Text(primary.authoredDate, style: .relative)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    if let changeStats {
+                        Text("·")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Text("\(changeStats.fileCount)f")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text("+\(changeStats.additions)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.additionText)
+                        Text("−\(changeStats.deletions)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.deletionText)
+                    }
+                    Spacer(minLength: 0)
+                    Button(action: onOpenPullRequest) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.pull")
+                                .font(.caption2.weight(.bold))
+                            Text(pullRequest.badgeLabel)
+                                .font(.caption2.weight(.bold))
+                        }
+                        .foregroundStyle(prBadgeColor)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(prBadgeColor.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open \(pullRequest.badgeLabel): \(pullRequest.title)")
+                }
+            }
+            .padding(11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.03))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(isSelected ? Color.accentColor.opacity(0.4) : Color.primary.opacity(0.05), lineWidth: isSelected ? 1.5 : 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("\(pullRequest.badgeLabel): \(pullRequest.title)")
+        .contextMenu {
+            Button("Open \(pullRequest.badgeLabel)") {
+                onOpenPullRequest()
+            }
+        }
+    }
+
+    private var prBadgeColor: Color {
+        switch pullRequest.status {
+        case "open":
+            return pullRequest.isDraft ? .secondary : AppTheme.additionText
+        case "merged":
+            return Color(red: 0.55, green: 0.40, blue: 0.90)
+        default:
+            return .secondary
+        }
     }
 }
 

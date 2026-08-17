@@ -438,6 +438,22 @@ final class RepoSession: ObservableObject, Identifiable {
         return filteredCommits.filter { !inherited.contains($0.hash) }
     }
 
+    /// First-parent work on this branch (no incoming merge side-history, no merge commits).
+    var currentHistoryCommits: [GitCommit] {
+        HistoryListBuilder.currentBranchCommits(
+            allRangeCommits: snapshot?.commits ?? [],
+            displayed: uniqueFilteredCommits
+        )
+    }
+
+    /// Current History rows: same-PR commits collapse to one card.
+    var currentHistoryItems: [HistoryListItem] {
+        HistoryListBuilder.items(
+            visibleCommits: currentHistoryCommits,
+            pullRequests: commitPullRequests
+        )
+    }
+
     /// Commits shown in the History list for the active browse mode.
     var displayedHistoryCommits: [GitCommit] {
         let source: [GitCommit]

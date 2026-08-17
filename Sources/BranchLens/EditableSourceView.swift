@@ -15,6 +15,7 @@ struct EditableSourceView: NSViewRepresentable {
         scroll.hasVerticalScroller = true
         scroll.hasHorizontalScroller = true
         scroll.autohidesScrollers = true
+        scroll.usesPredominantAxisScrolling = false
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
         scroll.hasVerticalRuler = true
@@ -36,7 +37,7 @@ struct EditableSourceView: NSViewRepresentable {
         textView.textContainerInset = NSSize(width: 8, height: 12)
         textView.isHorizontallyResizable = true
         textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
+        textView.autoresizingMask = []
         textView.minSize = .zero
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.textContainer?.widthTracksTextView = false
@@ -63,6 +64,7 @@ struct EditableSourceView: NSViewRepresentable {
         context.coordinator.publishUndoState()
         ruler.rebuildLineStarts(for: textView.string)
         ruler.needsDisplay = true
+        context.coordinator.sizeDocument(textView)
 
         DispatchQueue.main.async {
             textView.window?.makeFirstResponder(textView)
@@ -80,6 +82,7 @@ struct EditableSourceView: NSViewRepresentable {
             let max = (text as NSString).length
             textView.setSelectedRange(NSRange(location: min(selected.location, max), length: 0))
             context.coordinator.rulerView?.rebuildLineStarts(for: text)
+            context.coordinator.sizeDocument(textView)
             context.coordinator.publishUndoState()
         }
     }
@@ -163,7 +166,20 @@ struct EditableSourceView: NSViewRepresentable {
             text.wrappedValue = textView.string
             isUpdatingFromUI = false
             rulerView?.rebuildLineStarts(for: textView.string)
+            sizeDocument(textView)
             publishUndoState()
+        }
+
+        func sizeDocument(_ textView: NSTextView) {
+            let maxChars = HighlightRenderCache.maxLineCharacterCount(in: textView.string)
+            let width = HighlightRenderCache.estimateWidth(lineCharacterCounts: maxChars, padding: 48)
+            let font = textView.font ?? AppTheme.monoNS
+            let lineHeight = max(font.ascender - font.descender + font.leading, 14)
+            let lines = textView.string.isEmpty ? 1 : textView.string.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+            let height = max(CGFloat(lines) * lineHeight + 24, 40)
+            let clip = textView.enclosingScrollView?.contentSize ?? .zero
+            textView.minSize = NSSize(width: width, height: height)
+            textView.frame.size = NSSize(width: max(width, clip.width), height: max(height, clip.height))
         }
 
         func publishUndoState() {
