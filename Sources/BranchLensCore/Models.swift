@@ -291,6 +291,11 @@ public struct PullRequestSummary: Identifiable, Hashable, Sendable {
     public let updatedAt: Date
     public let url: String
     public let isDraft: Bool
+    /// open | closed | merged
+    public let status: String
+    public let changedFiles: Int?
+    public let additions: Int?
+    public let deletions: Int?
 
     public init(
         number: Int,
@@ -301,7 +306,11 @@ public struct PullRequestSummary: Identifiable, Hashable, Sendable {
         baseRefName: String,
         updatedAt: Date,
         url: String,
-        isDraft: Bool
+        isDraft: Bool,
+        status: String,
+        changedFiles: Int? = nil,
+        additions: Int? = nil,
+        deletions: Int? = nil
     ) {
         self.number = number
         self.title = title
@@ -312,6 +321,21 @@ public struct PullRequestSummary: Identifiable, Hashable, Sendable {
         self.updatedAt = updatedAt
         self.url = url
         self.isDraft = isDraft
+        self.status = status
+        self.changedFiles = changedFiles
+        self.additions = additions
+        self.deletions = deletions
+    }
+
+    public var badgeLabel: String {
+        if isDraft, status == "open" {
+            return "Draft #\(number)"
+        }
+        switch status {
+        case "open": return "Open #\(number)"
+        case "merged": return "Merged #\(number)"
+        default: return "Closed #\(number)"
+        }
     }
 }
 
@@ -355,6 +379,7 @@ public enum GitError: LocalizedError, Sendable {
     case notARepository(URL)
     case commandFailed(String)
     case invalidOutput(String)
+    case missingRevision(String)
 
     public var errorDescription: String? {
         switch self {
@@ -364,6 +389,23 @@ public enum GitError: LocalizedError, Sendable {
             return message
         case .invalidOutput(let message):
             return message
+        case .missingRevision(let name):
+            return "Branch “\(name)” is not in this repository."
+        }
+    }
+
+    public var isMissingRevision: Bool {
+        switch self {
+        case .missingRevision:
+            return true
+        case .commandFailed(let message), .invalidOutput(let message):
+            let lower = message.lowercased()
+            return lower.contains("not a valid object name")
+                || lower.contains("unknown revision")
+                || lower.contains("bad revision")
+                || lower.contains("needed a single revision")
+        default:
+            return false
         }
     }
 }

@@ -224,11 +224,26 @@ public actor GitService {
         return try await listCommits(in: repo, range: "-1 \(branch)")
     }
 
+    public func revisionExists(_ revision: String, in repo: URL) async -> Bool {
+        guard !revision.isEmpty else { return false }
+        return (try? await runGit(
+            ["rev-parse", "--verify", "--quiet", "\(revision)^{commit}"],
+            in: repo
+        )) != nil
+    }
+
     public func loadSnapshot(
         repo: URL,
         branch: String,
         baseBranch: String
     ) async throws -> BranchSnapshot {
+        if await !revisionExists(branch, in: repo) {
+            throw GitError.missingRevision(branch)
+        }
+        if await !revisionExists(baseBranch, in: repo) {
+            throw GitError.missingRevision(baseBranch)
+        }
+
         let mergeBase = try await runGit(
             ["merge-base", baseBranch, branch],
             in: repo

@@ -18,16 +18,30 @@ public actor GitHubService {
     ) async throws -> [PullRequestSummary] {
         let ghURL = try requireGH()
 
-        let result = try await ProcessRunner.run(
+        let fieldsWithStats = "number,title,author,headRefName,baseRefName,updatedAt,url,isDraft,state,additions,deletions,changedFiles"
+        let fields = "number,title,author,headRefName,baseRefName,updatedAt,url,isDraft,state"
+        var result = try await ProcessRunner.run(
             executable: ghURL,
             arguments: [
                 "pr", "list",
                 "--state", state.rawValue,
                 "--limit", String(limit),
-                "--json", "number,title,author,headRefName,baseRefName,updatedAt,url,isDraft,state",
+                "--json", fieldsWithStats,
             ],
             currentDirectory: repo
         )
+        if result.status != 0 {
+            result = try await ProcessRunner.run(
+                executable: ghURL,
+                arguments: [
+                    "pr", "list",
+                    "--state", state.rawValue,
+                    "--limit", String(limit),
+                    "--json", fields,
+                ],
+                currentDirectory: repo
+            )
+        }
         if result.status != 0 {
             let message = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
             throw GitError.commandFailed(
@@ -217,6 +231,9 @@ public actor GitHubService {
             let url: String
             let isDraft: Bool
             let state: String
+            let additions: Int?
+            let deletions: Int?
+            let changedFiles: Int?
         }
 
         let rows = try JSONDecoder().decode([Payload].self, from: data)
@@ -226,8 +243,17 @@ public actor GitHubService {
         isoBasic.formatOptions = [.withInternetDateTime]
 
         return rows.map { row in
-            let state = PullRequestState(rawValue: row.state.lowercased())
-                ?? (row.state.lowercased() == "merged" ? .closed : .open)
+            let lower = row.state.lowercased()
+            let status: String
+            if lower == "merged" {
+                status = "merged"
+            } else if lower == "open" {
+                status = "open"
+            } else {
+                status = "closed"
+            }
+            let state = PullRequestState(rawValue: lower)
+                ?? (status == "open" ? .open : .closed)
             let date = iso.date(from: row.updatedAt)
                 ?? isoBasic.date(from: row.updatedAt)
                 ?? Date.distantPast
@@ -240,7 +266,11 @@ public actor GitHubService {
                 baseRefName: row.baseRefName,
                 updatedAt: date,
                 url: row.url,
-                isDraft: row.isDraft
+                isDraft: row.isDraft,
+                status: status,
+                changedFiles: row.changedFiles,
+                additions: row.additions,
+                deletions: row.deletions
             )
         }
     }

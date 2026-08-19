@@ -64,6 +64,27 @@ struct FileTreeNode: Identifiable, Hashable, Equatable {
 
         return convert(root, path: "")
     }
+
+    /// Visible rows for the current expansion set (folders first, then files, matching `build`).
+    static func flattened(roots: [FileTreeNode], expandedIDs: Set<ID>) -> [FileTreeVisibleRow] {
+        var rows: [FileTreeVisibleRow] = []
+        func walk(_ nodes: [FileTreeNode], depth: Int) {
+            for node in nodes {
+                rows.append(FileTreeVisibleRow(node: node, depth: depth))
+                if node.isFolder, expandedIDs.contains(node.id) {
+                    walk(node.children, depth: depth + 1)
+                }
+            }
+        }
+        walk(roots, depth: 0)
+        return rows
+    }
+}
+
+struct FileTreeVisibleRow: Identifiable, Hashable {
+    var id: String { node.id }
+    let node: FileTreeNode
+    let depth: Int
 }
 
 enum TextUtilities {

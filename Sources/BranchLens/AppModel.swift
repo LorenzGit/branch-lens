@@ -221,16 +221,8 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var selectedPullRequestID: Int?
     @Published var isLoadingPullRequests = false
     @Published var pullRequestError: String?
-    /// Commit SHA → associated PR for History cards.
-    @Published var commitPullRequests: [String: CommitPullRequestLink] = [:]
-    /// SHAs already queried (including commits with no PR).
-    private var commitPRResolved: Set<String> = []
-    /// Commit SHA → files / +/- for History cards.
-    @Published var commitChangeStats: [String: CommitChangeStats] = [:]
-    private var commitStatsResolved: Set<String> = []
-    /// PR number → GitHub-style net stats versus the fresh COMPARE tip.
-    @Published var pullRequestChangeStats: [Int: CommitChangeStats] = [:]
-    private var pullRequestStatsResolved: Set<Int> = []
+    /// History PR badges and +/- stats. Observed by History only — not the rest of the session.
+    let historyDecorations = HistoryDecorations()
     /// When BRANCH has no unique commits vs COMPARE because it was already merged.
     @Published var mergedIntoCompare: MergedIntoCompareInfo?
 
@@ -254,6 +246,11 @@ final class RepoSession: ObservableObject, Identifiable {
     /// Last fetch+reload (auto or manual). Auto-refresh is skipped within the cooldown.
     private var lastFetchRefreshAt: Date?
     private static let autoFetchCooldown: TimeInterval = 3 * 60
+    /// Last successful working-tree status load (History onAppear skips a fresh one).
+    private var lastWorkingTreeLoadAt: Date?
+    private static let workingTreeFreshInterval: TimeInterval = 2
+    private var cachedFilteredFiles: [ChangedFile] = []
+    private var cachedFileTree: [FileTreeNode] = []
 
     init(id: UUID = UUID()) {
         self.id = id
@@ -459,7 +456,7 @@ final class RepoSession: ObservableObject, Identifiable {
     var currentHistoryItems: [HistoryListItem] {
         HistoryListBuilder.items(
             visibleCommits: currentHistoryCommits,
-            pullRequests: commitPullRequests
+            pullRequests: historyDecorations.commitPullRequests
         )
     }
 
@@ -524,7 +521,12 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     var fileTree: [FileTreeNode] {
-        FileTreeNode.build(from: filteredFiles)
+        let files = filteredFiles
+        if files != cachedFilteredFiles {
+            cachedFilteredFiles = files
+            cachedFileTree = FileTreeNode.build(from: files)
+        }
+        return cachedFileTree
     }
 
     /// Stable path list for folder-expansion onChange (ignores add/del count flicker).
@@ -642,43 +644,38 @@ final class RepoSession: ObservableObject, Identifiable {
         await loadCommitPullRequests(for: [commit])
     }
 
-    func changeStats(forCommitHash hash: String) -> CommitChangeStats? {
-        commitChangeStats[hash]
-    }
-
-    func changeStats(forPullRequest number: Int) -> CommitChangeStats? {
-        pullRequestChangeStats[number]
-    }
-
     /// Net files/+/- for a PR versus the fresh COMPARE tip (`origin/<compare>...BRANCH`).
     func ensurePullRequestChangeStats(for number: Int) async {
         guard let repoPath, let snap = snapshot else { return }
-        guard !pullRequestStatsResolved.contains(number) else { return }
-        pullRequestStatsResolved.insert(number)
+        guard !historyDecorations.pullRequestStatsResolved.contains(number) else { return }
+        historyDecorations.markPullRequestStatsResolved(number)
         do {
             let files = try await git.changedFiles(
                 in: repoPath,
                 from: snap.compareTip,
                 to: snap.branch
             )
-            pullRequestChangeStats[number] = CommitChangeStats(
-                fileCount: files.count,
-                additions: files.reduce(0) { $0 + $1.additions },
-                deletions: files.reduce(0) { $0 + $1.deletions }
+            historyDecorations.recordPullRequestStats(
+                number: number,
+                stats: CommitChangeStats(
+                    fileCount: files.count,
+                    additions: files.reduce(0) { $0 + $1.additions },
+                    deletions: files.reduce(0) { $0 + $1.deletions }
+                )
             )
         } catch {
-            pullRequestStatsResolved.remove(number)
+            historyDecorations.unmarkPullRequestStatsResolved(number)
         }
     }
 
     /// Lazy files/+/- fetch for a visible History card.
     func ensureCommitChangeStats(for commit: GitCommit) async {
         guard let repoPath else { return }
-        guard !commitStatsResolved.contains(commit.hash) else { return }
-        commitStatsResolved.insert(commit.hash)
+        guard !historyDecorations.commitStatsResolved.contains(commit.hash) else { return }
+        historyDecorations.markCommitStatsResolved(commit.hash)
         do {
             let stats = try await git.commitChangeStats(in: repoPath, commit: commit.hash)
-            commitChangeStats[commit.hash] = stats
+            historyDecorations.recordCommitStats(hash: commit.hash, stats: stats)
         } catch {
             // Leave unresolved visually; don't retry forever on hard failures.
         }
@@ -798,10 +795,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 contentQuery = ""
                 changeScope = .combined
                 selectedFileID = nil
-                commitPullRequests = [:]
-                commitPRResolved = []
-                commitChangeStats = [:]
-                commitStatsResolved = []
+                historyDecorations.resetCommitDecorations()
                 mergedIntoCompare = nil
             }
             clearInspectorCache()
@@ -1184,21 +1178,33 @@ final class RepoSession: ObservableObject, Identifiable {
         notifyStateChange()
     }
 
-    func reloadWorkingTree(updateVisibleFiles: Bool = true) async {
+    func reloadWorkingTree(updateVisibleFiles: Bool = true, skipIfFresh: Bool = false) async {
         guard let repoPath else {
-            workingTreeFiles = []
-            allChangesWithLocalFiles = []
+            if !workingTreeFiles.isEmpty { workingTreeFiles = [] }
+            if !allChangesWithLocalFiles.isEmpty { allChangesWithLocalFiles = [] }
+            return
+        }
+        if skipIfFresh,
+           let last = lastWorkingTreeLoadAt,
+           Date().timeIntervalSince(last) < Self.workingTreeFreshInterval {
             return
         }
         workingTreeTask?.cancel()
-        isLoadingWorkingTree = true
+        if workingTreeFiles.isEmpty {
+            isLoadingWorkingTree = true
+        }
         workingTreeTask = Task {
             do {
                 let files = try await git.workingTreeStatus(in: repoPath)
                 guard !Task.isCancelled else { return }
                 let previous = workingTreeFiles
-                workingTreeFiles = files
-                isLoadingWorkingTree = false
+                if files != workingTreeFiles {
+                    workingTreeFiles = files
+                }
+                if isLoadingWorkingTree {
+                    isLoadingWorkingTree = false
+                }
+                lastWorkingTreeLoadAt = Date()
                 if includeLocalChanges {
                     await reloadAllChangesWithLocal()
                 }
@@ -1214,8 +1220,10 @@ final class RepoSession: ObservableObject, Identifiable {
                 // ignore
             } catch {
                 guard !Task.isCancelled else { return }
-                workingTreeFiles = []
-                isLoadingWorkingTree = false
+                if !workingTreeFiles.isEmpty { workingTreeFiles = [] }
+                if isLoadingWorkingTree {
+                    isLoadingWorkingTree = false
+                }
                 errorMessage = error.localizedDescription
             }
         }
@@ -1225,14 +1233,17 @@ final class RepoSession: ObservableObject, Identifiable {
     /// Refresh net All-changes file list (merge-base → worktree).
     private func reloadAllChangesWithLocal() async {
         guard includeLocalChanges, let snap = snapshot else {
-            allChangesWithLocalFiles = []
+            if !allChangesWithLocalFiles.isEmpty { allChangesWithLocalFiles = [] }
             return
         }
         do {
-            allChangesWithLocalFiles = try await git.changedFilesToWorktree(
+            let files = try await git.changedFilesToWorktree(
                 in: snap.repoPath,
                 from: snap.mergeBase
             )
+            if files != allChangesWithLocalFiles {
+                allChangesWithLocalFiles = files
+            }
         } catch is CancellationError {
             // ignore
         } catch {
@@ -1346,20 +1357,91 @@ final class RepoSession: ObservableObject, Identifiable {
         }
     }
 
+    private func refreshBranchRecords(in repoPath: URL) async throws {
+        branchRecords = try await git.listBranches(in: repoPath)
+    }
+
+    private func loadSnapshotRecoveringMissingRevisions(in repoPath: URL) async throws -> BranchSnapshot {
+        do {
+            return try await git.loadSnapshot(
+                repo: repoPath,
+                branch: selectedBranch,
+                baseBranch: baseBranch
+            )
+        } catch {
+            guard isMissingRevision(error) else { throw error }
+            try await refreshBranchRecords(in: repoPath)
+            let recovered = await retargetMissingBranches(in: repoPath)
+            guard recovered, !selectedBranch.isEmpty, !baseBranch.isEmpty else { throw error }
+            return try await git.loadSnapshot(
+                repo: repoPath,
+                branch: selectedBranch,
+                baseBranch: baseBranch
+            )
+        }
+    }
+
+    private func isMissingRevision(_ error: Error) -> Bool {
+        if let gitError = error as? GitError {
+            return gitError.isMissingRevision
+        }
+        return GitError.commandFailed(error.localizedDescription).isMissingRevision
+    }
+
+    /// Point Viewing / Compare at branches that still exist. Returns true when something changed.
+    @discardableResult
+    private func retargetMissingBranches(in repoPath: URL) async -> Bool {
+        let names = branchRecords.map(\.name)
+        let current = (try? await git.currentBranch(in: repoPath)) ?? checkedOutBranch
+        if let current {
+            checkedOutBranch = current
+        }
+        let detectedBase = (try? await git.detectBaseBranch(in: repoPath, branches: names)) ?? names.first ?? ""
+
+        var notes: [String] = []
+        if selectedBranch.isEmpty || !names.contains(selectedBranch) {
+            let gone = selectedBranch
+            selectedBranch = fallbackInspectedBranch(
+                names: names,
+                current: current,
+                detectedBase: detectedBase
+            )
+            if !gone.isEmpty, !selectedBranch.isEmpty {
+                notes.append("“\(gone)” is gone. Inspecting \(selectedBranch).")
+            }
+        }
+        if baseBranch.isEmpty || !names.contains(baseBranch) {
+            let gone = baseBranch
+            baseBranch = detectedBase
+            if !gone.isEmpty, !baseBranch.isEmpty {
+                notes.append("Compare “\(gone)” is gone. Using \(baseBranch).")
+            }
+        }
+        guard !notes.isEmpty else { return false }
+        persistMemory()
+        clearInspectorCache()
+        statusMessage = notes.joined(separator: " ")
+        return true
+    }
+
+    private func fallbackInspectedBranch(
+        names: [String],
+        current: String?,
+        detectedBase: String
+    ) -> String {
+        if let current, names.contains(current) { return current }
+        if let other = names.first(where: { $0 != detectedBase }) { return other }
+        return names.first ?? ""
+    }
+
     func reloadSnapshot(
         resetScope: Bool = true,
         fetchFirst: Bool = false,
         refreshPanes: Bool = false
     ) async {
         guard let repoPath else { return }
-        guard !selectedBranch.isEmpty, !baseBranch.isEmpty else {
-            snapshot = nil
-            return
-        }
 
         loadTask?.cancel()
-        let branch = selectedBranch
-        let base = baseBranch
         isLoading = true
         errorMessage = nil
         if fetchFirst {
@@ -1377,17 +1459,27 @@ final class RepoSession: ObservableObject, Identifiable {
                         guard !Task.isCancelled else { return }
                         errorMessage = "Fetch failed: \(error.localizedDescription)"
                     }
-                    let listed = (try? await git.listBranches(in: repoPath)) ?? []
-                    if !listed.isEmpty {
-                        branchRecords = listed
-                    }
                 }
 
-                let snap = try await git.loadSnapshot(repo: repoPath, branch: branch, baseBranch: base)
+                try await refreshBranchRecords(in: repoPath)
+                await retargetMissingBranches(in: repoPath)
+
+                guard !selectedBranch.isEmpty, !baseBranch.isEmpty else {
+                    snapshot = nil
+                    visibleFiles = []
+                    errorMessage = branchRecords.isEmpty
+                        ? "This repository has no local branches."
+                        : "Could not pick a branch to inspect."
+                    statusMessage = nil
+                    isLoading = false
+                    return
+                }
+
+                let snap = try await loadSnapshotRecoveringMissingRevisions(in: repoPath)
                 guard !Task.isCancelled else { return }
+                let recoveryStatus = statusMessage
                 snapshot = snap
-                pullRequestChangeStats = [:]
-                pullRequestStatsResolved = []
+                historyDecorations.resetPullRequestStats()
                 checkedOutBranch = try? await git.currentBranch(in: repoPath)
                 selectedAuthors = selectedAuthors.filter { author in
                     snap.commits.contains { $0.authorName == author }
@@ -1406,7 +1498,10 @@ final class RepoSession: ObservableObject, Identifiable {
                     isLoadingFile = true
                 }
                 isLoading = false
-                if fetchFirst, errorMessage == nil {
+                if let recoveryStatus, recoveryStatus.contains("is gone") {
+                    statusMessage = recoveryStatus
+                    clearStatusEventually(recoveryStatus)
+                } else if fetchFirst, errorMessage == nil {
                     statusMessage = nil
                 } else if !fetchFirst {
                     statusMessage = nil
@@ -1494,10 +1589,9 @@ final class RepoSession: ObservableObject, Identifiable {
                         in: repoPath
                     )) ?? []
                 }
-                for commit in commits {
-                    commitPullRequests[commit.hash] = pr
-                    commitPRResolved.insert(commit.hash)
-                }
+                historyDecorations.recordCommitPRsNow(
+                    Dictionary(commits.map { ($0.hash, pr) }, uniquingKeysWith: { _, last in last })
+                )
                 mergedIntoCompare = MergedIntoCompareInfo(
                     kind: .mergedPR,
                     compareLabel: compareLabel,
@@ -1880,10 +1974,6 @@ final class RepoSession: ObservableObject, Identifiable {
         NSWorkspace.shared.open(url)
     }
 
-    func pullRequest(forCommitHash hash: String) -> CommitPullRequestLink? {
-        commitPullRequests[hash]
-    }
-
     /// Resolve associated PRs for History commits (cached; uses `gh api`).
     func loadCommitPullRequests(for commits: [GitCommit], force: Bool = false) async {
         guard let repoPath else { return }
@@ -1892,18 +1982,16 @@ final class RepoSession: ObservableObject, Identifiable {
         let targets = Array(commits.prefix(commitPRLookupLimit).map(\.hash))
         let missing = force
             ? targets
-            : targets.filter { !commitPRResolved.contains($0) }
+            : targets.filter { !historyDecorations.commitPRResolved.contains($0) }
         guard !missing.isEmpty else { return }
 
         if force {
-            for hash in missing {
-                commitPullRequests.removeValue(forKey: hash)
-                commitPRResolved.remove(hash)
-            }
+            historyDecorations.removeCommitPRs(missing)
         }
 
         commitPRTask?.cancel()
         let github = self.github
+        let decorations = historyDecorations
         commitPRTask = Task {
             // Bound concurrency so we don't stampede the GitHub API.
             let chunkSize = 6
@@ -1927,10 +2015,7 @@ final class RepoSession: ObservableObject, Identifiable {
                         }
                     }
                     for await (hash, link) in group {
-                        commitPRResolved.insert(hash)
-                        if let link {
-                            commitPullRequests[hash] = link
-                        }
+                        decorations.recordCommitPR(hash: hash, link: link)
                     }
                 }
                 index = end

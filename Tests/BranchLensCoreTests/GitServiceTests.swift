@@ -87,6 +87,38 @@ final class GitServiceTests: XCTestCase {
         XCTAssertEqual(netFile.deletions, 0)
     }
 
+    func testLoadSnapshotReportsMissingBranchInsteadOfFatalObjectName() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-missing-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "base\n".write(to: root.appendingPathComponent("keep.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        let git = GitService()
+        let mainExists = await git.revisionExists("main", in: root)
+        let missingExists = await git.revisionExists("agent/plus-one-gaps-contract", in: root)
+        XCTAssertTrue(mainExists)
+        XCTAssertFalse(missingExists)
+
+        do {
+            _ = try await git.loadSnapshot(
+                repo: root,
+                branch: "agent/plus-one-gaps-contract",
+                baseBranch: "main"
+            )
+            XCTFail("Expected missing revision")
+        } catch let error as GitError {
+            XCTAssertTrue(error.isMissingRevision)
+            XCTAssertEqual(error.localizedDescription, "Branch “agent/plus-one-gaps-contract” is not in this repository.")
+        }
+    }
+
     func testChangedFilesUsesTripleDotLikeGitHubPullRequest() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("branch-lens-pr-files-\(UUID().uuidString)", isDirectory: true)

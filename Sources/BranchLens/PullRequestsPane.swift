@@ -143,82 +143,112 @@ private struct PullRequestCard: View {
 
     var body: some View {
         Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .top, spacing: 8) {
-                    Text("#\(pr.number)")
-                        .font(.caption.monospaced().weight(.bold))
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.12), in: Capsule())
-
-                    Text(pr.title)
-                        .font(.callout.weight(.semibold))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-
-                    Spacer(minLength: 0)
-
-                    if pr.isDraft {
-                        Text("Draft")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(AppTheme.subtleFill, in: Capsule())
-                    }
-                }
+            VStack(alignment: .leading, spacing: 7) {
+                Text(pr.title)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
 
                 HStack(spacing: 6) {
                     Text(pr.authorLogin)
-                        .font(.caption.weight(.medium))
-                    Text("·")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    Text(pr.headRefName)
+                        .font(.caption.monospaced().weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "arrow.right")
+                        .font(.caption2.weight(.bold))
                         .foregroundStyle(.tertiary)
-                    Text("\(pr.headRefName) → \(pr.baseRefName)")
-                        .font(.caption.monospaced())
+                    Text(pr.baseRefName)
+                        .font(.caption.monospaced().weight(.medium))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 0)
                 }
+                .help("\(pr.headRefName) into \(pr.baseRefName)")
 
-                HStack {
-                    Text(pr.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                HStack(spacing: 6) {
+                    Text(pr.updatedAt, style: .relative)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                    Spacer()
-                    Button {
-                        onOpen()
-                    } label: {
-                        Image(systemName: "safari")
-                            .font(.caption)
+                    if let files = pr.changedFiles {
+                        Text("·")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        Text("\(files)f")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.borderless)
-                    .help("Open PR #\(pr.number) in browser")
+                    if let additions = pr.additions {
+                        Text("+\(additions)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.additionText)
+                    }
+                    if let deletions = pr.deletions {
+                        Text("−\(deletions)")
+                            .font(.caption2.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.deletionText)
+                    }
+                    Spacer(minLength: 0)
+                    Button(action: onOpen) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.triangle.pull")
+                                .font(.caption2.weight(.bold))
+                            Text(pr.badgeLabel)
+                                .font(.caption2.weight(.bold))
+                        }
+                        .foregroundStyle(badgeColor)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(badgeColor.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open \(pr.badgeLabel) in the browser")
                 }
             }
-            .padding(12)
+            .padding(11)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(isSelected ? Color.accentColor.opacity(0.14) : AppTheme.subtleFill)
+                    .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.03))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(
-                        isSelected ? Color.accentColor.opacity(0.45) : Color.primary.opacity(0.06),
+                        isSelected ? Color.accentColor.opacity(0.4) : Color.primary.opacity(0.05),
                         lineWidth: isSelected ? 1.5 : 1
                     )
             )
         }
         .buttonStyle(.plain)
-        .help("Inspect PR #\(pr.number): \(pr.headRefName) → \(pr.baseRefName)")
+        .help("\(pr.badgeLabel): \(pr.headRefName) → \(pr.baseRefName)")
         .contextMenu {
-            Button("Open in Browser") { onOpen() }
+            Button("Open \(pr.badgeLabel)") { onOpen() }
             Button("Copy URL") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(pr.url, forType: .string)
             }
+        }
+    }
+
+    private var badgeColor: Color {
+        switch pr.status {
+        case "open":
+            return pr.isDraft ? .secondary : AppTheme.additionText
+        case "merged":
+            return Color(red: 0.55, green: 0.40, blue: 0.90)
+        default:
+            return .secondary
         }
     }
 }

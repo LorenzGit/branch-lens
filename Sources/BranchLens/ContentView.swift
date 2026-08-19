@@ -1075,7 +1075,7 @@ private struct BranchWorkspaceView: View {
                 Group {
                     switch model.sidePaneMode {
                     case .history:
-                        CommitsPane(model: model)
+                        CommitsPane(model: model, decorations: model.historyDecorations)
                     case .pullRequests:
                         PullRequestsPane(model: model)
                     }
@@ -1179,6 +1179,7 @@ private struct ColumnResizeHandle: View {
 
 private struct CommitsPane: View {
     @ObservedObject var model: RepoSession
+    @ObservedObject var decorations: HistoryDecorations
 
     var body: some View {
         PanelChrome(fill: AppTheme.historyPanel) {
@@ -1349,8 +1350,8 @@ private struct CommitsPane: View {
                                         ForEach(model.filteredMergedCommits) { commit in
                                             CommitCard(
                                                 commit: commit,
-                                                pullRequest: model.pullRequest(forCommitHash: commit.hash) ?? merged.pullRequest,
-                                                changeStats: model.changeStats(forCommitHash: commit.hash),
+                                                pullRequest: decorations.commitPullRequests[commit.hash] ?? merged.pullRequest,
+                                                changeStats: decorations.commitChangeStats[commit.hash],
                                                 isSelected: {
                                                     if case .commit(let hash) = model.changeScope {
                                                         return hash == commit.hash
@@ -1368,14 +1369,14 @@ private struct CommitsPane: View {
                                         }
                                     }
                                 }
-                            } else if model.currentHistoryItems.isEmpty {
+                            } else if currentHistoryItems.isEmpty {
                                 Text(model.selectedAuthors.isEmpty ? "No commits on this branch." : "No commits from selected authors.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .padding(.top, 4)
                             } else {
                                 LazyVStack(spacing: 8) {
-                                    ForEach(model.currentHistoryItems) { item in
+                                    ForEach(currentHistoryItems) { item in
                                         currentHistoryRow(item)
                                     }
                                 }
@@ -1389,8 +1390,8 @@ private struct CommitsPane: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .onAppear {
-            // Always refresh local stats so the toggle row can show counts even when off.
-            Task { await model.reloadWorkingTree() }
+            // Skip if snapshot just loaded the tree — toggling the spinner republishes the whole session.
+            Task { await model.reloadWorkingTree(skipIfFresh: true) }
             if model.historyBrowseMode == .all, model.chronologicalCommits.isEmpty {
                 Task { await model.reloadChronologicalCommits(reset: true) }
             }
@@ -1405,6 +1406,14 @@ private struct CommitsPane: View {
         .onChange(of: showsLocalScopesOnly) { _, _ in
             schedulePreferLocalScopeIfNeeded()
         }
+    }
+
+    /// Current History rows: same-PR commits collapse to one card.
+    private var currentHistoryItems: [HistoryListItem] {
+        HistoryListBuilder.items(
+            visibleCommits: model.currentHistoryCommits,
+            pullRequests: decorations.commitPullRequests
+        )
     }
 
     /// Branch tip matches COMPARE and History is just local work — drop All changes / In sync.
@@ -1457,8 +1466,8 @@ private struct CommitsPane: View {
                     ForEach(model.displayedHistoryCommits) { commit in
                         CommitCard(
                             commit: commit,
-                            pullRequest: model.pullRequest(forCommitHash: commit.hash),
-                            changeStats: model.changeStats(forCommitHash: commit.hash),
+                            pullRequest: decorations.commitPullRequests[commit.hash],
+                            changeStats: decorations.commitChangeStats[commit.hash],
                             isSelected: {
                                 if case .commit(let hash) = model.changeScope {
                                     return hash == commit.hash
@@ -1524,12 +1533,12 @@ private struct CommitsPane: View {
         case .commit(let commit):
             CommitCard(
                 commit: commit,
-                pullRequest: model.pullRequest(forCommitHash: commit.hash),
-                changeStats: model.changeStats(forCommitHash: commit.hash),
+                pullRequest: decorations.commitPullRequests[commit.hash],
+                changeStats: decorations.commitChangeStats[commit.hash],
                 isSelected: isCommitSelected(commit.hash)
-                    || (model.pullRequest(forCommitHash: commit.hash).map { isPullRequestSelected($0.number) } ?? false),
+                    || (decorations.commitPullRequests[commit.hash].map { isPullRequestSelected($0.number) } ?? false),
                 onSelect: {
-                    if let pr = model.pullRequest(forCommitHash: commit.hash) {
+                    if let pr = decorations.commitPullRequests[commit.hash] {
                         model.selectPullRequestFiles(pr.number)
                     } else {
                         model.selectCommit(commit)
@@ -1547,7 +1556,7 @@ private struct CommitsPane: View {
                 pullRequest: pullRequest,
                 commits: commits,
                 primary: item.primaryCommit,
-                changeStats: model.changeStats(forPullRequest: pullRequest.number),
+                changeStats: decorations.pullRequestChangeStats[pullRequest.number],
                 isSelected: isPullRequestSelected(pullRequest.number),
                 onSelect: { model.selectPullRequestFiles(pullRequest.number) },
                 onOpenPullRequest: { model.openCommitPullRequestInBrowser(pullRequest) }
@@ -2395,14 +2404,13 @@ private struct FilesPane: View {
     }
 
     private var folderList: some View {
-        // Eager VStack (not LazyVStack): lazy stacks estimate height while scrolling,
-        // which makes the scrollbar thumb jump between different sizes.
-        ScrollView {
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(model.fileTree) { node in
+        let rows = FileTreeNode.flattened(roots: model.fileTree, expandedIDs: expandedFolderIDs)
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                ForEach(rows) { row in
                     FolderTreeRow(
-                        node: node,
-                        depth: 0,
+                        node: row.node,
+                        depth: row.depth,
                         selectedFileIDs: model.selectedFileIDs,
                         matchCounts: model.crossFileMatchCounts,
                         expandedFolderIDs: $expandedFolderIDs,
@@ -2605,65 +2613,41 @@ private struct FolderTreeRow: View {
                 Button("Find in Finder") { onRevealInFinder(file) }
             }
         } else {
-            VStack(alignment: .leading, spacing: 0) {
-                Button {
-                    if isExpanded {
-                        expandedFolderIDs.remove(node.id)
-                    } else {
-                        expandedFolderIDs.insert(node.id)
-                    }
-                } label: {
-                    HStack(spacing: 0) {
-                        Color.clear
-                            .frame(width: CGFloat(depth) * Self.iconWidth)
-
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: Self.iconWidth, height: Self.iconWidth)
-                            .rotationEffect(.degrees(isExpanded ? 0 : -90))
-
-                        Image(systemName: "folder.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .frame(width: Self.iconWidth, height: Self.iconWidth)
-
-                        Text(node.name)
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .padding(.leading, 4)
-
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.vertical, 4)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(isExpanded ? "Collapse \(node.name)" : "Expand \(node.name)")
-
+            Button {
                 if isExpanded {
-                    ForEach(node.children) { child in
-                        FolderTreeRow(
-                            node: child,
-                            depth: depth + 1,
-                            selectedFileIDs: selectedFileIDs,
-                            matchCounts: matchCounts,
-                            expandedFolderIDs: $expandedFolderIDs,
-                            canStage: canStage,
-                            canUnstage: canUnstage,
-                            onSelect: onSelect,
-                            onLog: onLog,
-                            onRevealInFinder: onRevealInFinder,
-                            onStage: onStage,
-                            onUnstage: onUnstage,
-                            onStageSelected: onStageSelected,
-                            onUnstageSelected: onUnstageSelected,
-                            multiSelectionCount: multiSelectionCount
-                        )
-                    }
+                    expandedFolderIDs.remove(node.id)
+                } else {
+                    expandedFolderIDs.insert(node.id)
                 }
+            } label: {
+                HStack(spacing: 0) {
+                    Color.clear
+                        .frame(width: CGFloat(depth) * Self.iconWidth)
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: Self.iconWidth, height: Self.iconWidth)
+                        .rotationEffect(.degrees(isExpanded ? 0 : -90))
+
+                    Image(systemName: "folder.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .frame(width: Self.iconWidth, height: Self.iconWidth)
+
+                    Text(node.name)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .padding(.leading, 4)
+
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help(isExpanded ? "Collapse \(node.name)" : "Expand \(node.name)")
         }
     }
 }
@@ -3277,6 +3261,7 @@ private struct FileInspectorView: View {
                             }
                             : nil
                     )
+                    .equatable()
                     .id("hunks-\(model.contentRefreshNonce)-\(model.selectedFileID ?? "")-\(canStageHunks)")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }

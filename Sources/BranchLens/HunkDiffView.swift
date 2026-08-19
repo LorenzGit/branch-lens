@@ -2,12 +2,20 @@ import BranchLensCore
 import SwiftUI
 
 /// Diff viewer split into per-hunk cards. Optional Stage / Unstage actions for local scopes.
-struct HunkDiffView: View {
+struct HunkDiffView: View, Equatable {
     let text: String
     let path: String
     let searchQuery: String
     var actionTitle: String? = nil
     var onHunkAction: ((DiffHunk) -> Void)? = nil
+
+    static func == (lhs: HunkDiffView, rhs: HunkDiffView) -> Bool {
+        lhs.text == rhs.text
+            && lhs.path == rhs.path
+            && lhs.searchQuery == rhs.searchQuery
+            && lhs.actionTitle == rhs.actionTitle
+            && (lhs.onHunkAction == nil) == (rhs.onHunkAction == nil)
+    }
 
     /// Prefer a single scrollable diff when the hunk UI would create too many NSTextViews
     /// (common for large PR / All-changes files and a frequent hang source).
@@ -70,7 +78,11 @@ struct HunkDiffView: View {
 
     private static func newlineCount(in text: String) -> Int {
         if text.isEmpty { return 0 }
-        return text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+        var count = 1
+        for byte in text.utf8 where byte == 10 {
+            count += 1
+        }
+        return count
     }
 }
 
