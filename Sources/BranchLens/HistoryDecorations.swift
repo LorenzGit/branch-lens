@@ -14,6 +14,7 @@ final class HistoryDecorations: ObservableObject {
     private(set) var pullRequestStatsResolved: Set<Int> = []
 
     private var pendingPRs: [String: CommitPullRequestLink] = [:]
+    private var pendingPRRemovals: Set<String> = []
     private var pendingCommitStats: [String: CommitChangeStats] = [:]
     private var pendingPullRequestStats: [Int: CommitChangeStats] = [:]
     private var flushTask: Task<Void, Never>?
@@ -54,6 +55,7 @@ final class HistoryDecorations: ObservableObject {
         for hash in hashes {
             commitPRResolved.remove(hash)
             pendingPRs.removeValue(forKey: hash)
+            pendingPRRemovals.remove(hash)
             commitPullRequests.removeValue(forKey: hash)
         }
     }
@@ -71,8 +73,13 @@ final class HistoryDecorations: ObservableObject {
 
     func recordCommitPR(hash: String, link: CommitPullRequestLink?) {
         commitPRResolved.insert(hash)
-        guard let link else { return }
-        pendingPRs[hash] = link
+        if let link {
+            pendingPRRemovals.remove(hash)
+            pendingPRs[hash] = link
+        } else {
+            pendingPRs.removeValue(forKey: hash)
+            pendingPRRemovals.insert(hash)
+        }
         scheduleFlush()
     }
 
@@ -90,6 +97,7 @@ final class HistoryDecorations: ObservableObject {
         flushTask?.cancel()
         flushTask = nil
         pendingPRs.removeAll()
+        pendingPRRemovals.removeAll()
         pendingCommitStats.removeAll()
         pendingPullRequestStats.removeAll()
     }
@@ -106,13 +114,24 @@ final class HistoryDecorations: ObservableObject {
 
     private func flush() {
         let prs = pendingPRs
+        let removals = pendingPRRemovals
         let stats = pendingCommitStats
         let prStats = pendingPullRequestStats
         pendingPRs.removeAll()
+        pendingPRRemovals.removeAll()
         pendingCommitStats.removeAll()
         pendingPullRequestStats.removeAll()
-        guard !prs.isEmpty || !stats.isEmpty || !prStats.isEmpty else { return }
+
+        let prsChanged = prs.contains { commitPullRequests[$0.key] != $0.value }
+            || removals.contains(where: { commitPullRequests[$0] != nil })
+        let statsChanged = stats.contains { commitChangeStats[$0.key] != $0.value }
+            || prStats.contains { pullRequestChangeStats[$0.key] != $0.value }
+        guard prsChanged || statsChanged else { return }
+
         objectWillChange.send()
+        for hash in removals {
+            commitPullRequests.removeValue(forKey: hash)
+        }
         for (hash, link) in prs {
             commitPullRequests[hash] = link
         }

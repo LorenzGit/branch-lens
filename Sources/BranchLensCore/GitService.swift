@@ -244,13 +244,17 @@ public actor GitService {
             throw GitError.missingRevision(baseBranch)
         }
 
+        // Behind-COMPARE and the merge-base both use the freshest tip (usually
+        // origin/<compare>), not a stale local compare branch. Otherwise History
+        // hides unique-vs-origin commits while Files still shows the huge stale range.
+        let compareTip = await resolveFreshTip(for: baseBranch, in: repo)
         let mergeBase = try await runGit(
-            ["merge-base", baseBranch, branch],
+            ["merge-base", compareTip, branch],
             in: repo
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !mergeBase.isEmpty else {
-            throw GitError.commandFailed("Could not find merge base of \(baseBranch) and \(branch).")
+            throw GitError.commandFailed("Could not find merge base of \(compareTip) and \(branch).")
         }
 
         let mergeBaseShort = try await runGit(
@@ -260,24 +264,12 @@ public actor GitService {
 
         let commits = try await listCommits(in: repo, from: mergeBase, to: branch)
         let files = try await listChangedFiles(in: repo, from: mergeBase, to: branch)
-        // Behind-COMPARE uses the freshest tip (usually origin/<compare> after fetch),
-        // not a possibly stale local compare branch.
-        let compareTip = await resolveFreshTip(for: baseBranch, in: repo)
         let compareAheadCount = try await commitCount(in: repo, from: branch, to: compareTip)
         let localCompareBehindCount: Int
-        let staleCompareInheritedCommitCount: Int
         if compareTip == baseBranch {
             localCompareBehindCount = 0
-            staleCompareInheritedCommitCount = 0
         } else {
             localCompareBehindCount = (try? await commitCount(in: repo, from: baseBranch, to: compareTip)) ?? 0
-            // Commits shown via local COMPARE that are already on the fresh tip (noise in History).
-            if localCompareBehindCount > 0 {
-                let uniqueVsCompareTip = (try? await commitCount(in: repo, from: compareTip, to: branch)) ?? commits.count
-                staleCompareInheritedCommitCount = max(0, commits.count - uniqueVsCompareTip)
-            } else {
-                staleCompareInheritedCommitCount = 0
-            }
         }
         let remote = try await remoteTrackingInfo(in: repo, branch: branch)
 
@@ -292,7 +284,7 @@ public actor GitService {
             compareAheadCount: compareAheadCount,
             compareTip: compareTip,
             localCompareBehindCount: localCompareBehindCount,
-            staleCompareInheritedCommitCount: staleCompareInheritedCommitCount,
+            staleCompareInheritedCommitCount: 0,
             aheadOfRemote: remote.ahead,
             behindRemote: remote.behind,
             remoteTrackingBranch: remote.tracking
@@ -400,13 +392,149 @@ public actor GitService {
     }
 
     /// Staged + unstaged (+ untracked) files in the working tree.
+    ///
+    /// Linked worktrees (including those inside ignored folders) share a common Git
+    /// directory. Git LFS and other clean filters often cannot write there, which
+    /// makes a normal `git status` exit 128. We skip LFS filters for listing, and
+    /// fall back to `ls-files` so a filter failure never looks like a clean tree.
     public func workingTreeStatus(in repo: URL) async throws -> [WorkingTreeFile] {
-        let porcelain = try await runGit(["status", "--porcelain=1", "-uall"], in: repo)
-        let stagedNum = try await runGit(["diff", "--cached", "--numstat", "--find-renames"], in: repo)
-        let unstagedNum = try await runGit(["diff", "--numstat", "--find-renames"], in: repo)
+        do {
+            return try await workingTreeStatusFromPorcelain(in: repo)
+        } catch let porcelainError {
+            do {
+                return try await workingTreeStatusFromLsFiles(in: repo)
+            } catch {
+                throw porcelainError
+            }
+        }
+    }
+
+    private func workingTreeStatusFromPorcelain(in repo: URL) async throws -> [WorkingTreeFile] {
+        let porcelain = try await runWorkingTreeGit(["status", "--porcelain=1", "-uall"], in: repo)
+        let stagedNum = (try? await runWorkingTreeGit(["diff", "--cached", "--numstat", "--find-renames"], in: repo)) ?? ""
+        let unstagedNum = (try? await runWorkingTreeGit(["diff", "--numstat", "--find-renames"], in: repo)) ?? ""
+        return parsePorcelainStatus(
+            porcelain,
+            stagedStats: parseNumStat(stagedNum),
+            unstagedStats: parseNumStat(unstagedNum)
+        )
+    }
+
+    /// Does not run clean filters: compare index blobs to `hash-object --no-filters`.
+    private func workingTreeStatusFromLsFiles(in repo: URL) async throws -> [WorkingTreeFile] {
+        let stagedNameStatus = (try? await runWorkingTreeGit(
+            ["diff", "--cached", "--name-status", "--find-renames"],
+            in: repo
+        )) ?? ""
+        let stagedNum = (try? await runWorkingTreeGit(["diff", "--cached", "--numstat", "--find-renames"], in: repo)) ?? ""
         let stagedStats = parseNumStat(stagedNum)
+        let unstagedNum = (try? await runWorkingTreeGit(["diff", "--numstat", "--find-renames"], in: repo)) ?? ""
         let unstagedStats = parseNumStat(unstagedNum)
 
+        var files: [WorkingTreeFile] = []
+        var seenUnstaged = Set<String>()
+
+        for line in stagedNameStatus.split(whereSeparator: \.isNewline).map(String.init) {
+            guard line.count >= 2 else { continue }
+            let code = String(line.prefix(while: { !$0.isWhitespace }))
+            let rest = String(line.dropFirst(code.count)).trimmingCharacters(in: .whitespaces)
+            let (path, oldPath) = parseStatusPath(rest)
+            let status = FileChangeStatus(rawValue: String(code.prefix(1))) ?? .modified
+            let stats = stagedStats[path] ?? (0, 0)
+            files.append(WorkingTreeFile(
+                area: .staged,
+                status: status == .unknown ? .modified : status,
+                path: path,
+                oldPath: oldPath,
+                additions: stats.0,
+                deletions: stats.1
+            ))
+        }
+
+        let indexDump = try await runWorkingTreeGit(["ls-files", "-s"], in: repo)
+        var indexSHA: [String: String] = [:]
+        for line in indexDump.split(whereSeparator: \.isNewline).map(String.init) {
+            let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 3 else { continue }
+            let sha = parts[1]
+            let afterSHA = parts[2]
+            let tabParts = afterSHA.split(separator: "\t", maxSplits: 1).map(String.init)
+            guard tabParts.count == 2 else { continue }
+            let path = unescapeStatusPath(tabParts[1])
+            guard !path.isEmpty else { continue }
+            indexSHA[path] = sha
+        }
+
+        let worktreeHashes = try await hashWorktreePaths(Array(indexSHA.keys), in: repo)
+        for (path, sha) in indexSHA {
+            let disk = repo.appendingPathComponent(path)
+            let exists = FileManager.default.fileExists(atPath: disk.path)
+            if !exists {
+                guard seenUnstaged.insert(path).inserted else { continue }
+                files.append(WorkingTreeFile(
+                    area: .unstaged,
+                    status: .deleted,
+                    path: path,
+                    additions: 0,
+                    deletions: unstagedStats[path]?.1 ?? 0
+                ))
+                continue
+            }
+            guard let worktreeSHA = worktreeHashes[path], worktreeSHA != sha else { continue }
+            guard seenUnstaged.insert(path).inserted else { continue }
+            let stats = unstagedStats[path] ?? (0, 0)
+            files.append(WorkingTreeFile(
+                area: .unstaged,
+                status: .modified,
+                path: path,
+                additions: stats.0,
+                deletions: stats.1
+            ))
+        }
+
+        let untracked = try await runWorkingTreeGit(["ls-files", "--others", "--exclude-standard"], in: repo)
+        for path in untracked.split(whereSeparator: \.isNewline).map(String.init) {
+            let path = unescapeStatusPath(path)
+            guard !path.isEmpty, seenUnstaged.insert(path).inserted else { continue }
+            files.append(WorkingTreeFile(
+                area: .unstaged,
+                status: .added,
+                path: path,
+                additions: Self.lineCount(ofFileAt: repo.appendingPathComponent(path)),
+                deletions: 0
+            ))
+        }
+
+        return files.sorted { lhs, rhs in
+            if lhs.area != rhs.area {
+                return lhs.area == .staged
+            }
+            return lhs.path.localizedCaseInsensitiveCompare(rhs.path) == .orderedAscending
+        }
+    }
+
+    private func hashWorktreePaths(_ paths: [String], in repo: URL) async throws -> [String: String] {
+        var result: [String: String] = [:]
+        let existing = paths.filter { FileManager.default.fileExists(atPath: repo.appendingPathComponent($0).path) }
+        let chunkSize = 40
+        var index = 0
+        while index < existing.count {
+            let chunk = Array(existing[index..<min(index + chunkSize, existing.count)])
+            let output = try await runWorkingTreeGit(["hash-object", "--no-filters", "--"] + chunk, in: repo)
+            let shas = output.split(whereSeparator: \.isNewline).map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            for (path, sha) in zip(chunk, shas) where !sha.isEmpty {
+                result[path] = sha
+            }
+            index += chunkSize
+        }
+        return result
+    }
+
+    private func parsePorcelainStatus(
+        _ porcelain: String,
+        stagedStats: [String: (Int, Int)],
+        unstagedStats: [String: (Int, Int)]
+    ) -> [WorkingTreeFile] {
         var files: [WorkingTreeFile] = []
         for line in porcelain.split(whereSeparator: \.isNewline) {
             let raw = String(line)
@@ -466,7 +594,7 @@ public actor GitService {
         var args = ["diff", "--cached", "--no-color", "--find-renames", "--"]
         if let oldPath, oldPath != path { args.append(oldPath) }
         args.append(path)
-        return try await runGit(args, in: repo)
+        return try await runWorkingTreeGit(args, in: repo)
     }
 
     public func unstagedDiff(in repo: URL, path: String, oldPath: String? = nil) async throws -> String {
@@ -474,7 +602,7 @@ public actor GitService {
         var args = ["diff", "--no-color", "--find-renames", "--"]
         if let oldPath, oldPath != path { args.append(oldPath) }
         args.append(path)
-        return try await runGit(args, in: repo)
+        return try await runWorkingTreeGit(args, in: repo)
     }
 
     /// Stage paths in the index (`git add -- …`). Works for modified, deleted, and untracked.
@@ -557,24 +685,24 @@ public actor GitService {
         var args = ["diff", "--no-color", "--find-renames", revision, "--"]
         if let oldPath, oldPath != path { args.append(oldPath) }
         args.append(path)
-        return try await runGit(args, in: repo)
+        return try await runWorkingTreeGit(args, in: repo)
     }
 
     /// Net file list from `revision` to the working tree (branch commits + staged/unstaged),
     /// with additions/deletions that cancel overlapping edits (unlike summing separate diffs).
     public func changedFilesToWorktree(in repo: URL, from revision: String) async throws -> [ChangedFile] {
-        let nameStatus = try await runGit(
+        let nameStatus = try await runWorkingTreeGit(
             ["diff", "--name-status", "--find-renames", revision],
             in: repo
         )
-        let numStat = try await runGit(
+        let numStat = try await runWorkingTreeGit(
             ["diff", "--numstat", "--find-renames", revision],
             in: repo
         )
         var files = parseChangedFiles(nameStatus: nameStatus, numStat: numStat)
         let tracked = Set(files.map(\.path))
 
-        let untrackedOutput = try await runGit(
+        let untrackedOutput = try await runWorkingTreeGit(
             ["ls-files", "--others", "--exclude-standard"],
             in: repo
         )
@@ -943,6 +1071,22 @@ public actor GitService {
         return (tracking, ahead, behind)
     }
 
+    /// Git LFS and similar clean filters write into the common Git directory. That
+    /// fails in linked worktrees when the process cannot create `.git/lfs/tmp`.
+    private static let skipWorkingTreeFilters: [String] = [
+        "-c", "filter.lfs.required=false",
+        "-c", "filter.lfs.process=",
+        "-c", "filter.lfs.clean=",
+        "-c", "filter.lfs.smudge=",
+    ]
+
+    private func runWorkingTreeGit(_ arguments: [String], in directory: URL) async throws -> String {
+        try await runGit(
+            ["--no-optional-locks"] + Self.skipWorkingTreeFilters + arguments,
+            in: directory
+        )
+    }
+
     private func runGit(_ arguments: [String], in directory: URL) async throws -> String {
         let result = try await ProcessRunner.run(
             executable: gitURL,
@@ -950,8 +1094,13 @@ public actor GitService {
             currentDirectory: directory
         )
         if result.status != 0 {
-            let message = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw GitError.commandFailed(message.isEmpty ? "git \(arguments.joined(separator: " ")) failed (\(result.status))" : message)
+            let stderr = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let command = arguments.joined(separator: " ")
+            throw GitError.commandFailed(
+                stderr.isEmpty
+                    ? "git \(command) failed (\(result.status))"
+                    : "git failed (\(result.status)): \(stderr)"
+            )
         }
         return result.stdoutText
     }

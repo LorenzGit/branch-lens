@@ -152,6 +152,12 @@ final class GitServiceTests: XCTestCase {
         XCTAssertEqual(Set(vsFreshMain.map(\.path)), ["pr.txt"])
         XCTAssertTrue(vsStaleMain.map(\.path).contains("unrelated.txt"))
         XCTAssertGreaterThan(vsStaleMain.count, vsFreshMain.count)
+
+        let snapshot = try await git.loadSnapshot(repo: root, branch: "feature", baseBranch: "main")
+        XCTAssertEqual(Set(snapshot.files.map(\.path)), ["pr.txt"])
+        XCTAssertFalse(snapshot.commits.contains { $0.subject == "advance main" })
+        XCTAssertGreaterThan(snapshot.localCompareBehindCount, 0)
+        XCTAssertEqual(snapshot.compareTip, "origin/main")
     }
 
     func testWriteWorkingTreeFileRoundTrip() async throws {
@@ -178,6 +184,116 @@ final class GitServiceTests: XCTestCase {
         } catch {
             // expected
         }
+    }
+
+    func testLinkedWorktreeLocalChangesSurviveFilterThatCannotWriteCommonGitDir() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-wt-filter-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let lfsDir = root.appendingPathComponent(".git/lfs")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: lfsDir.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "hello\n".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", "note.txt")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        try "node_modules/\n".write(to: root.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".gitignore")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "ignore node_modules")
+
+        try FileManager.default.createDirectory(at: lfsDir, withIntermediateDirectories: true)
+
+        try "*.txt filter=blocked\n".write(
+            to: root.appendingPathComponent(".gitattributes"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await run(
+            in: root,
+            "/usr/bin/git",
+            "config",
+            "filter.blocked.clean",
+            "cat"
+        )
+        try await run(in: root, "/usr/bin/git", "config", "filter.blocked.smudge", "cat")
+        try await run(in: root, "/usr/bin/git", "config", "filter.blocked.required", "false")
+        try await run(in: root, "/usr/bin/git", "add", ".gitattributes")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "add blocking filter")
+
+        let worktree = root.appendingPathComponent("node_modules/.codex-worktrees/topic")
+        try FileManager.default.createDirectory(
+            at: worktree.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try await run(
+            in: root,
+            "/usr/bin/git",
+            "worktree",
+            "add",
+            worktree.path,
+            "-b",
+            "topic"
+        )
+        try await run(
+            in: root,
+            "/usr/bin/git",
+            "config",
+            "filter.blocked.clean",
+            "sh -c 'touch \"$(git rev-parse --git-common-dir)/lfs/probe\"; echo cannot-access-common-git-dir >&2; exit 1'"
+        )
+        try await run(in: root, "/usr/bin/git", "config", "filter.blocked.required", "true")
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: lfsDir.path)
+
+        try "changed\n".write(to: worktree.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try "new\n".write(to: worktree.appendingPathComponent("extra.txt"), atomically: true, encoding: .utf8)
+
+        let diff = try await ProcessRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: ["diff", "--numstat", "--find-renames"],
+            currentDirectory: worktree
+        )
+        XCTAssertNotEqual(
+            diff.status,
+            0,
+            "Expected git diff to fail when the filter cannot write the common Git dir"
+        )
+        XCTAssertTrue(
+            diff.stderrText.contains("cannot-access-common-git-dir")
+                || diff.stderrText.lowercased().contains("filter"),
+            diff.stderrText
+        )
+
+        let files = try await GitService().workingTreeStatus(in: worktree)
+        let paths = Set(files.map(\.path))
+        XCTAssertEqual(paths, ["note.txt", "extra.txt"])
+        XCTAssertTrue(files.contains { $0.path == "note.txt" && $0.area == .unstaged })
+        XCTAssertTrue(files.contains { $0.path == "extra.txt" && $0.status == .added })
+    }
+
+    func testVenusCodexWorktreeShowsAllLocalChanges() async throws {
+        let worktree = URL(
+            fileURLWithPath: "/Users/lorenzonuvoletta/git/venus/node_modules/.codex-worktrees/test-app-remote-push"
+        )
+        try XCTSkipUnless(FileManager.default.fileExists(atPath: worktree.path))
+
+        let files = try await GitService().workingTreeStatus(in: worktree)
+        XCTAssertEqual(
+            Set(files.map(\.path)),
+            [
+                "packages/sdk/tests/test-app/README.md",
+                "packages/sdk/tests/test-app/rundot/realtime.config.json",
+                "packages/sdk/tests/test-app/src/events/handlers-notifications.ts",
+                "packages/sdk/tests/test-app/src/sections/section-notifications.ts",
+                "packages/sdk/tests/test-app/src/rooms/PushProbeRoom.ts",
+                "tests/products/sdk/pom/mobile/sections/NotificationsSection.mobile.ts",
+            ]
+        )
     }
 
     private func run(in directory: URL, _ executable: String, _ args: String...) async throws {

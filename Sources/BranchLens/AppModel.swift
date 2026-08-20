@@ -201,6 +201,8 @@ final class RepoSession: ObservableObject, Identifiable {
     /// Net merge-base → worktree files when “Include local changes” is on (cancels overlapping +/-).
     @Published private(set) var allChangesWithLocalFiles: [ChangedFile] = []
     @Published var isLoadingWorkingTree = false
+    /// Last local-status failure. Never treat a failed `git status` as a clean tree.
+    @Published var workingTreeError: String?
 
     // Worktrees
     @Published var worktrees: [GitWorktree] = []
@@ -395,6 +397,16 @@ final class RepoSession: ObservableObject, Identifiable {
             return allChangesWithLocalFiles.count
         }
         return snapshot?.files.count ?? 0
+    }
+
+    /// Net COMPARE…BRANCH files/+/- (no local edits). Same range a PR card inspects.
+    var branchRangeChangeStats: CommitChangeStats? {
+        guard let snap = snapshot else { return nil }
+        return CommitChangeStats(
+            fileCount: snap.files.count,
+            additions: snap.totalAdditions,
+            deletions: snap.totalDeletions
+        )
     }
 
     var localChangeDeletions: Int {
@@ -1185,6 +1197,7 @@ final class RepoSession: ObservableObject, Identifiable {
             return
         }
         if skipIfFresh,
+           workingTreeError == nil,
            let last = lastWorkingTreeLoadAt,
            Date().timeIntervalSince(last) < Self.workingTreeFreshInterval {
             return
@@ -1201,6 +1214,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 if files != workingTreeFiles {
                     workingTreeFiles = files
                 }
+                workingTreeError = nil
                 if isLoadingWorkingTree {
                     isLoadingWorkingTree = false
                 }
@@ -1220,10 +1234,10 @@ final class RepoSession: ObservableObject, Identifiable {
                 // ignore
             } catch {
                 guard !Task.isCancelled else { return }
-                if !workingTreeFiles.isEmpty { workingTreeFiles = [] }
                 if isLoadingWorkingTree {
                     isLoadingWorkingTree = false
                 }
+                workingTreeError = error.localizedDescription
                 errorMessage = error.localizedDescription
             }
         }
@@ -1247,6 +1261,7 @@ final class RepoSession: ObservableObject, Identifiable {
         } catch is CancellationError {
             // ignore
         } catch {
+            workingTreeError = error.localizedDescription
             errorMessage = error.localizedDescription
         }
     }
@@ -1478,8 +1493,12 @@ final class RepoSession: ObservableObject, Identifiable {
                 let snap = try await loadSnapshotRecoveringMissingRevisions(in: repoPath)
                 guard !Task.isCancelled else { return }
                 let recoveryStatus = statusMessage
+                let previousBranch = snapshot?.branch
+                let previousCompareTip = snapshot?.compareTip
                 snapshot = snap
-                historyDecorations.resetPullRequestStats()
+                if previousBranch != snap.branch || previousCompareTip != snap.compareTip {
+                    historyDecorations.resetPullRequestStats()
+                }
                 checkedOutBranch = try? await git.currentBranch(in: repoPath)
                 selectedAuthors = selectedAuthors.filter { author in
                     snap.commits.contains { $0.authorName == author }
@@ -1521,7 +1540,8 @@ final class RepoSession: ObservableObject, Identifiable {
                     contentRefreshNonce &+= 1
                 }
                 notifyStateChange()
-                // PR badges: Current loads the small unique set; All loads lazily per visible card.
+                // Re-check PRs after fetch, but keep existing grouping on screen
+                // until replacements arrive (do not wipe cards first).
                 if historyBrowseMode == .current {
                     let forcePR = shouldRefreshPanes
                     Task { await loadCommitPullRequests(for: snap.commits, force: forcePR) }
@@ -1985,10 +2005,6 @@ final class RepoSession: ObservableObject, Identifiable {
             : targets.filter { !historyDecorations.commitPRResolved.contains($0) }
         guard !missing.isEmpty else { return }
 
-        if force {
-            historyDecorations.removeCommitPRs(missing)
-        }
-
         commitPRTask?.cancel()
         let github = self.github
         let decorations = historyDecorations
@@ -2000,7 +2016,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 guard !Task.isCancelled else { return }
                 let end = min(index + chunkSize, missing.count)
                 let chunk = Array(missing[index..<end])
-                await withTaskGroup(of: (String, CommitPullRequestLink?).self) { group in
+                await withTaskGroup(of: (String, Result<CommitPullRequestLink?, Error>).self) { group in
                     for hash in chunk {
                         group.addTask {
                             do {
@@ -2008,14 +2024,20 @@ final class RepoSession: ObservableObject, Identifiable {
                                     containingCommit: hash,
                                     in: repoPath
                                 )
-                                return (hash, Self.preferredCommitPullRequest(from: prs))
+                                return (hash, .success(Self.preferredCommitPullRequest(from: prs)))
                             } catch {
-                                return (hash, nil)
+                                return (hash, .failure(error))
                             }
                         }
                     }
-                    for await (hash, link) in group {
-                        decorations.recordCommitPR(hash: hash, link: link)
+                    for await (hash, result) in group {
+                        switch result {
+                        case .success(let link):
+                            decorations.recordCommitPR(hash: hash, link: link)
+                        case .failure:
+                            // Leave any existing grouping in place.
+                            break
+                        }
                     }
                 }
                 index = end

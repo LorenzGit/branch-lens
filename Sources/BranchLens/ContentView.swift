@@ -365,7 +365,13 @@ private struct ToolbarView: View {
 
                     Spacer(minLength: 8)
 
-                    if let status = model.statusMessage {
+                    if let error = model.workingTreeError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(Color.orange)
+                            .lineLimit(2)
+                            .help(error)
+                    } else if let status = model.statusMessage {
                         Text(status)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -542,32 +548,57 @@ private struct CompactStats: View {
     }
 }
 
-private struct WorktreeMenu: View {
-    @ObservedObject var model: RepoSession
+/// NSPopover + ScrollView keeps the first content height unless height is explicit.
+private struct FittingPopoverScroll<Content: View>: View {
+    var itemCount: Int
+    var rowHeight: CGFloat
+    var maxHeight: CGFloat
+    @ViewBuilder var content: Content
+
+    private var height: CGFloat {
+        guard itemCount > 0 else { return 0 }
+        return min(CGFloat(itemCount) * rowHeight, maxHeight)
+    }
 
     var body: some View {
-        Menu {
-            if model.worktrees.isEmpty {
-                Text("No worktrees")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(model.worktrees) { worktree in
-                    Button {
-                        Task { await model.switchToWorktree(worktree) }
-                    } label: {
-                        if model.currentWorktree?.id == worktree.id {
-                            Label(worktree.displayName, systemImage: "checkmark")
-                        } else {
-                            Text(worktree.displayName)
-                        }
-                    }
-                    .help(worktree.path.path)
-                }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 2) {
+                content
             }
-            Divider()
-            Button("Reload Worktrees") {
-                Task { await model.reloadWorktrees() }
-            }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(height: height)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct WorktreeMenu: View {
+    @ObservedObject var model: RepoSession
+    @State private var isOpen = false
+    @State private var query = ""
+    @FocusState private var searchFocused: Bool
+
+    private var filteredWorktrees: [GitWorktree] {
+        model.worktrees.filter { worktree in
+            TextUtilities.containsAllSearchTokens(
+                [worktree.displayName, worktree.path.path],
+                query: query
+            )
+        }
+    }
+
+    private var popoverWidth: CGFloat {
+        let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        let longest = model.worktrees
+            .map { ($0.displayName as NSString).size(withAttributes: [.font: font]).width }
+            .max() ?? 180
+        return min(max(ceil(longest) + 52, 300), 640)
+    }
+
+    var body: some View {
+        Button {
+            query = ""
+            isOpen.toggle()
         } label: {
             HStack(spacing: 8) {
                 Image(systemName: "square.stack.3d.up")
@@ -585,6 +616,9 @@ private struct WorktreeMenu: View {
                         .truncationMode(.middle)
                 }
                 .frame(minWidth: 70, maxWidth: 140, alignment: .leading)
+                Image(systemName: "magnifyingglass")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -601,9 +635,112 @@ private struct WorktreeMenu: View {
             )
             .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .help(model.repoPath?.path ?? "Switch git worktree")
+        .buttonStyle(.plain)
+        .help(model.repoPath.map { "Switch git worktree\n\($0.path)" } ?? "Switch git worktree")
         .disabled(model.repoPath == nil)
+        .popover(isPresented: $isOpen, arrowEdge: .bottom) {
+            worktreePickerPopover
+        }
+    }
+
+    private var worktreePickerPopover: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search worktrees…", text: $query)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .onSubmit(selectSoleMatchIfNeeded)
+                if !query.isEmpty {
+                    Button {
+                        query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear search")
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            if filteredWorktrees.isEmpty {
+                Text(model.worktrees.isEmpty ? "No worktrees" : "No matches")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 8)
+            } else {
+                FittingPopoverScroll(itemCount: filteredWorktrees.count, rowHeight: 34, maxHeight: 320) {
+                    ForEach(filteredWorktrees) { worktree in
+                        let isCurrent = model.currentWorktree?.id == worktree.id
+                        Button {
+                            switchTo(worktree)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: isCurrent ? "checkmark" : "square.stack.3d.up")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
+                                    .frame(width: 14)
+                                Text(worktree.displayName)
+                                    .font(.callout.monospaced().weight(isCurrent ? .semibold : .regular))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(isCurrent ? Color.accentColor.opacity(0.14) : Color.clear)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .strokeBorder(
+                                        isCurrent ? Color.accentColor.opacity(0.40) : Color.clear,
+                                        lineWidth: isCurrent ? 1 : 0
+                                    )
+                            )
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(worktree.path.path)
+                    }
+                }
+            }
+
+            Divider().opacity(0.45)
+
+            Button("Reload Worktrees") {
+                Task { await model.reloadWorktrees() }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        }
+        .padding(10)
+        .frame(width: popoverWidth)
+        .fixedSize(horizontal: true, vertical: true)
+        .onAppear {
+            DispatchQueue.main.async {
+                searchFocused = true
+            }
+        }
+    }
+
+    private func selectSoleMatchIfNeeded() {
+        guard filteredWorktrees.count == 1, let worktree = filteredWorktrees.first else { return }
+        switchTo(worktree)
+    }
+
+    private func switchTo(_ worktree: GitWorktree) {
+        isOpen = false
+        Task { await model.switchToWorktree(worktree) }
     }
 }
 
@@ -733,10 +870,9 @@ private struct BranchMenu: View {
     }
 
     private var filteredOptions: [String] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = q.isEmpty
+        let base = TextUtilities.searchTokens(in: query).isEmpty
             ? options
-            : options.filter { $0.localizedCaseInsensitiveContains(q) }
+            : options.filter { TextUtilities.containsAllSearchTokens([$0], query: query) }
         switch sortMode {
         case .name:
             return base.sorted {
@@ -871,73 +1007,71 @@ private struct BranchMenu: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 8)
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(filteredOptions, id: \.self) { branch in
-                            let isCheckedOut = checkedOutBranch == branch
-                            let isInspecting = branch == value
-                            Button {
-                                onSelect(branch)
-                                isOpen = false
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: isInspecting ? "eye.fill" : "arrow.triangle.branch")
+                FittingPopoverScroll(itemCount: filteredOptions.count, rowHeight: 34, maxHeight: 280) {
+                    ForEach(filteredOptions, id: \.self) { branch in
+                        let isCheckedOut = checkedOutBranch == branch
+                        let isInspecting = branch == value
+                        Button {
+                            onSelect(branch)
+                            isOpen = false
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: isInspecting ? "eye.fill" : "arrow.triangle.branch")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(isInspecting ? Color.accentColor : .secondary)
+                                    .frame(width: 14)
+                                Text(branch)
+                                    .font(.callout.monospaced().weight(isInspecting ? .semibold : .regular))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                                if isInspecting {
+                                    Text("Viewing")
                                         .font(.caption2.weight(.bold))
-                                        .foregroundStyle(isInspecting ? Color.accentColor : .secondary)
-                                        .frame(width: 14)
-                                    Text(branch)
-                                        .font(.callout.monospaced().weight(isInspecting ? .semibold : .regular))
-                                        .lineLimit(1)
-                                        .fixedSize(horizontal: true, vertical: false)
-                                    if isInspecting {
-                                        Text("Viewing")
-                                            .font(.caption2.weight(.bold))
-                                            .foregroundStyle(Color.accentColor)
-                                            .padding(.horizontal, 5)
-                                            .padding(.vertical, 1)
-                                            .background(Color.accentColor.opacity(0.16), in: Capsule())
-                                    }
-                                    if isCheckedOut {
-                                        Text("Checked out")
-                                            .font(.caption2.weight(.bold))
-                                            .foregroundStyle(Color.orange)
-                                            .padding(.horizontal, 5)
-                                            .padding(.vertical, 1)
-                                            .background(Color.orange.opacity(0.16), in: Capsule())
-                                    }
-                                    Spacer(minLength: 0)
-                                    if sortMode == .date, let date = tipDates[branch] {
-                                        Text(date, style: .relative)
-                                            .font(.caption2)
-                                            .foregroundStyle(.tertiary)
-                                            .fixedSize()
-                                    }
+                                        .foregroundStyle(Color.accentColor)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.accentColor.opacity(0.16), in: Capsule())
                                 }
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 6)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .fill(isInspecting ? Color.accentColor.opacity(0.14) : Color.clear)
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .strokeBorder(
-                                            isInspecting ? Color.accentColor.opacity(0.40) : Color.clear,
-                                            lineWidth: isInspecting ? 1 : 0
-                                        )
-                                )
-                                .contentShape(Rectangle())
+                                if isCheckedOut {
+                                    Text("Checked out")
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(Color.orange)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.orange.opacity(0.16), in: Capsule())
+                                }
+                                Spacer(minLength: 0)
+                                if sortMode == .date, let date = tipDates[branch] {
+                                    Text(date, style: .relative)
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                        .fixedSize()
+                                }
                             }
-                            .buttonStyle(.plain)
-                            .help(branchHelp(for: branch, isCheckedOut: isCheckedOut, isInspecting: isInspecting))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .fill(isInspecting ? Color.accentColor.opacity(0.14) : Color.clear)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .strokeBorder(
+                                        isInspecting ? Color.accentColor.opacity(0.40) : Color.clear,
+                                        lineWidth: isInspecting ? 1 : 0
+                                    )
+                            )
+                            .contentShape(Rectangle())
                         }
+                        .buttonStyle(.plain)
+                        .help(branchHelp(for: branch, isCheckedOut: isCheckedOut, isInspecting: isInspecting))
                     }
                 }
-                .frame(maxHeight: 280)
             }
         }
         .padding(10)
         .frame(width: popoverWidth)
+        .fixedSize(horizontal: true, vertical: true)
     }
 
     private func branchHelp(for branch: String, isCheckedOut: Bool = false, isInspecting: Bool = false) -> String {
@@ -1248,6 +1382,11 @@ private struct CommitsPane: View {
                                     in: Capsule()
                                 )
                                 .help("Local working-tree changes (shown even when Include local changes is off)")
+                            } else if model.workingTreeError != nil {
+                                Text("Status failed")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(Color.orange)
+                                    .help(model.workingTreeError ?? "git status failed")
                             } else {
                                 Text("Clean")
                                     .font(.caption.weight(.semibold))
@@ -1269,6 +1408,16 @@ private struct CommitsPane: View {
 
                 if model.historyBrowseMode == .all {
                     allCommitsHistoryList
+                } else if let error = model.workingTreeError,
+                          model.includeLocalChanges,
+                          model.uniqueFilteredCommits.isEmpty,
+                          !model.hasLocalChanges {
+                    ContentUnavailableView(
+                        "Couldn’t read local changes",
+                        systemImage: "exclamationmark.triangle.fill",
+                        description: Text(error)
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if historyIsClean {
                     ContentUnavailableView(
                         "Clean",
@@ -1509,6 +1658,7 @@ private struct CommitsPane: View {
 
     /// No unique branch commits, no local edits to browse, and nothing useful in the merged fallback.
     private var historyIsClean: Bool {
+        if model.workingTreeError != nil { return false }
         if !model.uniqueFilteredCommits.isEmpty { return false }
         if model.includeLocalChanges && model.hasLocalChanges { return false }
         if !model.selectedAuthors.isEmpty,
@@ -1556,13 +1706,14 @@ private struct CommitsPane: View {
                 pullRequest: pullRequest,
                 commits: commits,
                 primary: item.primaryCommit,
-                changeStats: decorations.pullRequestChangeStats[pullRequest.number],
+                changeStats: decorations.pullRequestChangeStats[pullRequest.number]
+                    ?? model.branchRangeChangeStats,
                 isSelected: isPullRequestSelected(pullRequest.number),
                 onSelect: { model.selectPullRequestFiles(pullRequest.number) },
                 onOpenPullRequest: { model.openCommitPullRequestInBrowser(pullRequest) }
             )
-            .onAppear {
-                Task { await model.ensurePullRequestChangeStats(for: pullRequest.number) }
+            .task(id: pullRequest.number) {
+                await model.ensurePullRequestChangeStats(for: pullRequest.number)
             }
         }
     }
@@ -2013,29 +2164,30 @@ private struct PullRequestHistoryCard: View {
                     Text("·")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
-                    Text("\(commits.count) commits")
+                    Text("\(commits.count) commit\(commits.count == 1 ? "" : "s")")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
+                }
+                if let changeStats {
+                    HStack(spacing: 8) {
+                        Text("\(changeStats.fileCount) file\(changeStats.fileCount == 1 ? "" : "s")")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Text("+\(changeStats.additions)")
+                            .font(.caption.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.additionText)
+                        Text("−\(changeStats.deletions)")
+                            .font(.caption.monospacedDigit().weight(.semibold))
+                            .foregroundStyle(AppTheme.deletionText)
+                    }
+                    .help("\(changeStats.fileCount) file\(changeStats.fileCount == 1 ? "" : "s"), \(changeStats.additions) added, \(changeStats.deletions) deleted versus COMPARE")
                 }
                 HStack(spacing: 6) {
                     Text(primary.authoredDate, style: .relative)
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                    if let changeStats {
-                        Text("·")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                        Text("\(changeStats.fileCount)f")
-                            .font(.caption2.monospacedDigit().weight(.semibold))
-                            .foregroundStyle(.secondary)
-                        Text("+\(changeStats.additions)")
-                            .font(.caption2.monospacedDigit().weight(.semibold))
-                            .foregroundStyle(AppTheme.additionText)
-                        Text("−\(changeStats.deletions)")
-                            .font(.caption2.monospacedDigit().weight(.semibold))
-                            .foregroundStyle(AppTheme.deletionText)
-                    }
                     Spacer(minLength: 0)
                     Button(action: onOpenPullRequest) {
                         HStack(spacing: 4) {
@@ -2281,7 +2433,14 @@ private struct FilesPane: View {
 
                 Divider().opacity(0.45)
 
-                if model.filteredFiles.isEmpty {
+                if let error = model.workingTreeError, model.filteredFiles.isEmpty {
+                    ContentUnavailableView(
+                        "Couldn’t read local changes",
+                        systemImage: "exclamationmark.triangle.fill",
+                        description: Text(error)
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if model.filteredFiles.isEmpty {
                     ContentUnavailableView(
                         model.visibleFiles.isEmpty ? "No file changes" : "No matching files",
                         systemImage: "folder",
@@ -2519,8 +2678,17 @@ private struct FilesPane: View {
         )
     }
 
+    private static let autoExpandFileLimit = 80
+
     private func expandNewFolders() {
-        let folderIDs = collectFolderIDs(model.fileTree)
+        let tree = model.fileTree
+        // Huge PR / stale-range trees: only open the first folder level so SwiftUI
+        // does not try to materialize hundreds of nested rows on first paint.
+        if model.filteredFiles.count > Self.autoExpandFileLimit {
+            expandedFolderIDs.formUnion(tree.filter(\.isFolder).map(\.id))
+            return
+        }
+        let folderIDs = collectFolderIDs(tree)
         let missing = folderIDs.filter { !expandedFolderIDs.contains($0) }
         guard !missing.isEmpty else { return }
         expandedFolderIDs.formUnion(missing)

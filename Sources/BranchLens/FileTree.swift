@@ -94,6 +94,19 @@ enum TextUtilities {
         return text.split(separator: "\n", omittingEmptySubsequences: false).count
     }
 
+    /// Space-separated tokens; every token must appear in at least one haystack.
+    static func searchTokens(in query: String) -> [String] {
+        query.split(whereSeparator: \.isWhitespace).map(String.init)
+    }
+
+    static func containsAllSearchTokens(_ haystacks: [String], query: String) -> Bool {
+        let tokens = searchTokens(in: query)
+        guard !tokens.isEmpty else { return true }
+        return tokens.allSatisfy { token in
+            haystacks.contains { $0.localizedCaseInsensitiveContains(token) }
+        }
+    }
+
     static func matchCount(in text: String, query: String) -> Int {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return 0 }
