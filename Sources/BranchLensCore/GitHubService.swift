@@ -54,6 +54,29 @@ public actor GitHubService {
         return try decodePullRequests(from: result.stdout)
     }
 
+    /// Look up a PR by number without needing a local checkout (`gh pr view --repo`).
+    public func viewPullRequest(number: Int, repo nameWithOwner: String) async throws -> PullRequestSummary {
+        let ghURL = try requireGH()
+        let fields = "number,title,author,headRefName,baseRefName,updatedAt,url,isDraft,state,additions,deletions,changedFiles"
+        let result = try await ProcessRunner.run(
+            executable: ghURL,
+            arguments: [
+                "pr", "view", String(number),
+                "--repo", nameWithOwner,
+                "--json", fields,
+            ]
+        )
+        if result.status != 0 {
+            let message = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw GitError.commandFailed(
+                message.isEmpty
+                    ? "Could not load \(nameWithOwner)#\(number). Is `gh` authenticated?"
+                    : message
+            )
+        }
+        return try decodePullRequest(from: result.stdout)
+    }
+
     /// Most recently merged PR whose head branch matches `headBranch`.
     public func mergedPullRequest(
         headBranch: String,
@@ -219,60 +242,65 @@ public actor GitHubService {
         }
     }
 
-    private func decodePullRequests(from data: Data) throws -> [PullRequestSummary] {
-        struct Payload: Decodable {
-            struct Author: Decodable { let login: String }
-            let number: Int
-            let title: String
-            let author: Author?
-            let headRefName: String
-            let baseRefName: String
-            let updatedAt: String
-            let url: String
-            let isDraft: Bool
-            let state: String
-            let additions: Int?
-            let deletions: Int?
-            let changedFiles: Int?
-        }
+    private struct PullRequestPayload: Decodable {
+        struct Author: Decodable { let login: String }
+        let number: Int
+        let title: String
+        let author: Author?
+        let headRefName: String
+        let baseRefName: String
+        let updatedAt: String
+        let url: String
+        let isDraft: Bool
+        let state: String
+        let additions: Int?
+        let deletions: Int?
+        let changedFiles: Int?
+    }
 
-        let rows = try JSONDecoder().decode([Payload].self, from: data)
+    private func decodePullRequest(from data: Data) throws -> PullRequestSummary {
+        try makePullRequest(from: JSONDecoder().decode(PullRequestPayload.self, from: data))
+    }
+
+    private func decodePullRequests(from data: Data) throws -> [PullRequestSummary] {
+        try JSONDecoder().decode([PullRequestPayload].self, from: data).map(makePullRequest)
+    }
+
+    private func makePullRequest(from row: PullRequestPayload) -> PullRequestSummary {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let isoBasic = ISO8601DateFormatter()
         isoBasic.formatOptions = [.withInternetDateTime]
 
-        return rows.map { row in
-            let lower = row.state.lowercased()
-            let status: String
-            if lower == "merged" {
-                status = "merged"
-            } else if lower == "open" {
-                status = "open"
-            } else {
-                status = "closed"
-            }
-            let state = PullRequestState(rawValue: lower)
-                ?? (status == "open" ? .open : .closed)
-            let date = iso.date(from: row.updatedAt)
-                ?? isoBasic.date(from: row.updatedAt)
-                ?? Date.distantPast
-            return PullRequestSummary(
-                number: row.number,
-                title: row.title,
-                state: state,
-                authorLogin: row.author?.login ?? "unknown",
-                headRefName: row.headRefName,
-                baseRefName: row.baseRefName,
-                updatedAt: date,
-                url: row.url,
-                isDraft: row.isDraft,
-                status: status,
-                changedFiles: row.changedFiles,
-                additions: row.additions,
-                deletions: row.deletions
-            )
+        let lower = row.state.lowercased()
+        let status: String
+        if lower == "merged" {
+            status = "merged"
+        } else if lower == "open" {
+            status = "open"
+        } else {
+            status = "closed"
         }
+        let state = PullRequestState(rawValue: lower)
+            ?? (status == "open" ? .open : .closed)
+        let date = iso.date(from: row.updatedAt)
+            ?? isoBasic.date(from: row.updatedAt)
+            ?? Date.distantPast
+        return PullRequestSummary(
+            number: row.number,
+            title: row.title,
+            state: state,
+            authorLogin: row.author?.login ?? "unknown",
+            headRefName: row.headRefName,
+            baseRefName: row.baseRefName,
+            updatedAt: date,
+            url: row.url,
+            isDraft: row.isDraft,
+            status: status,
+            changedFiles: row.changedFiles,
+            additions: row.additions,
+            deletions: row.deletions
+        )
     }
 
     private static func resolveGH() -> URL? {

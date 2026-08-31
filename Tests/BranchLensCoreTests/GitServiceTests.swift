@@ -276,6 +276,42 @@ final class GitServiceTests: XCTestCase {
         XCTAssertTrue(files.contains { $0.path == "extra.txt" && $0.status == .added })
     }
 
+    func testRemoteURLsMatchGitHubIdentityAndPreferHeadWorktree() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-pr-open-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "hello\n".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", "note.txt")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+        try await run(in: root, "/usr/bin/git", "remote", "add", "origin", "git@github.com:LorenzGit/venus.git")
+        try await run(in: root, "/usr/bin/git", "branch", "lorenzgit/topic")
+
+        let worktree = root.appendingPathComponent("node_modules/.codex-worktrees/topic")
+        try FileManager.default.createDirectory(
+            at: worktree.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try await run(in: root, "/usr/bin/git", "worktree", "add", worktree.path, "lorenzgit/topic")
+
+        let git = GitService()
+        let remotes = try await git.remoteURLs(in: worktree)
+        XCTAssertTrue(GitRemoteIdentity.matchesAny(remotes, owner: "LorenzGit", repo: "venus"))
+
+        let worktrees = try await git.listWorktrees(in: worktree)
+        XCTAssertEqual(
+            GitRemoteIdentity.preferredWorktree(
+                from: worktrees,
+                headBranch: "lorenzgit/topic"
+            )?.path.standardizedFileURL.path,
+            worktree.standardizedFileURL.path
+        )
+    }
+
     func testVenusCodexWorktreeShowsAllLocalChanges() async throws {
         let worktree = URL(
             fileURLWithPath: "/Users/lorenzonuvoletta/git/venus/node_modules/.codex-worktrees/test-app-remote-push"

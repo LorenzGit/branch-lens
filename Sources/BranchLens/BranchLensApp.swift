@@ -14,6 +14,10 @@ struct BranchLensApp: App {
                     NotificationCenter.default.post(name: .openRepository, object: nil)
                 }
                 .keyboardShortcut("o", modifiers: [.command])
+                Button("Open Pull Request…") {
+                    NotificationCenter.default.post(name: .openPullRequest, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
             }
             CommandGroup(replacing: .appInfo) {
                 Button("About BranchLens") {
@@ -34,4 +38,5 @@ struct BranchLensApp: App {
 
 extension Notification.Name {
     static let openRepository = Notification.Name("BranchLens.openRepository")
+    static let openPullRequest = Notification.Name("BranchLens.openPullRequest")
 }

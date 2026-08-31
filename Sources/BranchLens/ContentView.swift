@@ -49,6 +49,12 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .openRepository)) { _ in
             workspace.openRepositoryPicker()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .openPullRequest)) { _ in
+            workspace.beginOpenPullRequest()
+        }
+        .sheet(isPresented: $workspace.isOpenPullRequestPresented) {
+            OpenPullRequestSheet(workspace: workspace)
+        }
         .confirmationDialog(
             "Close this tab?",
             isPresented: Binding(
@@ -176,6 +182,10 @@ private struct TabBarView: View {
                     workspace.openRepositoryPicker()
                 }
                 .help("Open a local git repository in a new tab")
+                Button("Open Pull Request…") {
+                    workspace.beginOpenPullRequest()
+                }
+                .help("Paste a GitHub pull request URL (⇧⌘O)")
                 if !workspace.recentRepos.isEmpty {
                     Divider()
                     Section("Recent") {
@@ -379,6 +389,14 @@ private struct ToolbarView: View {
                     }
 
                     columnToggles
+
+                    Button {
+                        NotificationCenter.default.post(name: .openPullRequest, object: nil)
+                    } label: {
+                        Image(systemName: "link")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Open a GitHub pull request URL (⇧⌘O)")
 
                     Button {
                         Task { await model.refresh() }
@@ -1126,6 +1144,12 @@ private struct EmptyWorkspaceView: View {
                 .keyboardShortcut("o", modifiers: [.command])
                 .help("Open a local git repository (⌘O)")
 
+                Button("Open Pull Request…") {
+                    workspace.beginOpenPullRequest()
+                }
+                .controlSize(.large)
+                .help("Paste a GitHub pull request URL (⇧⌘O)")
+
                 if !workspace.recentRepos.isEmpty {
                     Menu("Recent") {
                         ForEach(workspace.recentRepos, id: \.path) { url in
@@ -1139,6 +1163,9 @@ private struct EmptyWorkspaceView: View {
                     .help("Open a recently used repository")
                 }
             }
+
+            OpenPullRequestField(workspace: workspace)
+                .frame(maxWidth: 560)
 
             if !workspace.recentRepos.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {

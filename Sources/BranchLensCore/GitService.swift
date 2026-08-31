@@ -391,6 +391,37 @@ public actor GitService {
         return (output?.isEmpty == false) ? output : nil
     }
 
+    /// Unique fetch/push URLs from `git remote -v`.
+    public func remoteURLs(in repo: URL) async throws -> [String] {
+        let output = (try? await runGit(["remote", "-v"], in: repo)) ?? ""
+        var seen = Set<String>()
+        var urls: [String] = []
+        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
+            let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count >= 2 else { continue }
+            let url = parts[1]
+            if seen.insert(url).inserted {
+                urls.append(url)
+            }
+        }
+        return urls
+    }
+
+    public func hasRevision(_ revision: String, in repo: URL) async -> Bool {
+        (try? await runGit(["rev-parse", "--verify", "--quiet", revision], in: repo)) != nil
+    }
+
+    /// Create a local branch tracking `origin/<name>` when only the remote-tracking ref exists.
+    public func ensureLocalBranch(_ name: String, in repo: URL) async throws {
+        let locals = try await listBranches(in: repo)
+        if locals.contains(where: { $0.name == name }) { return }
+        let remote = "origin/\(name)"
+        guard await hasRevision(remote, in: repo) else {
+            throw GitError.missingRevision(name)
+        }
+        _ = try await runGit(["branch", "--track", name, remote], in: repo)
+    }
+
     /// Staged + unstaged (+ untracked) files in the working tree.
     ///
     /// Linked worktrees (including those inside ignored folders) share a common Git
