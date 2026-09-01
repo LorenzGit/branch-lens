@@ -306,7 +306,7 @@ final class RepoSession: ObservableObject, Identifiable {
         includeLocalChanges = state.includeLocalChanges ?? false
 
         await openRepository(
-            at: URL(fileURLWithPath: state.repoPath),
+            at: resolvedLiveRepoURL(from: URL(fileURLWithPath: state.repoPath)),
             preferredBranch: state.selectedBranch,
             preferredBase: state.baseBranch,
             resetTransientState: false
@@ -758,6 +758,19 @@ final class RepoSession: ObservableObject, Identifiable {
         TextUtilities.matchCount(in: activeContentForSearch, query: contentQuery)
     }
 
+    private func resolvedLiveRepoURL(from url: URL) -> URL {
+        if FileManager.default.fileExists(atPath: url.path) {
+            return url.standardizedFileURL
+        }
+        let known = RecentRepos.load() + [
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("git")
+                .appendingPathComponent(url.lastPathComponent)
+        ]
+        return GitRemoteIdentity.recoverLiveRepository(from: url, knownPaths: known)
+            ?? url
+    }
+
     func openRepository(
         at url: URL,
         preferredBranch: String? = nil,
@@ -769,7 +782,11 @@ final class RepoSession: ObservableObject, Identifiable {
         defer { isLoading = false }
 
         do {
-            let root = try await git.validateRepository(at: url)
+            let target = resolvedLiveRepoURL(from: url)
+            if target != url.standardizedFileURL {
+                statusMessage = "Worktree was removed. Opened \(target.path)."
+            }
+            let root = try await git.validateRepository(at: target)
             repoPath = root
             RecentRepos.remember(root)
 
@@ -1454,6 +1471,22 @@ final class RepoSession: ObservableObject, Identifiable {
         fetchFirst: Bool = false,
         refreshPanes: Bool = false
     ) async {
+        if let repoPath, !FileManager.default.fileExists(atPath: repoPath.path) {
+            let recovered = resolvedLiveRepoURL(from: repoPath)
+            if recovered.path != repoPath.path, FileManager.default.fileExists(atPath: recovered.path) {
+                await openRepository(
+                    at: recovered,
+                    preferredBranch: selectedBranch,
+                    preferredBase: baseBranch,
+                    resetTransientState: false
+                )
+                return
+            }
+            snapshot = nil
+            errorMessage = "Worktree folder is gone:\n\(repoPath.path)"
+            isLoading = false
+            return
+        }
         guard let repoPath else { return }
 
         loadTask?.cancel()
@@ -2850,9 +2883,13 @@ enum RecentRepos {
 
     static func load() -> [URL] {
         let paths = UserDefaults.standard.stringArray(forKey: key) ?? []
-        return paths.map { URL(fileURLWithPath: $0) }.filter {
+        let existing = paths.map { URL(fileURLWithPath: $0) }.filter {
             FileManager.default.fileExists(atPath: $0.path)
         }
+        if existing.map(\.path) != paths {
+            UserDefaults.standard.set(existing.map(\.path), forKey: key)
+        }
+        return existing
     }
 
     static func remember(_ url: URL) {

@@ -68,14 +68,36 @@ public enum GitRemoteIdentity {
         headBranch: String,
         preferring paths: [URL] = []
     ) -> GitWorktree? {
-        let matches = worktrees.filter { $0.branch == headBranch }
+        let matches = liveWorktrees(from: worktrees).filter { $0.branch == headBranch }
         guard !matches.isEmpty else { return nil }
         let preferred = Set(paths.map { $0.standardizedFileURL.path })
         return matches.first { preferred.contains($0.path.standardizedFileURL.path) } ?? matches[0]
     }
 
     public static func fallbackWorktree(from worktrees: [GitWorktree]) -> GitWorktree? {
-        worktrees.first { !$0.isBare && !$0.isDetached } ?? worktrees.first { !$0.isBare }
+        liveWorktrees(from: worktrees).first { !$0.isBare && !$0.isDetached }
+            ?? liveWorktrees(from: worktrees).first { !$0.isBare }
+    }
+
+    public static func liveWorktrees(from worktrees: [GitWorktree]) -> [GitWorktree] {
+        worktrees.filter { FileManager.default.fileExists(atPath: $0.path.path) }
+    }
+
+    /// When a linked worktree folder is deleted, prefer another checkout with the same folder name.
+    public static func recoverLiveRepository(from dead: URL, knownPaths: [URL]) -> URL? {
+        let name = dead.lastPathComponent
+        guard !name.isEmpty else { return nil }
+        var seen = Set<String>()
+        for url in knownPaths {
+            let path = url.standardizedFileURL.path
+            guard seen.insert(path).inserted else { continue }
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+                continue
+            }
+            if url.lastPathComponent == name { return url }
+        }
+        return nil
     }
 
     private static func parse(_ remoteURL: String) -> (host: String, owner: String, repo: String)? {

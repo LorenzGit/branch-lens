@@ -48,16 +48,23 @@ final class GitHubPullRequestURLTests: XCTestCase {
         XCTAssertTrue(GitRemoteIdentity.matchesAny(remotes, owner: "LorenzGit", repo: "venus"))
     }
 
-    func testPrefersWorktreeCheckedOutToHeadBranch() {
+    func testPrefersWorktreeCheckedOutToHeadBranch() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-wt-pick-\(UUID().uuidString)", isDirectory: true)
+        let mainPath = root.appendingPathComponent("venus", isDirectory: true)
+        let prPath = root.appendingPathComponent("venus/node_modules/.codex-worktrees/topic", isDirectory: true)
+        try FileManager.default.createDirectory(at: prPath, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
         let main = GitWorktree(
-            path: URL(fileURLWithPath: "/tmp/venus"),
+            path: mainPath,
             head: "aaa",
             branch: "develop",
             isBare: false,
             isDetached: false
         )
         let pr = GitWorktree(
-            path: URL(fileURLWithPath: "/tmp/venus/node_modules/.codex-worktrees/topic"),
+            path: prPath,
             head: "bbb",
             branch: "lorenzgit/topic",
             isBare: false,
@@ -76,6 +83,25 @@ final class GitHubPullRequestURLTests: XCTestCase {
         XCTAssertEqual(
             GitRemoteIdentity.fallbackWorktree(from: [main, pr])?.path.path,
             main.path.path
+        )
+    }
+
+    func testRecoversLiveCheckoutWhenLinkedWorktreeFolderIsGone() throws {
+        let live = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-recover-live-\(UUID().uuidString)/choices-h5", isDirectory: true)
+        try FileManager.default.createDirectory(at: live, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: live.deletingLastPathComponent()) }
+
+        let dead = URL(fileURLWithPath: "/tmp/missing-worktrees/0afd/choices-h5")
+        XCTAssertEqual(
+            GitRemoteIdentity.recoverLiveRepository(from: dead, knownPaths: [live])?.path,
+            live.path
+        )
+        XCTAssertNil(
+            GitRemoteIdentity.recoverLiveRepository(
+                from: dead,
+                knownPaths: [URL(fileURLWithPath: "/tmp/does-not-exist/choices-h5")]
+            )
         )
     }
 }

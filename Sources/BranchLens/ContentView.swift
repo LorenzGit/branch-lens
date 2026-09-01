@@ -605,6 +605,17 @@ private struct WorktreeMenu: View {
         }
     }
 
+    private var worktreeChipLabel: String {
+        let path = model.currentWorktree?.path ?? model.repoPath
+        guard let path else { return "Select…" }
+        let name = path.lastPathComponent
+        let parent = path.deletingLastPathComponent()
+        if path.path.contains("/.codex/worktrees/") || path.path.contains("/.codex-worktrees/") {
+            return "\(parent.lastPathComponent)/\(name)"
+        }
+        return name
+    }
+
     private var popoverWidth: CGFloat {
         let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         let longest = model.worktrees
@@ -626,9 +637,7 @@ private struct WorktreeMenu: View {
                     Text("WORKTREE")
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(.secondary)
-                    Text(model.currentWorktree?.path.lastPathComponent
-                          ?? model.repoPath?.lastPathComponent
-                          ?? "Select…")
+                    Text(worktreeChipLabel)
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)

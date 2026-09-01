@@ -21,7 +21,14 @@ public enum ProcessRunner {
         arguments: [String],
         currentDirectory: URL? = nil
     ) async throws -> ProcessResult {
-        try await withCheckedThrowingContinuation { continuation in
+        if let currentDirectory {
+            let path = currentDirectory.path
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+                throw GitError.commandFailed("Worktree folder is gone:\n\(path)")
+            }
+        }
+        return try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             process.executableURL = executable
             process.arguments = arguments

@@ -44,7 +44,16 @@ final class WorkspaceModel: ObservableObject {
         var restored: [RepoSession] = []
         for tab in snapshot.tabs {
             let url = URL(fileURLWithPath: tab.repoPath)
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            let recovered = GitRemoteIdentity.recoverLiveRepository(
+                from: url,
+                knownPaths: RecentRepos.load() + [
+                    FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent("git")
+                        .appendingPathComponent(url.lastPathComponent)
+                ]
+            )
+            guard exists || recovered != nil else { continue }
             let session = RepoSession(id: tab.id)
             session.onStateChange = { [weak self] in self?.scheduleSave() }
             await session.restore(from: tab)
@@ -219,14 +228,17 @@ final class WorkspaceModel: ObservableObject {
 
     private func sessionForOpening(at url: URL, worktrees: [GitWorktree]) async -> RepoSession {
         let standardized = url.standardizedFileURL
-        if let existing = tabs.first(where: { $0.repoPath?.standardizedFileURL == standardized }) {
+        if let existing = tabs.first(where: {
+            $0.repoPath?.standardizedFileURL == standardized
+                && FileManager.default.fileExists(atPath: standardized.path)
+        }) {
             selectTab(existing.id)
             return existing
         }
-        let family = Set(worktrees.map { $0.path.standardizedFileURL.path })
+        let family = Set(GitRemoteIdentity.liveWorktrees(from: worktrees).map { $0.path.standardizedFileURL.path })
         if let existing = tabs.first(where: {
             guard let path = $0.repoPath?.standardizedFileURL.path else { return false }
-            return family.contains(path)
+            return family.contains(path) && FileManager.default.fileExists(atPath: path)
         }) {
             selectTab(existing.id)
             return existing

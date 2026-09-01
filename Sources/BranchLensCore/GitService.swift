@@ -857,7 +857,7 @@ public actor GitService {
             }
         }
         flush()
-        return worktrees
+        return GitRemoteIdentity.liveWorktrees(from: worktrees)
     }
 
     /// File contents at a revision. Returns `nil` when the path does not exist at that revision.
