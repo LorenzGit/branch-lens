@@ -119,6 +119,30 @@ final class RepoSession: ObservableObject, Identifiable {
     var branchTipDates: [String: Date] {
         Dictionary(uniqueKeysWithValues: branchRecords.map { ($0.name, $0.tipDate) })
     }
+    var branchTipAuthors: [String: String] {
+        Dictionary(uniqueKeysWithValues: branchRecords.compactMap { record in
+            guard let author = record.tipAuthor, !author.isEmpty else { return nil }
+            return (record.name, author)
+        })
+    }
+    /// branch → worktree labels that have it checked out.
+    var branchOccupancy: [String: String] {
+        var labels: [String: [String]] = [:]
+        for worktree in worktrees where worktree.folderExists {
+            guard let branch = worktree.branch, !branch.isEmpty else { continue }
+            labels[branch, default: []].append(worktree.shortLabel)
+        }
+        return labels.mapValues { $0.sorted().joined(separator: ", ") }
+    }
+    var branchPullRequestNumbers: [String: Int] {
+        var numbers: [String: Int] = [:]
+        for pullRequest in pullRequests {
+            if numbers[pullRequest.headRefName] == nil {
+                numbers[pullRequest.headRefName] = pullRequest.number
+            }
+        }
+        return numbers
+    }
     @Published var selectedBranch: String = ""
     /// Branch currently checked out in this worktree (`git branch --show-current`).
     @Published var checkedOutBranch: String?
@@ -421,6 +445,39 @@ final class RepoSession: ObservableObject, Identifiable {
         guard let repoPath else { return nil }
         let standardized = repoPath.standardizedFileURL
         return worktrees.first { $0.path.standardizedFileURL == standardized }
+    }
+
+    var liveWorktreeCount: Int { WorktreeActions.liveCount(worktrees) }
+    var missingWorktreeCount: Int { WorktreeActions.missingCount(worktrees) }
+
+    var toolbarUpdateAction: BranchUpdateAction? {
+        guard let snapshot else { return nil }
+        return BranchUpdatePlanner.action(
+            viewing: selectedBranch,
+            compare: baseBranch,
+            compareTip: snapshot.compareTip,
+            viewingBehind: snapshot.compareAheadCount,
+            localCompareBehind: snapshot.localCompareBehindCount,
+            checkedOutBranch: checkedOutBranch,
+            hasLocalChanges: hasLocalChanges,
+            viewingOccupiedBy: occupiedBy(selectedBranch),
+            compareOccupiedBy: occupiedBy(baseBranch),
+            viewingCanFastForward: snapshot.viewingCanFastForward,
+            localCompareCanFastForward: snapshot.localCompareCanFastForward
+        )
+    }
+
+    var compareBranchOptions: [String] {
+        CompareBranchOptions.bases(from: branches, current: baseBranch)
+    }
+
+    private func occupiedBy(_ branch: String) -> String? {
+        guard !branch.isEmpty else { return nil }
+        return worktrees.first {
+            $0.folderExists
+                && $0.branch == branch
+                && $0.path.standardizedFileURL != repoPath?.standardizedFileURL
+        }?.shortLabel
     }
 
     var branchAuthors: [String] {
@@ -1293,6 +1350,10 @@ final class RepoSession: ObservableObject, Identifiable {
 
     func switchToWorktree(_ worktree: GitWorktree) async {
         guard worktree.path.standardizedFileURL != repoPath?.standardizedFileURL else { return }
+        guard worktree.folderExists else {
+            errorMessage = "Worktree folder is gone:\n\(worktree.path.path)"
+            return
+        }
         statusMessage = "Switching worktree…"
         await openRepository(
             at: worktree.path,
@@ -1303,10 +1364,75 @@ final class RepoSession: ObservableObject, Identifiable {
         statusMessage = nil
     }
 
-    /// Bring BRANCH up to date with COMPARE tip.
-    /// When BRANCH == COMPARE (e.g. inspecting `main` vs `main`), fast-forward to the
-    /// fresh remote tip instead of trying to merge a branch into itself.
-    func updateFromCompare() async {
+    func performToolbarUpdate() async {
+        guard let action = toolbarUpdateAction, action.isEnabled else { return }
+        switch action.kind {
+        case .mergeIntoViewing:
+            await updateFromCompare(forceMerge: true)
+        case .fastForwardViewing:
+            await updateFromCompare(forceMerge: false)
+        case .refreshLocalCompare:
+            await updateLocalCompare()
+        }
+    }
+
+    func deleteLocalBranch(_ name: String) async {
+        guard let repoPath else { return }
+        errorMessage = nil
+        statusMessage = "Deleting \(name)…"
+        do {
+            try await git.deleteLocalBranch(name, in: repoPath)
+            try await refreshBranchRecords(in: repoPath)
+            if selectedBranch == name {
+                selectBranch(checkedOutBranch ?? baseBranch)
+            }
+            if baseBranch == name, let fallback = try await git.detectBaseBranch(in: repoPath, branches: branches) {
+                selectBaseBranch(fallback)
+            }
+            statusMessage = "Deleted \(name)."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+        }
+    }
+
+    func removeWorktree(_ worktree: GitWorktree) async {
+        guard let repoPath else { return }
+        errorMessage = nil
+        statusMessage = worktree.folderExists ? "Removing \(worktree.shortLabel)…" : "Pruning \(worktree.shortLabel)…"
+        do {
+            try await git.removeWorktree(worktree, in: repoPath)
+            await reloadWorktrees()
+            statusMessage = worktree.folderExists
+                ? "Removed \(worktree.shortLabel)."
+                : "Pruned \(worktree.shortLabel)."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+        }
+    }
+
+    func pruneMissingWorktrees() async {
+        guard let repoPath else { return }
+        errorMessage = nil
+        statusMessage = "Pruning missing worktrees…"
+        do {
+            try await git.pruneWorktrees(in: repoPath)
+            await reloadWorktrees()
+            statusMessage = "Pruned missing worktrees."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = nil
+        }
+    }
+
+    /// Bring Viewing up to date with the COMPARE tip.
+    /// Fast-forward when Viewing is the compare branch and histories allow it.
+    /// `forceMerge` is for a diverged local `main` vs `origin/main`.
+    func updateFromCompare(forceMerge: Bool = false) async {
         guard let repoPath else { return }
         guard !selectedBranch.isEmpty, !baseBranch.isEmpty else { return }
 
@@ -1316,10 +1442,10 @@ final class RepoSession: ObservableObject, Identifiable {
 
         do {
             // Prefer fresh remote tips before merging / fast-forwarding.
-            try? await git.fetchRemotes(in: repoPath)
+            let fetchNote = await fetchRemotesNote(in: repoPath)
             let tip = await git.resolveFreshTip(for: baseBranch, in: repoPath)
 
-            if selectedBranch == baseBranch {
+            if selectedBranch == baseBranch, !forceMerge {
                 guard tip != selectedBranch else {
                     errorMessage = "No fresher tip than local \(selectedBranch)."
                     statusMessage = nil
@@ -1329,16 +1455,16 @@ final class RepoSession: ObservableObject, Identifiable {
                 statusMessage = "Fast-forwarding \(selectedBranch) to \(tip)…"
                 try await git.fastForwardLocalBranch(selectedBranch, to: tip, in: repoPath)
                 await reloadSnapshot(resetScope: true, fetchFirst: false)
-                statusMessage = "Updated \(selectedBranch) to \(tip)."
+                statusMessage = "Updated \(selectedBranch) to \(tip).\(fetchNote)"
             } else {
                 statusMessage = "Updating \(selectedBranch) from \(tip)…"
                 try await git.merge(source: tip, into: selectedBranch, in: repoPath)
-                // Keep local COMPARE from staying stale after a successful update.
-                if tip != baseBranch {
+                // Don't rewrite the branch we just merged into (e.g. diverged main).
+                if tip != baseBranch, selectedBranch != baseBranch {
                     try? await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
                 }
                 await reloadSnapshot(resetScope: true, fetchFirst: false)
-                statusMessage = "Updated \(selectedBranch) with \(tip)."
+                statusMessage = "Updated \(selectedBranch) with \(tip).\(fetchNote)"
             }
             isUpdatingFromCompare = false
             clearStatusEventually(statusMessage)
@@ -1359,7 +1485,7 @@ final class RepoSession: ObservableObject, Identifiable {
         statusMessage = "Updating local \(baseBranch)…"
 
         do {
-            try? await git.fetchRemotes(in: repoPath)
+            let fetchNote = await fetchRemotesNote(in: repoPath)
             let tip = await git.resolveFreshTip(for: baseBranch, in: repoPath)
             guard tip != baseBranch else {
                 statusMessage = nil
@@ -1370,13 +1496,22 @@ final class RepoSession: ObservableObject, Identifiable {
             statusMessage = "Fast-forwarding \(baseBranch) to \(tip)…"
             try await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
             await reloadSnapshot(resetScope: false, fetchFirst: false)
-            statusMessage = "Updated local \(baseBranch) to \(tip)."
+            statusMessage = "Updated local \(baseBranch) to \(tip).\(fetchNote)"
             isUpdatingFromCompare = false
             clearStatusEventually(statusMessage)
         } catch {
             errorMessage = error.localizedDescription
             statusMessage = nil
             isUpdatingFromCompare = false
+        }
+    }
+
+    private func fetchRemotesNote(in repoPath: URL) async -> String {
+        do {
+            try await git.fetchRemotes(in: repoPath)
+            return ""
+        } catch {
+            return " Could not fetch remotes; used last-known tips."
         }
     }
 

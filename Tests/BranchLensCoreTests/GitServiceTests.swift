@@ -158,6 +158,38 @@ final class GitServiceTests: XCTestCase {
         XCTAssertFalse(snapshot.commits.contains { $0.subject == "advance main" })
         XCTAssertGreaterThan(snapshot.localCompareBehindCount, 0)
         XCTAssertEqual(snapshot.compareTip, "origin/main")
+        XCTAssertTrue(snapshot.localCompareCanFastForward)
+    }
+
+    func testLoadSnapshotFlagsDivergedLocalCompare() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-diverged-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "base\n".write(to: root.appendingPathComponent("keep.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+        try await run(in: root, "/usr/bin/git", "branch", "origin/main")
+
+        try "local only\n".write(to: root.appendingPathComponent("local.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "local main commit")
+
+        try await run(in: root, "/usr/bin/git", "checkout", "origin/main")
+        try "remote only\n".write(to: root.appendingPathComponent("remote.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "origin main commit")
+        try await run(in: root, "/usr/bin/git", "checkout", "main")
+
+        let snapshot = try await GitService().loadSnapshot(repo: root, branch: "main", baseBranch: "main")
+        XCTAssertEqual(snapshot.compareTip, "origin/main")
+        XCTAssertGreaterThan(snapshot.compareAheadCount, 0)
+        XCTAssertFalse(snapshot.viewingCanFastForward)
+        XCTAssertFalse(snapshot.localCompareCanFastForward)
     }
 
     func testWriteWorkingTreeFileRoundTrip() async throws {
@@ -310,6 +342,86 @@ final class GitServiceTests: XCTestCase {
             )?.path.standardizedFileURL.path,
             worktree.standardizedFileURL.path
         )
+    }
+
+    func testListBranchesIncludesTipAuthor() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-author-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Ada Lovelace")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "ada@example.com")
+        try "hello\n".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", "note.txt")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        let branches = try await GitService().listBranches(in: root)
+        let main = try XCTUnwrap(branches.first { $0.name == "main" })
+        XCTAssertEqual(main.tipAuthor, "Ada Lovelace")
+    }
+
+    func testListWorktreesKeepsMissingFoldersForPrune() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-missing-wt-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "hello\n".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", "note.txt")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        let worktree = root.appendingPathComponent("linked")
+        try await run(in: root, "/usr/bin/git", "worktree", "add", "-b", "topic", worktree.path)
+        try FileManager.default.removeItem(at: worktree)
+
+        let git = GitService()
+        let listed = try await git.listWorktrees(in: root)
+        XCTAssertEqual(listed.count, 2)
+        let linkedPath = worktree.resolvingSymlinksInPath().path
+        let missing = try XCTUnwrap(listed.first {
+            $0.path.resolvingSymlinksInPath().path == linkedPath
+                || $0.path.lastPathComponent == worktree.lastPathComponent
+        })
+        XCTAssertFalse(missing.folderExists)
+        XCTAssertEqual(WorktreeActions.missingCount(listed), 1)
+        XCTAssertNil(WorktreeActions.blockedReason(missing, in: listed, currentPath: root, openPaths: []))
+
+        try await git.removeWorktree(missing, in: root)
+        let after = try await git.listWorktrees(in: root)
+        XCTAssertEqual(after.count, 1)
+        XCTAssertTrue(WorktreeActions.isPrimary(after[0], in: after))
+    }
+
+    func testDeleteLocalBranchRefusesProtectedAndOccupied() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-delete-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "hello\n".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", "note.txt")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+        try await run(in: root, "/usr/bin/git", "branch", "topic")
+
+        let git = GitService()
+        do {
+            try await git.deleteLocalBranch("main", in: root)
+            XCTFail("Expected protected delete to fail")
+        } catch let error as GitError {
+            XCTAssertTrue(error.localizedDescription.contains("Refusing to delete"))
+        }
+
+        try await git.deleteLocalBranch("topic", in: root)
+        let names = try await git.listBranches(in: root).map(\.name)
+        XCTAssertFalse(names.contains("topic"))
     }
 
     func testVenusCodexWorktreeShowsAllLocalChanges() async throws {

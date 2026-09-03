@@ -22,7 +22,7 @@ public actor GitService {
         let output = try await runGit(
             [
                 "for-each-ref",
-                "--format=%(refname:short)%00%(committerdate:iso8601-strict)",
+                "--format=%(refname:short)%00%(committerdate:iso8601-strict)%00%(authorname)",
                 "--sort=refname",
                 "refs/heads/",
             ],
@@ -31,12 +31,19 @@ public actor GitService {
         return output
             .split(whereSeparator: \.isNewline)
             .compactMap { line -> GitBranch? in
-                let parts = line.split(separator: "\0", maxSplits: 1, omittingEmptySubsequences: false)
+                let parts = line.split(separator: "\0", maxSplits: 2, omittingEmptySubsequences: false)
                 guard let namePart = parts.first else { return nil }
                 let name = String(namePart).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !name.isEmpty else { return nil }
                 let dateString = parts.count > 1 ? String(parts[1]) : ""
-                return GitBranch(name: name, tipDate: Self.parseGitDate(dateString))
+                let author = parts.count > 2
+                    ? String(parts[2]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    : ""
+                return GitBranch(
+                    name: name,
+                    tipDate: Self.parseGitDate(dateString),
+                    tipAuthor: author.isEmpty ? nil : author
+                )
             }
     }
 
@@ -145,9 +152,53 @@ public actor GitService {
             }
             _ = try await runGit(["merge", "--ff-only", tip], in: repo)
         } else {
+            if let occupant = try await listWorktrees(in: repo).first(where: {
+                $0.folderExists
+                    && $0.branch == branch
+                    && $0.path.standardizedFileURL != repo.standardizedFileURL
+            }) {
+                throw GitError.commandFailed(
+                    "Cannot update “\(branch)” while it is checked out in \(occupant.shortLabel)."
+                )
+            }
             // Update the ref in place so we don't disturb the checked-out feature branch.
             _ = try await runGit(["update-ref", "refs/heads/\(branch)", tipSHA], in: repo)
         }
+    }
+
+    /// Safe delete: refuses protected names, occupied checkouts, and unmerged tips (`-d`, never `-D`).
+    public func deleteLocalBranch(_ name: String, in repo: URL) async throws {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains(".."), !trimmed.hasPrefix("-") else {
+            throw GitError.commandFailed("Invalid branch name.")
+        }
+        if BranchDeleteRules.blockedReason(name: trimmed, occupiedBy: nil) != nil {
+            throw GitError.commandFailed("Refusing to delete “\(trimmed)”.")
+        }
+        if let occupant = try await listWorktrees(in: repo).first(where: {
+            $0.folderExists && $0.branch == trimmed
+        }) {
+            throw GitError.commandFailed(
+                "“\(trimmed)” is checked out in \(occupant.shortLabel)."
+            )
+        }
+        _ = try await runGit(["branch", "-d", trimmed], in: repo)
+    }
+
+    public func removeWorktree(_ worktree: GitWorktree, in repo: URL) async throws {
+        if WorktreeActions.isPrimary(worktree, in: try await listWorktrees(in: repo)) {
+            throw GitError.commandFailed("The primary clone can’t be removed.")
+        }
+        var args = ["worktree", "remove"]
+        if !worktree.folderExists {
+            args.append("--force")
+        }
+        args.append(worktree.path.path)
+        _ = try await runGit(args, in: repo)
+    }
+
+    public func pruneWorktrees(in repo: URL) async throws {
+        _ = try await runGit(["worktree", "prune"], in: repo)
     }
 
     public func isAncestor(
@@ -266,10 +317,14 @@ public actor GitService {
         let files = try await listChangedFiles(in: repo, from: mergeBase, to: branch)
         let compareAheadCount = try await commitCount(in: repo, from: branch, to: compareTip)
         let localCompareBehindCount: Int
+        let viewingCanFastForward = await isAncestor(branch, of: compareTip, in: repo)
+        let localCompareCanFastForward: Bool
         if compareTip == baseBranch {
             localCompareBehindCount = 0
+            localCompareCanFastForward = true
         } else {
             localCompareBehindCount = (try? await commitCount(in: repo, from: baseBranch, to: compareTip)) ?? 0
+            localCompareCanFastForward = await isAncestor(baseBranch, of: compareTip, in: repo)
         }
         let remote = try await remoteTrackingInfo(in: repo, branch: branch)
 
@@ -284,6 +339,8 @@ public actor GitService {
             compareAheadCount: compareAheadCount,
             compareTip: compareTip,
             localCompareBehindCount: localCompareBehindCount,
+            viewingCanFastForward: viewingCanFastForward,
+            localCompareCanFastForward: localCompareCanFastForward,
             staleCompareInheritedCommitCount: 0,
             aheadOfRemote: remote.ahead,
             behindRemote: remote.behind,
@@ -857,7 +914,7 @@ public actor GitService {
             }
         }
         flush()
-        return GitRemoteIdentity.liveWorktrees(from: worktrees)
+        return worktrees
     }
 
     /// File contents at a revision. Returns `nil` when the path does not exist at that revision.

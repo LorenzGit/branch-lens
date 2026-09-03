@@ -84,7 +84,7 @@ private struct SessionContainer: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ToolbarView(model: session)
+            ToolbarView(model: session, workspace: workspace)
             if session.repoPath == nil {
                 ProgressView("Opening repository…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -298,52 +298,55 @@ private struct TabChip: View {
 
 private struct ToolbarView: View {
     @ObservedObject var model: RepoSession
+    @ObservedObject var workspace: WorkspaceModel
+
+    private var viewingSubtitle: String? {
+        if let checkedOut = model.checkedOutBranch,
+           !checkedOut.isEmpty,
+           checkedOut != model.selectedBranch {
+            return "HEAD is \(checkedOut)"
+        }
+        let author = model.branchTipAuthors[model.selectedBranch]
+        if let date = model.branchTipDates[model.selectedBranch] {
+            let when = ToolbarCopy.relative(date)
+            return author.map { "\($0) · \(when)" } ?? when
+        }
+        return author
+    }
+
+    private var viewingHelp: String {
+        if let checkedOut = model.checkedOutBranch,
+           !checkedOut.isEmpty,
+           checkedOut != model.selectedBranch {
+            return "Viewing is what BranchLens inspects. This folder’s git HEAD is \(checkedOut)."
+        }
+        return "Branch BranchLens is inspecting"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 if model.repoPath != nil {
-                    HStack(spacing: 6) {
-                        if let checkedOut = model.checkedOutBranch,
-                           !checkedOut.isEmpty,
-                           checkedOut != model.selectedBranch {
-                            Button {
-                                model.selectBranch(checkedOut)
-                            } label: {
-                                Image(systemName: "arrow.uturn.backward")
-                                    .font(.callout.weight(.semibold))
-                                    .foregroundStyle(Color.orange)
-                                    .frame(width: 16)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 14)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                            .fill(Color.orange.opacity(0.12))
-                                    )
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                            .strokeBorder(Color.orange.opacity(0.30), lineWidth: 1)
-                                    )
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .help("Inspect the checked-out branch \(checkedOut)")
-                        }
-
-                        BranchMenu(
-                            title: "Branch",
-                            icon: "arrow.triangle.branch",
-                            value: model.selectedBranch,
-                            options: model.branches,
-                            tipDates: model.branchTipDates,
-                            emphasized: true,
-                            checkedOutBranch: model.checkedOutBranch,
-                            badge: upstreamBadge(for: model.snapshot),
-                            badgeHelp: upstreamBadgeHelp(for: model.snapshot),
-                            badgeStyle: upstreamBadgeStyle(for: model.snapshot),
-                            helpText: "Branch to inspect"
-                        ) { model.selectBranch($0) }
-                    }
+                    BranchMenu(
+                        title: "Viewing",
+                        icon: "arrow.triangle.branch",
+                        value: model.selectedBranch,
+                        options: model.branches,
+                        tipDates: model.branchTipDates,
+                        tipAuthors: model.branchTipAuthors,
+                        occupancy: model.branchOccupancy,
+                        pullRequestNumbers: model.branchPullRequestNumbers,
+                        emphasized: true,
+                        checkedOutBranch: model.checkedOutBranch,
+                        subtitle: viewingSubtitle,
+                        subtitleStyle: viewingSubtitle?.hasPrefix("HEAD is") == true ? .warning : .neutral,
+                        badge: upstreamBadge(for: model.snapshot),
+                        badgeHelp: upstreamBadgeHelp(for: model.snapshot),
+                        badgeStyle: upstreamBadgeStyle(for: model.snapshot),
+                        helpText: viewingHelp,
+                        onDelete: { name in Task { await model.deleteLocalBranch(name) } },
+                        onSelect: { model.selectBranch($0) }
+                    )
 
                     if model.unpushedCommitCount > 0 {
                         Button {
@@ -366,7 +369,7 @@ private struct ToolbarView: View {
 
                     CompareBranchControl(model: model)
 
-                    WorktreeMenu(model: model)
+                    WorktreeMenu(model: model, workspace: workspace)
 
                     if let snapshot = model.snapshot {
                         CompactStats(model: model, snapshot: snapshot)
@@ -590,30 +593,68 @@ private struct FittingPopoverScroll<Content: View>: View {
     }
 }
 
+private enum ToolbarCopy {
+    static func relative(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
 private struct WorktreeMenu: View {
     @ObservedObject var model: RepoSession
+    @ObservedObject var workspace: WorkspaceModel
     @State private var isOpen = false
     @State private var query = ""
+    @State private var pendingRemove: GitWorktree?
+    @State private var pendingPruneAll = false
     @FocusState private var searchFocused: Bool
 
     private var filteredWorktrees: [GitWorktree] {
         model.worktrees.filter { worktree in
             TextUtilities.containsAllSearchTokens(
-                [worktree.displayName, worktree.path.path],
+                [worktree.displayName, worktree.path.path, worktree.shortLabel],
                 query: query
             )
         }
     }
 
     private var worktreeChipLabel: String {
-        let path = model.currentWorktree?.path ?? model.repoPath
-        guard let path else { return "Select…" }
-        let name = path.lastPathComponent
-        let parent = path.deletingLastPathComponent()
-        if path.path.contains("/.codex/worktrees/") || path.path.contains("/.codex-worktrees/") {
-            return "\(parent.lastPathComponent)/\(name)"
+        if let current = model.currentWorktree {
+            return current.shortLabel
         }
-        return name
+        if let path = model.repoPath {
+            return GitWorktree.shortLabel(for: path)
+        }
+        return "Select…"
+    }
+
+    private var worktreeHeadSubtitle: String? {
+        if let worktree = model.currentWorktree {
+            if let branch = worktree.branch, !branch.isEmpty {
+                return "HEAD \(branch)"
+            }
+            if worktree.isDetached {
+                return "HEAD detached \(String(worktree.head.prefix(8)))"
+            }
+        }
+        if let checkedOut = model.checkedOutBranch, !checkedOut.isEmpty {
+            return "HEAD \(checkedOut)"
+        }
+        return nil
+    }
+
+    private var censusLabel: String {
+        let live = model.liveWorktreeCount
+        let missing = model.missingWorktreeCount
+        if missing > 0 {
+            return "\(live) live · \(missing) missing"
+        }
+        return "\(live) live"
+    }
+
+    private var openPaths: Set<String> {
+        workspace.openPaths(excluding: model.id)
     }
 
     private var popoverWidth: CGFloat {
@@ -621,12 +662,14 @@ private struct WorktreeMenu: View {
         let longest = model.worktrees
             .map { ($0.displayName as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 180
-        return min(max(ceil(longest) + 52, 300), 640)
+        return min(max(ceil(longest) + 160, 340), 680)
     }
 
     var body: some View {
         Button {
             query = ""
+            pendingRemove = nil
+            pendingPruneAll = false
             isOpen.toggle()
         } label: {
             HStack(spacing: 8) {
@@ -637,12 +680,25 @@ private struct WorktreeMenu: View {
                     Text("WORKTREE")
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(.secondary)
-                    Text(worktreeChipLabel)
-                        .font(.caption.weight(.medium))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    HStack(spacing: 6) {
+                        Text(worktreeChipLabel)
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(censusLabel)
+                            .font(.caption2.monospacedDigit().weight(.bold))
+                            .foregroundStyle(model.missingWorktreeCount > 0 ? Color.orange : .secondary)
+                            .fixedSize()
+                    }
+                    if let worktreeHeadSubtitle {
+                        Text(worktreeHeadSubtitle)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
                 }
-                .frame(minWidth: 70, maxWidth: 140, alignment: .leading)
+                .frame(minWidth: 70, maxWidth: 160, alignment: .leading)
                 Image(systemName: "magnifyingglass")
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.tertiary)
@@ -663,15 +719,31 @@ private struct WorktreeMenu: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(model.repoPath.map { "Switch git worktree\n\($0.path)" } ?? "Switch git worktree")
+        .help(worktreeHelp)
         .disabled(model.repoPath == nil)
         .popover(isPresented: $isOpen, arrowEdge: .bottom) {
             worktreePickerPopover
         }
     }
 
+    private var worktreeHelp: String {
+        var lines = ["This worktree, and the other checkouts of this repository."]
+        if let path = model.repoPath {
+            lines.append(path.path)
+        }
+        if let worktreeHeadSubtitle {
+            lines.append(worktreeHeadSubtitle)
+        }
+        lines.append(censusLabel)
+        return lines.joined(separator: "\n")
+    }
+
     private var worktreePickerPopover: some View {
         VStack(alignment: .leading, spacing: 8) {
+            Text(censusLabel)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
@@ -701,52 +773,54 @@ private struct WorktreeMenu: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 8)
             } else {
-                FittingPopoverScroll(itemCount: filteredWorktrees.count, rowHeight: 34, maxHeight: 320) {
+                FittingPopoverScroll(itemCount: filteredWorktrees.count, rowHeight: 62, maxHeight: 360) {
                     ForEach(filteredWorktrees) { worktree in
-                        let isCurrent = model.currentWorktree?.id == worktree.id
-                        Button {
-                            switchTo(worktree)
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: isCurrent ? "checkmark" : "square.stack.3d.up")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
-                                    .frame(width: 14)
-                                Text(worktree.displayName)
-                                    .font(.callout.monospaced().weight(isCurrent ? .semibold : .regular))
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Spacer(minLength: 0)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(isCurrent ? Color.accentColor.opacity(0.14) : Color.clear)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .strokeBorder(
-                                        isCurrent ? Color.accentColor.opacity(0.40) : Color.clear,
-                                        lineWidth: isCurrent ? 1 : 0
-                                    )
-                            )
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(worktree.path.path)
+                        worktreeRow(worktree)
                     }
+                }
+            }
+
+            if let pending = pendingRemove {
+                confirmBar(
+                    message: pending.folderExists
+                        ? "Remove \(pending.shortLabel)?"
+                        : "Prune missing \(pending.shortLabel)?"
+                ) {
+                    let target = pending
+                    pendingRemove = nil
+                    isOpen = false
+                    Task { await model.removeWorktree(target) }
+                } cancel: {
+                    pendingRemove = nil
+                }
+            } else if pendingPruneAll {
+                confirmBar(message: "Prune \(model.missingWorktreeCount) missing worktree\(model.missingWorktreeCount == 1 ? "" : "s")?") {
+                    pendingPruneAll = false
+                    isOpen = false
+                    Task { await model.pruneMissingWorktrees() }
+                } cancel: {
+                    pendingPruneAll = false
                 }
             }
 
             Divider().opacity(0.45)
 
-            Button("Reload Worktrees") {
-                Task { await model.reloadWorktrees() }
+            HStack {
+                Button("Refresh list") {
+                    Task { await model.reloadWorktrees() }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                Spacer()
+                if model.missingWorktreeCount > 0 {
+                    Button("Prune missing") {
+                        pendingRemove = nil
+                        pendingPruneAll = true
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.orange)
+                }
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
@@ -760,8 +834,132 @@ private struct WorktreeMenu: View {
         }
     }
 
+    @ViewBuilder
+    private func worktreeRow(_ worktree: GitWorktree) -> some View {
+        let isCurrent = model.currentWorktree?.id == worktree.id
+            || worktree.path.standardizedFileURL == model.repoPath?.standardizedFileURL
+        let isPrimary = WorktreeActions.isPrimary(worktree, in: model.worktrees)
+        let removeBlocked = WorktreeActions.blockedReason(
+            worktree,
+            in: model.worktrees,
+            currentPath: model.repoPath,
+            openPaths: openPaths
+        )
+
+        HStack(spacing: 8) {
+            Button {
+                guard worktree.folderExists else { return }
+                switchTo(worktree)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isCurrent ? "checkmark" : (worktree.folderExists ? "square.stack.3d.up" : "questionmark.folder"))
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(isCurrent ? Color.accentColor : (worktree.folderExists ? .secondary : Color.orange))
+                        .frame(width: 14)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(worktree.shortLabel)
+                            .font(.callout.monospaced().weight(isCurrent ? .semibold : .regular))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(worktreeRowSubtitle(worktree))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text(worktree.path.path)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                    if isCurrent {
+                        capsule("Current", color: .accentColor)
+                    }
+                    if isPrimary {
+                        capsule("Primary", color: .secondary)
+                    }
+                    if !worktree.folderExists {
+                        capsule("Missing", color: .orange)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(isCurrent ? Color.accentColor.opacity(0.14) : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(
+                            isCurrent ? Color.accentColor.opacity(0.40) : Color.clear,
+                            lineWidth: isCurrent ? 1 : 0
+                        )
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!worktree.folderExists)
+            .help(worktree.path.path)
+
+            if removeBlocked == nil {
+                Button {
+                    pendingPruneAll = false
+                    pendingRemove = worktree
+                } label: {
+                    Image(systemName: worktree.folderExists ? "trash" : "scissors")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.orange)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help(worktree.folderExists ? "Remove this linked worktree" : "Prune this missing worktree")
+            }
+        }
+    }
+
+    private func worktreeRowSubtitle(_ worktree: GitWorktree) -> String {
+        if let branch = worktree.branch, !branch.isEmpty {
+            return "HEAD \(branch)"
+        }
+        if worktree.isDetached {
+            return "HEAD detached \(String(worktree.head.prefix(8)))"
+        }
+        return "HEAD unknown"
+    }
+
+    private func capsule(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.16), in: Capsule())
+    }
+
+    private func confirmBar(
+        message: String,
+        confirm: @escaping () -> Void,
+        cancel: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 8) {
+            Text(message)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary)
+            Spacer(minLength: 8)
+            Button("Cancel", action: cancel)
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            Button("Remove", role: .destructive, action: confirm)
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.orange)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
     private func selectSoleMatchIfNeeded() {
-        guard filteredWorktrees.count == 1, let worktree = filteredWorktrees.first else { return }
+        guard filteredWorktrees.count == 1, let worktree = filteredWorktrees.first, worktree.folderExists else { return }
         switchTo(worktree)
     }
 
@@ -773,6 +971,7 @@ private struct WorktreeMenu: View {
 
 private struct CompareBranchControl: View {
     @ObservedObject var model: RepoSession
+    @State private var showAllBranches = false
 
     private var behindCount: Int {
         model.snapshot?.compareAheadCount ?? 0
@@ -788,7 +987,17 @@ private struct CompareBranchControl: View {
 
     private var badge: String? {
         guard model.snapshot != nil else { return nil }
-        return behindCount > 0 ? "↓\(behindCount)" : "✓"
+        if behindCount > 0 { return "↓\(behindCount)" }
+        if localCompareBehind > 0, compareTip != model.baseBranch {
+            return "local −\(localCompareBehind)"
+        }
+        return "✓"
+    }
+
+    private var badgeStyle: BranchBadgeStyle {
+        if behindCount > 0 { return .warning }
+        if localCompareBehind > 0, compareTip != model.baseBranch { return .neutral }
+        return .success
     }
 
     private var badgeHelp: String? {
@@ -798,11 +1007,10 @@ private struct CompareBranchControl: View {
             if localCompareBehind > 0, compareTip != model.baseBranch {
                 text += " Local \(model.baseBranch) is also \(localCompareBehind) behind \(compareTip)."
             }
-            text += " Refresh fetches remotes first."
             return text
         }
         if localCompareBehind > 0, compareTip != model.baseBranch {
-            return "\(model.selectedBranch) includes all commits from \(compareTip). Local \(model.baseBranch) is \(localCompareBehind) commit\(localCompareBehind == 1 ? "" : "s") behind \(compareTip)."
+            return "\(model.selectedBranch) already includes \(compareTip). Local \(model.baseBranch) is \(localCompareBehind) commit\(localCompareBehind == 1 ? "" : "s") behind — refreshing it does not change this branch."
         }
         return "\(model.selectedBranch) includes all commits from \(compareTip)"
     }
@@ -813,48 +1021,51 @@ private struct CompareBranchControl: View {
                 title: "Compare",
                 icon: "point.topleft.down.to.point.bottomright.curvepath",
                 value: model.baseBranch,
-                options: model.branches,
-                tipDates: model.branchTipDates,
+                displayValue: compareTip,
+                options: showAllBranches ? model.branches : model.compareBranchOptions,
+                occupancy: model.branchOccupancy,
                 emphasized: false,
                 badge: badge,
                 badgeHelp: badgeHelp,
-                badgeStyle: behindCount > 0 ? .warning : .success,
-                helpText: "Branch to compare against (merge-base)"
-            ) { model.selectBaseBranch($0) }
+                badgeStyle: badgeStyle,
+                showsSort: showAllBranches,
+                showsDetails: showAllBranches,
+                showsSearch: showAllBranches,
+                helpText: "Diff against this base. The list is main/develop unless you show all branches.",
+                footerTitle: showAllBranches ? "Show bases only" : "Show all branches",
+                onFooter: { showAllBranches.toggle() },
+                onSelect: { model.selectBaseBranch($0) }
+            )
 
-            if behindCount > 0 {
-                let sameBranch = model.selectedBranch == model.baseBranch
-                Button {
-                    Task { await model.updateFromCompare() }
-                } label: {
-                    Label("Update", systemImage: "arrow.down.circle")
-                        .font(.caption.weight(.semibold))
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(model.isLoading || model.isUpdatingFromCompare)
-                .help(
-                    sameBranch
-                        ? "Fast-forward \(model.selectedBranch) by \(behindCount) commit\(behindCount == 1 ? "" : "s") to \(compareTip)"
-                        : "Merge \(behindCount) commit\(behindCount == 1 ? "" : "s") from \(compareTip) into \(model.selectedBranch)"
-                )
-            } else if localCompareBehind > 0, compareTip != model.baseBranch {
-                Text("↓\(localCompareBehind)")
-                    .font(.caption.monospacedDigit().weight(.bold))
-                    .foregroundStyle(.orange)
-                    .help("Local \(model.baseBranch) is \(localCompareBehind) commit\(localCompareBehind == 1 ? "" : "s") behind \(compareTip). Your branch already includes those commits.")
-
-                Button {
-                    Task { await model.updateLocalCompare() }
-                } label: {
-                    Label("Update \(model.baseBranch)", systemImage: "arrow.down.circle")
-                        .font(.caption.weight(.semibold))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(model.isLoading || model.isUpdatingFromCompare)
-                .help("Fast-forward local \(model.baseBranch) by \(localCompareBehind) commit\(localCompareBehind == 1 ? "" : "s") to \(compareTip). Your branch already includes those commits.")
+            if let action = model.toolbarUpdateAction {
+                updateButton(action)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func updateButton(_ action: BranchUpdateAction) -> some View {
+        let button = Button {
+            Task { await model.performToolbarUpdate() }
+        } label: {
+            if model.isUpdatingFromCompare {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Label(action.title, systemImage: "arrow.down.circle")
+                    .font(.caption.weight(.semibold))
+                    .fixedSize()
+            }
+        }
+        .controlSize(.small)
+        .fixedSize()
+        .disabled(!action.isEnabled || model.isLoading || model.isUpdatingFromCompare)
+        .help(action.blockedReason ?? action.help)
+
+        if action.isPrimary {
+            button.buttonStyle(.borderedProminent)
+        } else {
+            button.buttonStyle(.bordered)
         }
     }
 }
@@ -877,19 +1088,32 @@ private struct BranchMenu: View {
     let title: String
     let icon: String
     let value: String
+    var displayValue: String? = nil
     let options: [String]
     var tipDates: [String: Date] = [:]
+    var tipAuthors: [String: String] = [:]
+    var occupancy: [String: String] = [:]
+    var pullRequestNumbers: [String: Int] = [:]
     let emphasized: Bool
     /// Git HEAD in this worktree — highlighted in the list when set.
     var checkedOutBranch: String? = nil
+    var subtitle: String? = nil
+    var subtitleStyle: BranchBadgeStyle = .neutral
     var badge: String? = nil
     var badgeHelp: String? = nil
     var badgeStyle: BranchBadgeStyle = .neutral
+    var showsSort: Bool = true
+    var showsDetails: Bool = true
+    var showsSearch: Bool = true
     var helpText: String = ""
+    var footerTitle: String? = nil
+    var onFooter: (() -> Void)? = nil
+    var onDelete: ((String) -> Void)? = nil
     let onSelect: (String) -> Void
 
     @State private var isOpen = false
     @State private var query = ""
+    @State private var pendingDelete: String?
     @AppStorage("BranchLens.branchSortMode") private var sortModeRaw: String = BranchSortMode.name.rawValue
 
     private var sortMode: BranchSortMode {
@@ -920,14 +1144,16 @@ private struct BranchMenu: View {
         let longest = options
             .map { ($0 as NSString).size(withAttributes: [.font: font]).width }
             .max() ?? 180
-        // Icon + paddings + Viewing/Checked out badges + optional date column.
-        let dateExtra: CGFloat = sortMode == .date ? 78 : 0
-        return min(max(ceil(longest) + 148 + dateExtra, 300), 760)
+        // Icon + paddings + badges + author + occupancy + delete + optional date.
+        let dateExtra: CGFloat = showsDetails && sortMode == .date ? 78 : 0
+        let extras: CGFloat = showsDetails ? 260 : 140
+        return min(max(ceil(longest) + extras + dateExtra, showsDetails ? 360 : 280), 820)
     }
 
     var body: some View {
         Button {
             query = ""
+            pendingDelete = nil
             isOpen.toggle()
         } label: {
             HStack(spacing: 8) {
@@ -940,7 +1166,7 @@ private struct BranchMenu: View {
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(.secondary)
                     HStack(spacing: 6) {
-                        Text(value.isEmpty ? "Select…" : value)
+                        Text((displayValue ?? value).isEmpty ? "Select…" : (displayValue ?? value))
                             .font(emphasized ? .callout.weight(.semibold) : .caption.weight(.medium))
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -953,6 +1179,13 @@ private struct BranchMenu: View {
                                 .layoutPriority(1)
                                 .help(badgeHelp ?? badge)
                         }
+                    }
+                    if let subtitle, !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(subtitleStyle.color)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
                 }
                 .frame(minWidth: emphasized ? 160 : 110, maxWidth: emphasized ? 280 : 220, alignment: .leading)
@@ -977,7 +1210,11 @@ private struct BranchMenu: View {
         .help({
             var lines: [String] = []
             if !helpText.isEmpty { lines.append(helpText) }
+            if let displayValue, displayValue != value {
+                lines.append("Using \(displayValue)")
+            }
             if !value.isEmpty { lines.append(value) }
+            if let subtitle { lines.append(subtitle) }
             if let badgeHelp { lines.append(badgeHelp) }
             return lines.joined(separator: "\n")
         }())
@@ -988,40 +1225,44 @@ private struct BranchMenu: View {
 
     private var branchPickerPopover: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-                TextField("Search branches…", text: $query)
-                    .textFieldStyle(.plain)
-                if !query.isEmpty {
-                    Button {
-                        query = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
+            if showsSearch {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search branches…", text: $query)
+                        .textFieldStyle(.plain)
+                    if !query.isEmpty {
+                        Button {
+                            query = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Clear search")
                     }
-                    .buttonStyle(.plain)
-                    .help("Clear search")
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(AppTheme.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-            Picker("Sort", selection: Binding(
-                get: { sortMode },
-                set: { sortModeRaw = $0.rawValue }
-            )) {
-                ForEach(BranchSortMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
+            if showsSort {
+                Picker("Sort", selection: Binding(
+                    get: { sortMode },
+                    set: { sortModeRaw = $0.rawValue }
+                )) {
+                    ForEach(BranchSortMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .help("Sort branches by name or newest tip date")
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .help("Sort branches by name or newest tip date")
 
             if checkedOutBranch != nil {
-                Text("Viewing is what BranchLens inspects. Checked out is git HEAD.")
+                Text("Viewing is what BranchLens inspects. HEAD is git checkout in this folder.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1034,66 +1275,44 @@ private struct BranchMenu: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 8)
             } else {
-                FittingPopoverScroll(itemCount: filteredOptions.count, rowHeight: 34, maxHeight: 280) {
+                FittingPopoverScroll(itemCount: filteredOptions.count, rowHeight: 38, maxHeight: 280) {
                     ForEach(filteredOptions, id: \.self) { branch in
-                        let isCheckedOut = checkedOutBranch == branch
-                        let isInspecting = branch == value
-                        Button {
-                            onSelect(branch)
-                            isOpen = false
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: isInspecting ? "eye.fill" : "arrow.triangle.branch")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundStyle(isInspecting ? Color.accentColor : .secondary)
-                                    .frame(width: 14)
-                                Text(branch)
-                                    .font(.callout.monospaced().weight(isInspecting ? .semibold : .regular))
-                                    .lineLimit(1)
-                                    .fixedSize(horizontal: true, vertical: false)
-                                if isInspecting {
-                                    Text("Viewing")
-                                        .font(.caption2.weight(.bold))
-                                        .foregroundStyle(Color.accentColor)
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(Color.accentColor.opacity(0.16), in: Capsule())
-                                }
-                                if isCheckedOut {
-                                    Text("Checked out")
-                                        .font(.caption2.weight(.bold))
-                                        .foregroundStyle(Color.orange)
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(Color.orange.opacity(0.16), in: Capsule())
-                                }
-                                Spacer(minLength: 0)
-                                if sortMode == .date, let date = tipDates[branch] {
-                                    Text(date, style: .relative)
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                        .fixedSize()
-                                }
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .fill(isInspecting ? Color.accentColor.opacity(0.14) : Color.clear)
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                    .strokeBorder(
-                                        isInspecting ? Color.accentColor.opacity(0.40) : Color.clear,
-                                        lineWidth: isInspecting ? 1 : 0
-                                    )
-                            )
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(branchHelp(for: branch, isCheckedOut: isCheckedOut, isInspecting: isInspecting))
+                        branchRow(branch)
                     }
                 }
+            }
+
+            if let footerTitle, let onFooter {
+                Button(footerTitle, action: onFooter)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2)
+            }
+
+            if let pendingDelete {
+                HStack(spacing: 8) {
+                    Text("Delete \(pendingDelete)? Only if it is fully merged.")
+                        .font(.caption.weight(.semibold))
+                    Spacer(minLength: 8)
+                    Button("Cancel") {
+                        self.pendingDelete = nil
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    Button("Delete", role: .destructive) {
+                        let name = pendingDelete
+                        self.pendingDelete = nil
+                        isOpen = false
+                        onDelete?(name)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color.orange)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
         }
         .padding(10)
@@ -1101,13 +1320,119 @@ private struct BranchMenu: View {
         .fixedSize(horizontal: true, vertical: true)
     }
 
+    @ViewBuilder
+    private func branchRow(_ branch: String) -> some View {
+        let isCheckedOut = checkedOutBranch == branch
+        let isInspecting = branch == value
+        let deleteBlocked = BranchDeleteRules.blockedReason(name: branch, occupiedBy: occupancy[branch])
+
+        HStack(spacing: 6) {
+            Button {
+                onSelect(branch)
+                isOpen = false
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isInspecting ? "eye.fill" : "arrow.triangle.branch")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(isInspecting ? Color.accentColor : .secondary)
+                        .frame(width: 14)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 6) {
+                            Text(branch)
+                                .font(.callout.monospaced().weight(isInspecting ? .semibold : .regular))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                            if isInspecting {
+                                Text(showsDetails ? "Viewing" : "Selected")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(Color.accentColor)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.accentColor.opacity(0.16), in: Capsule())
+                            }
+                            if isCheckedOut {
+                                Text("HEAD")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(Color.orange)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.orange.opacity(0.16), in: Capsule())
+                            }
+                            if showsDetails, let number = pullRequestNumbers[branch] {
+                                Text("#\(number)")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            if let place = occupancy[branch] {
+                                Text("in \(place)")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        if showsDetails, let author = tipAuthors[branch] {
+                            Text(author)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    if sortMode == .date, let date = tipDates[branch] {
+                        Text(date, style: .relative)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .fixedSize()
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(isInspecting ? Color.accentColor.opacity(0.14) : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(
+                            isInspecting ? Color.accentColor.opacity(0.40) : Color.clear,
+                            lineWidth: isInspecting ? 1 : 0
+                        )
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(branchHelp(for: branch, isCheckedOut: isCheckedOut, isInspecting: isInspecting))
+
+            if onDelete != nil, deleteBlocked == nil {
+                Button {
+                    pendingDelete = branch
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.orange)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.plain)
+                .help("Delete \(branch) if it is fully merged")
+            }
+        }
+    }
+
     private func branchHelp(for branch: String, isCheckedOut: Bool = false, isInspecting: Bool = false) -> String {
-        var lines: [String] = ["Inspect \(branch) in BranchLens"]
+        var lines: [String] = [
+            showsDetails ? "Inspect \(branch) in BranchLens" : "Compare against \(branch)"
+        ]
         if isInspecting { lines.append("Viewing: this is the branch in the toolbar.") }
-        if isCheckedOut { lines.append("Checked out: git HEAD in this worktree.") }
+        if isCheckedOut { lines.append("HEAD: git checkout in this folder.") }
+        if let author = tipAuthors[branch] { lines.append("Tip author: \(author)") }
+        if let place = occupancy[branch] { lines.append("Checked out in \(place)") }
+        if let number = pullRequestNumbers[branch] { lines.append("PR #\(number)") }
         if let date = tipDates[branch] {
             let formatted = date.formatted(date: .abbreviated, time: .shortened)
             lines.append("Tip: \(formatted)")
+        }
+        if let blocked = BranchDeleteRules.blockedReason(name: branch, occupiedBy: occupancy[branch]) {
+            lines.append("Can’t delete: \(blocked)")
         }
         return lines.joined(separator: "\n")
     }
@@ -1465,20 +1790,17 @@ private struct CommitsPane: View {
                     ScrollView {
                         // Non-lazy top cards stay stable; lazy only the long commit list.
                         VStack(spacing: 8) {
-                            // In sync + only local work: All changes / In sync are noise — keep Staged/Unstaged.
-                            if !showsLocalScopesOnly {
                             AllChangesCard(
                                 isSelected: model.changeScope == .combined,
                                 commitCount: model.currentHistoryCommits.count,
-                                    stagedCount: model.stagedWorkingTreeFiles.count,
-                                    unstagedCount: model.unstagedWorkingTreeFiles.count,
-                                    includeLocal: model.includeLocalChanges,
-                                    fileCount: model.allChangesDisplayedFileCount,
-                                    additions: model.allChangesDisplayedAdditions,
-                                    deletions: model.allChangesDisplayedDeletions
-                                ) {
-                                    model.selectCombined()
-                                }
+                                stagedCount: model.stagedWorkingTreeFiles.count,
+                                unstagedCount: model.unstagedWorkingTreeFiles.count,
+                                includeLocal: model.includeLocalChanges,
+                                fileCount: model.allChangesDisplayedFileCount,
+                                additions: model.allChangesDisplayedAdditions,
+                                deletions: model.allChangesDisplayedDeletions
+                            ) {
+                                model.selectCombined()
                             }
 
                             if model.includeLocalChanges {
@@ -1580,16 +1902,11 @@ private struct CommitsPane: View {
             if model.historyBrowseMode == .all, model.chronologicalCommits.isEmpty {
                 Task { await model.reloadChronologicalCommits(reset: true) }
             }
-            // Defer — mutating @Published during view update can hang SwiftUI.
-            schedulePreferLocalScopeIfNeeded()
         }
         .onChange(of: model.includeLocalChanges) { _, enabled in
             if enabled {
                 Task { await model.reloadWorkingTree() }
             }
-        }
-        .onChange(of: showsLocalScopesOnly) { _, _ in
-            schedulePreferLocalScopeIfNeeded()
         }
     }
 
@@ -1601,7 +1918,7 @@ private struct CommitsPane: View {
         )
     }
 
-    /// Branch tip matches COMPARE and History is just local work — drop All changes / In sync.
+    /// Branch tip matches COMPARE and History is just local work — hide the In sync card.
     private var showsLocalScopesOnly: Bool {
         guard model.includeLocalChanges, model.hasLocalChanges else { return false }
         guard model.uniqueFilteredCommits.isEmpty else { return false }
@@ -1611,23 +1928,6 @@ private struct CommitsPane: View {
             return true
         case .mergedPR:
             return false
-        }
-    }
-
-    private func schedulePreferLocalScopeIfNeeded() {
-        // Bounce out of the current SwiftUI transaction before publishing.
-        Task { @MainActor in
-            preferLocalScopeIfNeeded()
-        }
-    }
-
-    private func preferLocalScopeIfNeeded() {
-        guard showsLocalScopesOnly else { return }
-        guard case .combined = model.changeScope else { return }
-        if !model.unstagedWorkingTreeFiles.isEmpty {
-            model.selectUnstaged()
-        } else if !model.stagedWorkingTreeFiles.isEmpty {
-            model.selectStaged()
         }
     }
 

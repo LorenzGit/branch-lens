@@ -4,10 +4,18 @@ public struct GitBranch: Identifiable, Hashable, Sendable {
     public var id: String { name }
     public let name: String
     public let tipDate: Date
+    public let tipAuthor: String?
 
-    public init(name: String, tipDate: Date) {
+    public init(name: String, tipDate: Date, tipAuthor: String? = nil) {
         self.name = name
         self.tipDate = tipDate
+        self.tipAuthor = tipAuthor
+    }
+
+    public var isProtected: Bool { Self.isProtectedName(name) }
+
+    public static func isProtectedName(_ name: String) -> Bool {
+        ["main", "master", "develop"].contains(name)
     }
 }
 
@@ -116,6 +124,10 @@ public struct BranchSnapshot: Sendable {
     public let compareTip: String
     /// Commits on `compareTip` that are missing from the local COMPARE branch name (stale local `main`).
     public let localCompareBehindCount: Int
+    /// `branch` is an ancestor of `compareTip` (fast-forward is possible).
+    public let viewingCanFastForward: Bool
+    /// Local COMPARE name is an ancestor of `compareTip`.
+    public let localCompareCanFastForward: Bool
     /// History commits that are already on `compareTip` and only appear because local COMPARE is stale.
     public let staleCompareInheritedCommitCount: Int
     public let aheadOfRemote: Int?
@@ -136,6 +148,8 @@ public struct BranchSnapshot: Sendable {
         compareAheadCount: Int,
         compareTip: String,
         localCompareBehindCount: Int,
+        viewingCanFastForward: Bool = true,
+        localCompareCanFastForward: Bool = true,
         staleCompareInheritedCommitCount: Int = 0,
         aheadOfRemote: Int?,
         behindRemote: Int?,
@@ -151,6 +165,8 @@ public struct BranchSnapshot: Sendable {
         self.compareAheadCount = compareAheadCount
         self.compareTip = compareTip
         self.localCompareBehindCount = localCompareBehindCount
+        self.viewingCanFastForward = viewingCanFastForward
+        self.localCompareCanFastForward = localCompareCanFastForward
         self.staleCompareInheritedCommitCount = staleCompareInheritedCommitCount
         self.aheadOfRemote = aheadOfRemote
         self.behindRemote = behindRemote
@@ -268,8 +284,31 @@ public struct GitWorktree: Identifiable, Hashable, Sendable {
         self.isDetached = isDetached
     }
 
+    public var folderExists: Bool {
+        FileManager.default.fileExists(atPath: path.path)
+    }
+
+    public var isLinked: Bool {
+        let raw = path.path
+        return raw.contains("/.codex/worktrees/")
+            || raw.contains("/.codex-worktrees/")
+            || raw.contains("/.git/worktrees/")
+    }
+
+    public var shortLabel: String { Self.shortLabel(for: path) }
+
+    public static func shortLabel(for path: URL) -> String {
+        let name = path.lastPathComponent
+        let parent = path.deletingLastPathComponent()
+        let raw = path.path
+        if raw.contains("/.codex/worktrees/") || raw.contains("/.codex-worktrees/") {
+            return "\(parent.lastPathComponent)/\(name)"
+        }
+        return name
+    }
+
     public var displayName: String {
-        let folder = path.lastPathComponent
+        let folder = shortLabel
         if let branch, !branch.isEmpty {
             return "\(folder) · \(branch)"
         }

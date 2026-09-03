@@ -27,6 +27,13 @@ final class WorkspaceModel: ObservableObject {
         return tabs.first(where: { $0.id == activeTabID }) ?? tabs.first
     }
 
+    func openPaths(excluding sessionID: UUID) -> Set<String> {
+        Set(tabs.compactMap { tab in
+            guard tab.id != sessionID else { return nil }
+            return tab.repoPath?.standardizedFileURL.path
+        })
+    }
+
     init() {
         // Restore happens asynchronously from ContentView.task so UI can appear first.
     }
