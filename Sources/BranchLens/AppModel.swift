@@ -1454,7 +1454,8 @@ final class RepoSession: ObservableObject, Identifiable {
                 }
                 statusMessage = "Fast-forwarding \(selectedBranch) to \(tip)…"
                 try await git.fastForwardLocalBranch(selectedBranch, to: tip, in: repoPath)
-                await reloadSnapshot(resetScope: true, fetchFirst: false)
+                lastFetchRefreshAt = Date()
+                await reloadSnapshot(resetScope: true, fetchFirst: false, refreshPanes: true)
                 statusMessage = "Updated \(selectedBranch) to \(tip).\(fetchNote)"
             } else {
                 statusMessage = "Updating \(selectedBranch) from \(tip)…"
@@ -1463,7 +1464,8 @@ final class RepoSession: ObservableObject, Identifiable {
                 if tip != baseBranch, selectedBranch != baseBranch {
                     try? await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
                 }
-                await reloadSnapshot(resetScope: true, fetchFirst: false)
+                lastFetchRefreshAt = Date()
+                await reloadSnapshot(resetScope: true, fetchFirst: false, refreshPanes: true)
                 statusMessage = "Updated \(selectedBranch) with \(tip).\(fetchNote)"
             }
             isUpdatingFromCompare = false
@@ -1495,7 +1497,8 @@ final class RepoSession: ObservableObject, Identifiable {
             }
             statusMessage = "Fast-forwarding \(baseBranch) to \(tip)…"
             try await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
-            await reloadSnapshot(resetScope: false, fetchFirst: false)
+            lastFetchRefreshAt = Date()
+            await reloadSnapshot(resetScope: false, fetchFirst: false, refreshPanes: true)
             statusMessage = "Updated local \(baseBranch) to \(tip).\(fetchNote)"
             isUpdatingFromCompare = false
             clearStatusEventually(statusMessage)
@@ -1663,9 +1666,15 @@ final class RepoSession: ObservableObject, Identifiable {
                 let recoveryStatus = statusMessage
                 let previousBranch = snapshot?.branch
                 let previousCompareTip = snapshot?.compareTip
+                let previousMergeBase = snapshot?.mergeBase
                 snapshot = snap
-                if previousBranch != snap.branch || previousCompareTip != snap.compareTip {
+                if previousBranch != snap.branch
+                    || previousCompareTip != snap.compareTip
+                    || previousMergeBase != snap.mergeBase {
                     historyDecorations.resetPullRequestStats()
+                    allChangesWithLocalFiles = []
+                    cachedFilteredFiles = []
+                    cachedFileTree = []
                 }
                 checkedOutBranch = try? await git.currentBranch(in: repoPath)
                 selectedAuthors = selectedAuthors.filter { author in
@@ -1700,14 +1709,13 @@ final class RepoSession: ObservableObject, Identifiable {
                 if historyBrowseMode == .all {
                     await reloadChronologicalCommits(reset: true)
                 }
-                guard !Task.isCancelled else { return }
-                // Rebuild Changed files from the fresh snapshot + working tree, and
-                // force-reload file contents after fetch/refresh.
-                await reloadVisibleFiles(forceInspectorReload: shouldRefreshPanes)
-                if shouldRefreshPanes {
+                let forceFiles = shouldRefreshPanes || Task.isCancelled
+                await reloadVisibleFiles(forceInspectorReload: forceFiles)
+                if forceFiles {
                     contentRefreshNonce &+= 1
                 }
                 notifyStateChange()
+                if Task.isCancelled { return }
                 // Re-check PRs after fetch, but keep existing grouping on screen
                 // until replacements arrive (do not wipe cards first).
                 if historyBrowseMode == .current {
@@ -2360,10 +2368,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 switch changeScope {
                 case .combined:
                     if includeLocalChanges {
-                        // Net merge-base → worktree (not max of separate branch/local stats).
-                        if allChangesWithLocalFiles.isEmpty, !workingTreeFiles.isEmpty || !snapshot.files.isEmpty {
-                            await reloadAllChangesWithLocal()
-                        }
+                        await reloadAllChangesWithLocal()
                         files = allChangesWithLocalFiles
                     } else {
                         files = snapshot.files
@@ -2388,6 +2393,8 @@ final class RepoSession: ObservableObject, Identifiable {
                 // Assign a fresh array so SwiftUI always sees a Combined-files update
                 // even when paths match but stats/content changed after fetch.
                 visibleFiles = files
+                cachedFilteredFiles = []
+                cachedFileTree = []
                 syncSelection(to: files, prefer: previousSelection, preserving: previousMulti)
                 if hasMultiFileSelection {
                     // Keep multi-select panel; no single-file reload.
