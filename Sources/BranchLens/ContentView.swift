@@ -85,7 +85,7 @@ private struct SessionContainer: View {
     var body: some View {
         VStack(spacing: 0) {
             ToolbarView(model: session, workspace: workspace)
-            if session.repoPath == nil {
+            if session.snapshot == nil, session.errorMessage == nil {
                 ProgressView("Opening repository…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let error = session.errorMessage, session.snapshot == nil {
@@ -1796,6 +1796,7 @@ private struct CommitsPane: View {
                                 stagedCount: model.stagedWorkingTreeFiles.count,
                                 unstagedCount: model.unstagedWorkingTreeFiles.count,
                                 includeLocal: model.includeLocalChanges,
+                                localBelongToThisFolder: !model.viewingMatchesHEAD,
                                 fileCount: model.allChangesDisplayedFileCount,
                                 additions: model.allChangesDisplayedAdditions,
                                 deletions: model.allChangesDisplayedDeletions
@@ -2140,6 +2141,7 @@ private struct AllChangesCard: View {
     let stagedCount: Int
     let unstagedCount: Int
     let includeLocal: Bool
+    let localBelongToThisFolder: Bool
     let fileCount: Int
     let additions: Int
     let deletions: Int
@@ -2163,9 +2165,7 @@ private struct AllChangesCard: View {
                         .padding(.vertical, 2)
                         .background(tint.opacity(0.16), in: Capsule())
                 }
-                Text(includeLocal
-                     ? "Net of branch commits and local edits versus COMPARE."
-                     : "Review the whole branch as a single change set.")
+                Text(allChangesSubtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2198,9 +2198,27 @@ private struct AllChangesCard: View {
             )
         }
         .buttonStyle(.plain)
-        .help(includeLocal
-              ? "Show branch commits together with staged and unstaged local changes"
-              : "Show all branch commits as one change set")
+        .help(allChangesHelp)
+    }
+
+    private var allChangesSubtitle: String {
+        if includeLocal, localBelongToThisFolder {
+            return "Viewing versus COMPARE, plus this folder’s local edits."
+        }
+        if includeLocal {
+            return "Net of branch commits and local edits versus COMPARE."
+        }
+        return "Review the whole branch as a single change set."
+    }
+
+    private var allChangesHelp: String {
+        if includeLocal, localBelongToThisFolder {
+            return "Show Viewing versus COMPARE together with this folder’s staged and unstaged edits"
+        }
+        if includeLocal {
+            return "Show branch commits together with staged and unstaged local changes"
+        }
+        return "Show all branch commits as one change set"
     }
 }
 

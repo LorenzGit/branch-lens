@@ -19,6 +19,8 @@ final class WorkspaceModel: ObservableObject {
 
     private var saveTask: Task<Void, Never>?
     private var isRestoring = false
+    private var didRestoreGit = false
+    private var pendingTabStates: [UUID: TabSnapshot] = [:]
     private let git = GitService()
     private let github = GitHubService()
 
@@ -35,16 +37,14 @@ final class WorkspaceModel: ObservableObject {
     }
 
     init() {
-        // Restore happens asynchronously from ContentView.task so UI can appear first.
+        installRestoredTabs()
     }
 
-    func restoreIfNeeded() async {
-        guard !isRestoring, tabs.isEmpty else { return }
+    /// Put last-open tabs on screen before any git work, so launch does not flash the empty welcome view.
+    private func installRestoredTabs() {
         guard let snapshot = SessionPersistence.load(), !snapshot.tabs.isEmpty else { return }
 
         isRestoring = true
-        defer { isRestoring = false }
-
         historyWidth = CGFloat(snapshot.historyWidth).clamped(to: 200...500)
         filesWidth = CGFloat(snapshot.filesWidth).clamped(to: 220...560)
 
@@ -52,7 +52,7 @@ final class WorkspaceModel: ObservableObject {
         for tab in snapshot.tabs {
             let url = URL(fileURLWithPath: tab.repoPath)
             let exists = FileManager.default.fileExists(atPath: url.path)
-            let recovered = GitRemoteIdentity.recoverLiveRepository(
+            let recovered = exists ? nil : GitRemoteIdentity.recoverLiveRepository(
                 from: url,
                 knownPaths: RecentRepos.load() + [
                     FileManager.default.homeDirectoryForCurrentUser
@@ -63,10 +63,12 @@ final class WorkspaceModel: ObservableObject {
             guard exists || recovered != nil else { continue }
             let session = RepoSession(id: tab.id)
             session.onStateChange = { [weak self] in self?.scheduleSave() }
-            await session.restore(from: tab)
-            if session.repoPath != nil {
-                restored.append(session)
-            }
+            session.applyRestoredChrome(
+                from: tab,
+                repoURL: exists ? url.standardizedFileURL : recovered!
+            )
+            pendingTabStates[tab.id] = tab
+            restored.append(session)
         }
 
         tabs = restored
@@ -75,7 +77,41 @@ final class WorkspaceModel: ObservableObject {
         } else {
             activeTabID = restored.first?.id
         }
+        if restored.isEmpty {
+            isRestoring = false
+        }
+    }
+
+    func restoreIfNeeded() async {
+        guard !didRestoreGit else { return }
+        didRestoreGit = true
+        guard !pendingTabStates.isEmpty else {
+            isRestoring = false
+            return
+        }
+
+        defer {
+            pendingTabStates.removeAll()
+            isRestoring = false
+            saveNow()
+        }
+
+        if let activeID = activeTabID, let active = tabs.first(where: { $0.id == activeID }) {
+            await restorePendingSession(active)
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for session in tabs where session.id != activeTabID {
+                group.addTask { @MainActor in
+                    await self.restorePendingSession(session)
+                }
+            }
+        }
         recentRepos = RecentRepos.load()
+    }
+
+    private func restorePendingSession(_ session: RepoSession) async {
+        guard let state = pendingTabStates[session.id] else { return }
+        await session.restore(from: state)
     }
 
     func selectTab(_ id: UUID) {

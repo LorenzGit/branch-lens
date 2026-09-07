@@ -319,7 +319,10 @@ final class RepoSession: ObservableObject, Identifiable {
         )
     }
 
-    func restore(from state: TabSnapshot) async {
+    func applyRestoredChrome(from state: TabSnapshot, repoURL: URL) {
+        repoPath = repoURL
+        selectedBranch = state.selectedBranch
+        baseBranch = state.baseBranch
         showHistory = state.showHistory
         showFiles = state.showFiles
         filesLayout = FilesLayoutMode(rawValue: state.filesLayout) ?? .folders
@@ -328,6 +331,14 @@ final class RepoSession: ObservableObject, Identifiable {
         fileNameQuery = state.fileNameQuery
         selectedFileID = state.selectedFileID
         includeLocalChanges = state.includeLocalChanges ?? false
+        isLoading = true
+    }
+
+    func restore(from state: TabSnapshot) async {
+        applyRestoredChrome(
+            from: state,
+            repoURL: resolvedLiveRepoURL(from: URL(fileURLWithPath: state.repoPath))
+        )
 
         await openRepository(
             at: resolvedLiveRepoURL(from: URL(fileURLWithPath: state.repoPath)),
@@ -439,6 +450,18 @@ final class RepoSession: ObservableObject, Identifiable {
 
     var hasLocalChanges: Bool {
         !workingTreeFiles.isEmpty
+    }
+
+    /// This folder’s checkout is the branch Viewing is inspecting.
+    var viewingMatchesHEAD: Bool {
+        guard let checkedOut = checkedOutBranch, !checkedOut.isEmpty else { return false }
+        return checkedOut == selectedBranch
+    }
+
+    /// Net merge-base → worktree is only valid when Viewing is HEAD.
+    /// Otherwise All changes is Viewing…Compare plus this folder’s local files.
+    var mergeLocalIntoAllChanges: Bool {
+        includeLocalChanges && viewingMatchesHEAD
     }
 
     var currentWorktree: GitWorktree? {
@@ -1318,17 +1341,25 @@ final class RepoSession: ObservableObject, Identifiable {
         await workingTreeTask?.value
     }
 
-    /// Refresh net All-changes file list (merge-base → worktree).
+    /// Refresh All-changes files: merge-base → worktree when Viewing is HEAD, else Viewing ∪ local.
     private func reloadAllChangesWithLocal() async {
         guard includeLocalChanges, let snap = snapshot else {
             if !allChangesWithLocalFiles.isEmpty { allChangesWithLocalFiles = [] }
             return
         }
         do {
-            let files = try await git.changedFilesToWorktree(
-                in: snap.repoPath,
-                from: snap.mergeBase
-            )
+            let files: [ChangedFile]
+            if viewingMatchesHEAD {
+                files = try await git.changedFilesToWorktree(
+                    in: snap.repoPath,
+                    from: snap.mergeBase
+                )
+            } else {
+                files = AllChangesFiles.viewingPlusLocal(
+                    branchFiles: snap.files,
+                    workingTreeFiles: workingTreeFiles
+                )
+            }
             if files != allChangesWithLocalFiles {
                 allChangesWithLocalFiles = files
             }
@@ -2743,13 +2774,21 @@ final class RepoSession: ObservableObject, Identifiable {
         } else {
             localMarker = "clean"
         }
+        let localMode: String
+        if mergeLocalIntoAllChanges {
+            localMode = "inclocal"
+        } else if includeLocalChanges {
+            localMode = "local-union"
+        } else {
+            localMode = "nolocal"
+        }
         return [
             snapshot.repoPath.path,
             snapshot.branch,
             snapshot.baseBranch,
             snapshot.mergeBase,
             changeScope.cacheKeyPart,
-            includeLocalChanges ? "inclocal" : "nolocal",
+            localMode,
             localMarker,
             file.path,
             file.oldPath ?? "",
@@ -2866,8 +2905,8 @@ final class RepoSession: ObservableObject, Identifiable {
         switch scope {
         case .combined:
             if let snap {
-                // Include-local All changes is always merge-base → worktree (net).
-                if includeLocalChanges {
+                // Local edits are this folder. Only fold them in when Viewing is HEAD.
+                if mergeLocalIntoAllChanges {
                     async let diffTask = git.worktreeDiff(
                         in: repoPath,
                         from: snap.mergeBase,
@@ -2883,6 +2922,25 @@ final class RepoSession: ObservableObject, Identifiable {
                         (beforeImage, afterImage) = try await (beforeImageTask, afterImageTask)
                     }
                     beforeName = "\(snap.baseBranch) @ \(snap.mergeBaseShort)"
+                    afterName = "Working tree"
+                } else if includeLocalChanges,
+                          workingTreeFiles.contains(where: { $0.path == file.path }),
+                          !snap.files.contains(where: { $0.path == file.path }) {
+                    async let diffTask = git.worktreeDiff(
+                        in: repoPath,
+                        from: "HEAD",
+                        path: afterPath,
+                        oldPath: file.oldPath
+                    )
+                    async let beforeTask = git.fileContents(in: repoPath, revision: "HEAD", path: beforePath)
+                    async let afterTask = git.workingTreeFileContents(in: repoPath, path: afterPath)
+                    (diff, before, after) = try await (diffTask, beforeTask, afterTask)
+                    if wantsImages {
+                        async let beforeImageTask = git.fileData(in: repoPath, revision: "HEAD", path: beforePath)
+                        async let afterImageTask = git.workingTreeFileData(in: repoPath, path: afterPath)
+                        (beforeImage, afterImage) = try await (beforeImageTask, afterImageTask)
+                    }
+                    beforeName = "HEAD"
                     afterName = "Working tree"
                 } else {
                     async let diffTask = git.fileDiff(
