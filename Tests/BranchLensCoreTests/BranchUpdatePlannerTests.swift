@@ -73,6 +73,24 @@ final class BranchUpdatePlannerTests: XCTestCase {
         )
         XCTAssertEqual(action?.kind, .fastForwardViewing)
         XCTAssertTrue(action?.isPrimary ?? false)
+        XCTAssertTrue(action?.isEnabled ?? false)
+    }
+
+    func testFastForwardStaysEnabledWhenThisFolderIsDirty() {
+        let action = BranchUpdatePlanner.action(
+            viewing: "main",
+            compare: "main",
+            compareTip: "origin/main",
+            viewingBehind: 6,
+            localCompareBehind: 6,
+            checkedOutBranch: "main",
+            hasLocalChanges: true,
+            viewingOccupiedBy: nil,
+            compareOccupiedBy: nil
+        )
+        XCTAssertEqual(action?.kind, .fastForwardViewing)
+        XCTAssertTrue(action?.isEnabled ?? false)
+        XCTAssertNil(action?.blockedReason)
     }
 
     func testRefreshLocalCompareWhenViewingAlreadyIncludesTip() {

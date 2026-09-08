@@ -69,15 +69,11 @@ public enum BranchUpdatePlanner {
                         isPrimary: true
                     )
                 }
-                var blocked = occupied
-                if blocked == nil, checkedOutBranch == viewing, hasLocalChanges {
-                    blocked = "Uncommitted changes in this folder. Commit or stash first."
-                }
                 return BranchUpdateAction(
                     kind: .fastForwardViewing,
                     title: "Fast-forward \(viewing)",
-                    help: "Fast-forward \(viewing) by \(viewingBehind) commit\(viewingBehind == 1 ? "" : "s") to \(compareTip).",
-                    blockedReason: blocked,
+                    help: "Fast-forward \(viewing) by \(viewingBehind) commit\(viewingBehind == 1 ? "" : "s") to \(compareTip). Local edits are stashed for the update and reapplied.",
+                    blockedReason: occupied,
                     isPrimary: true
                 )
             }

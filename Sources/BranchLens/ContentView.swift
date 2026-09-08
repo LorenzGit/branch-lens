@@ -378,7 +378,13 @@ private struct ToolbarView: View {
 
                     Spacer(minLength: 8)
 
-                    if let error = model.workingTreeError {
+                    if let error = model.errorMessage {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(Color.orange)
+                            .lineLimit(2)
+                            .help(error)
+                    } else if let error = model.workingTreeError {
                         Text(error)
                             .font(.caption)
                             .foregroundStyle(Color.orange)

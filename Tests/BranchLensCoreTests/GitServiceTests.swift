@@ -444,6 +444,50 @@ final class GitServiceTests: XCTestCase {
         )
     }
 
+    func testFastForwardKeepsUnrelatedLocalEdits() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-ff-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+
+        try "base\n".write(to: root.appendingPathComponent("readme.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        try await run(in: root, "/usr/bin/git", "checkout", "-b", "incoming")
+        try "incoming\n".write(to: root.appendingPathComponent("new.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "add incoming")
+        try await run(in: root, "/usr/bin/git", "checkout", "main")
+
+        try "local only\n".write(to: root.appendingPathComponent("scratch.txt"), atomically: true, encoding: .utf8)
+        let git = GitService()
+        try await git.fastForwardLocalBranch("main", to: "incoming", in: root)
+
+        let head = try await runCapture(in: root, "/usr/bin/git", "rev-parse", "--abbrev-ref", "HEAD")
+        XCTAssertEqual(head, "main")
+        let local = try String(contentsOf: root.appendingPathComponent("scratch.txt"), encoding: .utf8)
+        XCTAssertEqual(local, "local only\n")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("new.txt").path))
+    }
+
+    private func runCapture(in directory: URL, _ executable: String, _ args: String...) async throws -> String {
+        let result = try await ProcessRunner.run(
+            executable: URL(fileURLWithPath: executable),
+            arguments: args,
+            currentDirectory: directory
+        )
+        if result.status != 0 {
+            XCTFail(result.stderrText)
+            throw GitError.commandFailed(result.stderrText)
+        }
+        return result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func run(in directory: URL, _ executable: String, _ args: String...) async throws {
         let result = try await ProcessRunner.run(
             executable: URL(fileURLWithPath: executable),

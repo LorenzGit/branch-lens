@@ -125,12 +125,14 @@ public actor GitService {
     }
 
     /// Fast-forward a local branch ref to `tip` without switching branches when possible.
-    public func fastForwardLocalBranch(_ branch: String, to tip: String, in repo: URL) async throws {
+    /// Returns a leftover-stash warning when local edits could not be reapplied.
+    @discardableResult
+    public func fastForwardLocalBranch(_ branch: String, to tip: String, in repo: URL) async throws -> String? {
         let branchSHA = try await runGit(["rev-parse", branch], in: repo)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let tipSHA = try await runGit(["rev-parse", tip], in: repo)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if branchSHA == tipSHA { return }
+        if branchSHA == tipSHA { return nil }
 
         let ancestor = try await ProcessRunner.run(
             executable: gitURL,
@@ -145,12 +147,35 @@ public actor GitService {
 
         let current = try await currentBranch(in: repo)
         if current == branch {
-            guard try await isWorkingTreeClean(in: repo) else {
-                throw GitError.commandFailed(
-                    "Working tree has uncommitted changes. Commit or stash before updating “\(branch)”."
+            let dirty = !(try await isWorkingTreeClean(in: repo))
+            if dirty {
+                _ = try await runGit(
+                    [
+                        "stash", "push", "--include-untracked",
+                        "--message", "BranchLens fast-forward \(branch)",
+                    ],
+                    in: repo
                 )
             }
-            _ = try await runGit(["merge", "--ff-only", tip], in: repo)
+            do {
+                _ = try await runGit(["merge", "--ff-only", tip], in: repo)
+            } catch {
+                if dirty {
+                    _ = try? await runGit(["stash", "pop"], in: repo)
+                }
+                throw error
+            }
+            if dirty {
+                let pop = try await ProcessRunner.run(
+                    executable: gitURL,
+                    arguments: ["stash", "pop"],
+                    currentDirectory: repo
+                )
+                if pop.status != 0 {
+                    return "Local edits are still in git stash — pop failed after the update."
+                }
+            }
+            return nil
         } else {
             if let occupant = try await listWorktrees(in: repo).first(where: {
                 $0.folderExists
@@ -163,6 +188,7 @@ public actor GitService {
             }
             // Update the ref in place so we don't disturb the checked-out feature branch.
             _ = try await runGit(["update-ref", "refs/heads/\(branch)", tipSHA], in: repo)
+            return nil
         }
     }
 

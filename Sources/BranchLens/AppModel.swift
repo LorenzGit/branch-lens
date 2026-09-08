@@ -1484,16 +1484,21 @@ final class RepoSession: ObservableObject, Identifiable {
                     return
                 }
                 statusMessage = "Fast-forwarding \(selectedBranch) to \(tip)…"
-                try await git.fastForwardLocalBranch(selectedBranch, to: tip, in: repoPath)
+                let leftover = try await git.fastForwardLocalBranch(selectedBranch, to: tip, in: repoPath)
                 lastFetchRefreshAt = Date()
                 await reloadSnapshot(resetScope: true, fetchFirst: false, refreshPanes: true)
-                statusMessage = "Updated \(selectedBranch) to \(tip).\(fetchNote)"
+                if let leftover, !leftover.isEmpty {
+                    errorMessage = leftover
+                    statusMessage = "Updated \(selectedBranch) to \(tip).\(fetchNote)"
+                } else {
+                    statusMessage = "Updated \(selectedBranch) to \(tip).\(fetchNote)"
+                }
             } else {
                 statusMessage = "Updating \(selectedBranch) from \(tip)…"
                 try await git.merge(source: tip, into: selectedBranch, in: repoPath)
                 // Don't rewrite the branch we just merged into (e.g. diverged main).
                 if tip != baseBranch, selectedBranch != baseBranch {
-                    try? await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
+                    _ = try? await git.fastForwardLocalBranch(baseBranch, to: tip, in: repoPath)
                 }
                 lastFetchRefreshAt = Date()
                 await reloadSnapshot(resetScope: true, fetchFirst: false, refreshPanes: true)
