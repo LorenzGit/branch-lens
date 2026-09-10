@@ -335,6 +335,9 @@ private struct ToolbarView: View {
                         tipDates: model.branchTipDates,
                         tipAuthors: model.branchTipAuthors,
                         occupancy: model.branchOccupancy,
+                        branchByName: model.branchByName,
+                        compareTip: model.snapshot?.compareTip,
+                        branchRangeStats: model.branchRangeStats,
                         pullRequestNumbers: model.branchPullRequestNumbers,
                         emphasized: true,
                         checkedOutBranch: model.checkedOutBranch,
@@ -345,6 +348,7 @@ private struct ToolbarView: View {
                         badgeStyle: upstreamBadgeStyle(for: model.snapshot),
                         helpText: viewingHelp,
                         onDelete: { name in Task { await model.deleteLocalBranch(name) } },
+                        onNeedRangeStats: { names in Task { await model.ensureBranchRangeStats(for: names) } },
                         onSelect: { model.selectBranch($0) }
                     )
 
@@ -1030,6 +1034,9 @@ private struct CompareBranchControl: View {
                 displayValue: compareTip,
                 options: showAllBranches ? model.branches : model.compareBranchOptions,
                 occupancy: model.branchOccupancy,
+                branchByName: model.branchByName,
+                compareTip: compareTip,
+                branchRangeStats: model.branchRangeStats,
                 emphasized: false,
                 badge: badge,
                 badgeHelp: badgeHelp,
@@ -1040,6 +1047,7 @@ private struct CompareBranchControl: View {
                 helpText: "Diff against this base. The list is main/develop unless you show all branches.",
                 footerTitle: showAllBranches ? "Show bases only" : "Show all branches",
                 onFooter: { showAllBranches.toggle() },
+                onNeedRangeStats: { names in Task { await model.ensureBranchRangeStats(for: names) } },
                 onSelect: { model.selectBaseBranch($0) }
             )
 
@@ -1099,6 +1107,9 @@ private struct BranchMenu: View {
     var tipDates: [String: Date] = [:]
     var tipAuthors: [String: String] = [:]
     var occupancy: [String: String] = [:]
+    var branchByName: [String: GitBranch] = [:]
+    var compareTip: String? = nil
+    var branchRangeStats: [String: CommitChangeStats] = [:]
     var pullRequestNumbers: [String: Int] = [:]
     let emphasized: Bool
     /// Git HEAD in this worktree — highlighted in the list when set.
@@ -1115,6 +1126,7 @@ private struct BranchMenu: View {
     var footerTitle: String? = nil
     var onFooter: (() -> Void)? = nil
     var onDelete: ((String) -> Void)? = nil
+    var onNeedRangeStats: (([String]) -> Void)? = nil
     let onSelect: (String) -> Void
 
     @State private var isOpen = false
@@ -1152,7 +1164,7 @@ private struct BranchMenu: View {
             .max() ?? 180
         // Icon + paddings + badges + author + occupancy + delete + optional date.
         let dateExtra: CGFloat = showsDetails && sortMode == .date ? 78 : 0
-        let extras: CGFloat = showsDetails ? 260 : 140
+        let extras: CGFloat = showsDetails ? 360 : 200
         return min(max(ceil(longest) + extras + dateExtra, showsDetails ? 360 : 280), 820)
     }
 
@@ -1224,8 +1236,19 @@ private struct BranchMenu: View {
             if let badgeHelp { lines.append(badgeHelp) }
             return lines.joined(separator: "\n")
         }())
+        .contextMenu {
+            if !value.isEmpty {
+                Button("Copy Branch Path") {
+                    copyBranchPath(value)
+                }
+            }
+        }
         .popover(isPresented: $isOpen, arrowEdge: .bottom) {
             branchPickerPopover
+                .onAppear { onNeedRangeStats?(filteredOptions) }
+                .onChange(of: filteredOptions) { _, names in
+                    onNeedRangeStats?(names)
+                }
         }
     }
 
@@ -1369,6 +1392,7 @@ private struct BranchMenu: View {
                                     .font(.caption2.weight(.bold))
                                     .foregroundStyle(.secondary)
                             }
+                            branchStatusBadges(branchByName[branch])
                             if let place = occupancy[branch] {
                                 Text("in \(place)")
                                     .font(.caption2)
@@ -1376,8 +1400,8 @@ private struct BranchMenu: View {
                                     .lineLimit(1)
                             }
                         }
-                        if showsDetails, let author = tipAuthors[branch] {
-                            Text(author)
+                        if showsDetails, let line = branchSubtitle(branchByName[branch], fallbackAuthor: tipAuthors[branch]) {
+                            Text(line)
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                                 .lineLimit(1)
@@ -1422,6 +1446,67 @@ private struct BranchMenu: View {
                 .help("Delete \(branch) if it is fully merged")
             }
         }
+        .contextMenu {
+            Button("Copy Branch Path") {
+                copyBranchPath(branch)
+            }
+        }
+    }
+
+    private func copyBranchPath(_ name: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(name, forType: .string)
+    }
+
+    @ViewBuilder
+    private func branchStatusBadges(_ info: GitBranch?) -> some View {
+        let stats = info.flatMap { branchRangeStats[$0.name] }
+        if let info {
+            if info.upstreamGone {
+                Text("gone")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Color.orange)
+            }
+            if let stats {
+                Text("\(stats.fileCount)f")
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(.secondary)
+                Text("+\(stats.additions)")
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(AppTheme.additionText)
+                Text("−\(stats.deletions)")
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(AppTheme.deletionText)
+            }
+            if let behind = info.behindOfCompare, behind > 0 {
+                Text("↓\(behind)")
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(Color.orange)
+            } else if info.behindOfCompare == nil, info.behindOfUpstream > 0 {
+                Text("↓\(info.behindOfUpstream)")
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(Color.orange)
+            }
+            if info.aheadOfCompare != nil,
+               info.behindOfUpstream > 0,
+               let upstream = info.upstream,
+               upstream != compareTip {
+                Text("stale ↓\(info.behindOfUpstream)")
+                    .font(.caption2.monospacedDigit().weight(.bold))
+                    .foregroundStyle(Color.orange)
+            }
+        }
+    }
+
+    private func branchSubtitle(_ info: GitBranch?, fallbackAuthor: String?) -> String? {
+        var parts: [String] = []
+        if let author = info?.tipAuthor ?? fallbackAuthor, !author.isEmpty {
+            parts.append(author)
+        }
+        if let subject = info?.tipSubject, !subject.isEmpty {
+            parts.append(subject)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private func branchHelp(for branch: String, isCheckedOut: Bool = false, isInspecting: Bool = false) -> String {
@@ -1430,6 +1515,36 @@ private struct BranchMenu: View {
         ]
         if isInspecting { lines.append("Viewing: this is the branch in the toolbar.") }
         if isCheckedOut { lines.append("HEAD: git checkout in this folder.") }
+        if let info = branchByName[branch] {
+            if let hash = info.shortHash { lines.append(hash) }
+            if let subject = info.tipSubject { lines.append(subject) }
+            if info.upstreamGone {
+                lines.append("Upstream is gone.")
+            } else if let upstream = info.upstream {
+                if info.aheadOfUpstream > 0 {
+                    lines.append("\(info.aheadOfUpstream) unpushed versus \(upstream).")
+                }
+                if info.behindOfUpstream > 0 {
+                    lines.append("\(info.behindOfUpstream) behind \(upstream).")
+                }
+                if info.aheadOfUpstream == 0, info.behindOfUpstream == 0 {
+                    lines.append("In sync with \(upstream).")
+                }
+            }
+            if let ahead = info.aheadOfCompare, let behind = info.behindOfCompare {
+                let tip = compareTip ?? "Compare"
+                if ahead == 0, behind == 0 {
+                    lines.append("No unique commits versus \(tip).")
+                } else {
+                    if ahead > 0 { lines.append("\(ahead) commit\(ahead == 1 ? "" : "s") ahead of \(tip).") }
+                    if behind > 0 { lines.append("\(behind) commit\(behind == 1 ? "" : "s") behind \(tip).") }
+                }
+            }
+            if let stats = branchRangeStats[branch] {
+                let tip = compareTip ?? "Compare"
+                lines.append("\(stats.fileCount) file\(stats.fileCount == 1 ? "" : "s"), +\(stats.additions) −\(stats.deletions) versus \(tip).")
+            }
+        }
         if let author = tipAuthors[branch] { lines.append("Tip author: \(author)") }
         if let place = occupancy[branch] { lines.append("Checked out in \(place)") }
         if let number = pullRequestNumbers[branch] { lines.append("PR #\(number)") }

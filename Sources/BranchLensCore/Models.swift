@@ -5,11 +5,59 @@ public struct GitBranch: Identifiable, Hashable, Sendable {
     public let name: String
     public let tipDate: Date
     public let tipAuthor: String?
+    public let shortHash: String?
+    public let tipSubject: String?
+    public let upstream: String?
+    public let upstreamGone: Bool
+    public let aheadOfUpstream: Int
+    public let behindOfUpstream: Int
+    public let aheadOfCompare: Int?
+    public let behindOfCompare: Int?
 
-    public init(name: String, tipDate: Date, tipAuthor: String? = nil) {
+    public init(
+        name: String,
+        tipDate: Date,
+        tipAuthor: String? = nil,
+        shortHash: String? = nil,
+        tipSubject: String? = nil,
+        upstream: String? = nil,
+        upstreamGone: Bool = false,
+        aheadOfUpstream: Int = 0,
+        behindOfUpstream: Int = 0,
+        aheadOfCompare: Int? = nil,
+        behindOfCompare: Int? = nil
+    ) {
         self.name = name
         self.tipDate = tipDate
         self.tipAuthor = tipAuthor
+        self.shortHash = shortHash
+        self.tipSubject = tipSubject
+        self.upstream = upstream
+        self.upstreamGone = upstreamGone
+        self.aheadOfUpstream = aheadOfUpstream
+        self.behindOfUpstream = behindOfUpstream
+        self.aheadOfCompare = aheadOfCompare
+        self.behindOfCompare = behindOfCompare
+    }
+
+    public static func parseUpstreamTrack(_ raw: String) -> (gone: Bool, ahead: Int, behind: Int) {
+        let text = raw.trimmingCharacters(in: CharacterSet(charactersIn: "[] \t"))
+        if text.localizedCaseInsensitiveContains("gone") {
+            return (true, 0, 0)
+        }
+        return (false, intAfter("ahead", in: text), intAfter("behind", in: text))
+    }
+
+    public static func parseAheadBehind(_ raw: String) -> (ahead: Int, behind: Int)? {
+        let parts = raw.split(whereSeparator: \.isWhitespace).compactMap { Int($0) }
+        guard parts.count == 2 else { return nil }
+        return (parts[0], parts[1])
+    }
+
+    private static func intAfter(_ label: String, in text: String) -> Int {
+        guard let range = text.range(of: "\(label) ") else { return 0 }
+        let digits = text[range.upperBound...].prefix(while: \.isNumber)
+        return Int(digits) ?? 0
     }
 
     public var isProtected: Bool { Self.isProtectedName(name) }
@@ -60,6 +108,22 @@ public struct CommitChangeStats: Hashable, Sendable {
         self.fileCount = fileCount
         self.additions = additions
         self.deletions = deletions
+    }
+
+    /// `git diff --shortstat` / `git show --shortstat` summary line.
+    public static func parseShortStat(_ raw: String) -> CommitChangeStats {
+        CommitChangeStats(
+            fileCount: intBefore(" file", in: raw),
+            additions: intBefore(" insertion", in: raw),
+            deletions: intBefore(" deletion", in: raw)
+        )
+    }
+
+    private static func intBefore(_ token: String, in text: String) -> Int {
+        guard let range = text.range(of: token) else { return 0 }
+        let prefix = text[text.startIndex..<range.lowerBound]
+        let digits = prefix.reversed().prefix(while: \.isNumber)
+        return Int(String(digits.reversed())) ?? 0
     }
 }
 

@@ -125,6 +125,12 @@ final class RepoSession: ObservableObject, Identifiable {
             return (record.name, author)
         })
     }
+    var branchByName: [String: GitBranch] {
+        Dictionary(uniqueKeysWithValues: branchRecords.map { ($0.name, $0) })
+    }
+    @Published private(set) var branchRangeStats: [String: CommitChangeStats] = [:]
+    private var branchRangeStatsCompareTip: String?
+    private var branchRangeStatsLoading: Set<String> = []
     /// branch → worktree labels that have it checked out.
     var branchOccupancy: [String: String] {
         var labels: [String: [String]] = [:]
@@ -757,6 +763,41 @@ final class RepoSession: ObservableObject, Identifiable {
             )
         } catch {
             historyDecorations.unmarkPullRequestStatsResolved(number)
+        }
+    }
+
+    /// Lazy files/+/- versus Compare for branch picker rows. One shortstat per branch, as the menu opens.
+    func ensureBranchRangeStats(for branches: [String]) async {
+        guard let repoPath else { return }
+        let tip = snapshot?.compareTip ?? (baseBranch.isEmpty ? nil : baseBranch)
+        guard let tip, !tip.isEmpty else { return }
+        if branchRangeStatsCompareTip != tip {
+            branchRangeStats = [:]
+            branchRangeStatsCompareTip = tip
+            branchRangeStatsLoading = []
+        }
+        if let snap = snapshot, branches.contains(snap.branch), branchRangeStats[snap.branch] == nil {
+            branchRangeStats[snap.branch] = CommitChangeStats(
+                fileCount: snap.files.count,
+                additions: snap.totalAdditions,
+                deletions: snap.totalDeletions
+            )
+        }
+        let needed = branches.filter { name in
+            !name.isEmpty
+                && branchRangeStats[name] == nil
+                && !branchRangeStatsLoading.contains(name)
+        }
+        guard !needed.isEmpty else { return }
+        branchRangeStatsLoading.formUnion(needed)
+        for name in needed {
+            do {
+                let stats = try await git.rangeChangeStats(in: repoPath, from: tip, to: name)
+                branchRangeStats[name] = stats
+            } catch {
+                // Leave blank; don't retry in this compare-tip session.
+            }
+            branchRangeStatsLoading.remove(name)
         }
     }
 
@@ -1564,7 +1605,9 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func refreshBranchRecords(in repoPath: URL) async throws {
-        branchRecords = try await git.listBranches(in: repoPath)
+        let versus = snapshot?.compareTip
+            ?? (baseBranch.isEmpty ? nil : "origin/\(baseBranch)")
+        branchRecords = try await git.listBranches(in: repoPath, versus: versus)
     }
 
     private func loadSnapshotRecoveringMissingRevisions(in repoPath: URL) async throws -> BranchSnapshot {
@@ -1704,6 +1747,7 @@ final class RepoSession: ObservableObject, Identifiable {
                 let previousCompareTip = snapshot?.compareTip
                 let previousMergeBase = snapshot?.mergeBase
                 snapshot = snap
+                try? await refreshBranchRecords(in: repoPath)
                 if previousBranch != snap.branch
                     || previousCompareTip != snap.compareTip
                     || previousMergeBase != snap.mergeBase {
@@ -1711,6 +1755,9 @@ final class RepoSession: ObservableObject, Identifiable {
                     allChangesWithLocalFiles = []
                     cachedFilteredFiles = []
                     cachedFileTree = []
+                    branchRangeStats = [:]
+                    branchRangeStatsCompareTip = nil
+                    branchRangeStatsLoading = []
                 }
                 checkedOutBranch = try? await git.currentBranch(in: repoPath)
                 selectedAuthors = selectedAuthors.filter { author in

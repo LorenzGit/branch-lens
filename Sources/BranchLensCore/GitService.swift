@@ -18,11 +18,16 @@ public actor GitService {
         return URL(fileURLWithPath: root)
     }
 
-    public func listBranches(in repo: URL) async throws -> [GitBranch] {
+    public func listBranches(in repo: URL, versus compareTip: String? = nil) async throws -> [GitBranch] {
+        let compare = await verifiedCompareTip(compareTip, in: repo)
+        var format = "%(refname:short)%00%(committerdate:iso8601-strict)%00%(authorname)%00%(objectname:short)%00%(contents:subject)%00%(upstream:short)%00%(upstream:track)"
+        if let compare {
+            format += "%00%(ahead-behind:\(compare))"
+        }
         let output = try await runGit(
             [
                 "for-each-ref",
-                "--format=%(refname:short)%00%(committerdate:iso8601-strict)%00%(authorname)",
+                "--format=\(format)",
                 "--sort=refname",
                 "refs/heads/",
             ],
@@ -31,19 +36,43 @@ public actor GitService {
         return output
             .split(whereSeparator: \.isNewline)
             .compactMap { line -> GitBranch? in
-                let parts = line.split(separator: "\0", maxSplits: 2, omittingEmptySubsequences: false)
-                guard let namePart = parts.first else { return nil }
-                let name = String(namePart).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !name.isEmpty else { return nil }
-                let dateString = parts.count > 1 ? String(parts[1]) : ""
-                let author = parts.count > 2
-                    ? String(parts[2]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    : ""
+                let parts = line.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
+                guard let name = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else {
+                    return nil
+                }
+                let dateString = parts.count > 1 ? parts[1] : ""
+                let author = parts.count > 2 ? parts[2].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                let shortHash = parts.count > 3 ? parts[3].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                let subject = parts.count > 4 ? parts[4].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                let upstream = parts.count > 5 ? parts[5].trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                let track = GitBranch.parseUpstreamTrack(parts.count > 6 ? parts[6] : "")
+                let versus = parts.count > 7 ? GitBranch.parseAheadBehind(parts[7]) : nil
                 return GitBranch(
                     name: name,
                     tipDate: Self.parseGitDate(dateString),
-                    tipAuthor: author.isEmpty ? nil : author
+                    tipAuthor: author.isEmpty ? nil : author,
+                    shortHash: shortHash.isEmpty ? nil : shortHash,
+                    tipSubject: subject.isEmpty ? nil : subject,
+                    upstream: upstream.isEmpty ? nil : upstream,
+                    upstreamGone: track.gone,
+                    aheadOfUpstream: track.ahead,
+                    behindOfUpstream: track.behind,
+                    aheadOfCompare: versus?.ahead,
+                    behindOfCompare: versus?.behind
                 )
+            }
+    }
+
+    private func verifiedCompareTip(_ compareTip: String?, in repo: URL) async -> String? {
+        guard let compareTip, Self.isSafeRefFormat(compareTip) else { return nil }
+        return await hasRevision(compareTip, in: repo) ? compareTip : nil
+    }
+
+    private static func isSafeRefFormat(_ name: String) -> Bool {
+        !name.isEmpty
+            && name.unicodeScalars.allSatisfy { scalar in
+                CharacterSet.alphanumerics.contains(scalar)
+                    || "-_./@".unicodeScalars.contains(scalar)
             }
     }
 
@@ -433,6 +462,15 @@ public actor GitService {
             deletions += Int(parts[1]) ?? 0
         }
         return CommitChangeStats(fileCount: fileCount, additions: additions, deletions: deletions)
+    }
+
+    /// Triple-dot files/+/- (`from...to`), same range GitHub’s PR “files changed” uses.
+    public func rangeChangeStats(in repo: URL, from: String, to: String) async throws -> CommitChangeStats {
+        let output = try await runGit(
+            ["diff", "--shortstat", "--find-renames", "\(from)...\(to)"],
+            in: repo
+        )
+        return CommitChangeStats.parseShortStat(output)
     }
 
     /// History of commits that touched `path` (follows renames).

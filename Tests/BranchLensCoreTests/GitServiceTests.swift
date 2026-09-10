@@ -360,6 +360,79 @@ final class GitServiceTests: XCTestCase {
         let branches = try await GitService().listBranches(in: root)
         let main = try XCTUnwrap(branches.first { $0.name == "main" })
         XCTAssertEqual(main.tipAuthor, "Ada Lovelace")
+        XCTAssertEqual(main.tipSubject, "initial")
+        XCTAssertNotNil(main.shortHash)
+    }
+
+    func testListBranchesReportsAheadBehindVersusCompare() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-ahead-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "base\n".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+        try await run(in: root, "/usr/bin/git", "checkout", "-b", "feature")
+        try "feature\n".write(to: root.appendingPathComponent("extra.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "feature work")
+
+        let branches = try await GitService().listBranches(in: root, versus: "main")
+        let feature = try XCTUnwrap(branches.first { $0.name == "feature" })
+        XCTAssertEqual(feature.aheadOfCompare, 1)
+        XCTAssertEqual(feature.behindOfCompare, 0)
+        let main = try XCTUnwrap(branches.first { $0.name == "main" })
+        XCTAssertEqual(main.aheadOfCompare, 0)
+        XCTAssertEqual(main.behindOfCompare, 0)
+    }
+
+    func testParsesUpstreamTrackAndAheadBehindAtoms() {
+        XCTAssertEqual(GitBranch.parseUpstreamTrack("[ahead 2, behind 6]").ahead, 2)
+        XCTAssertEqual(GitBranch.parseUpstreamTrack("[ahead 2, behind 6]").behind, 6)
+        XCTAssertTrue(GitBranch.parseUpstreamTrack("[gone]").gone)
+        XCTAssertEqual(GitBranch.parseAheadBehind("12 3")?.ahead, 12)
+        XCTAssertEqual(GitBranch.parseAheadBehind("12 3")?.behind, 3)
+        XCTAssertNil(GitBranch.parseAheadBehind(""))
+    }
+
+    func testParseShortStatReadsFilesAndLineCounts() {
+        let stats = CommitChangeStats.parseShortStat(
+            " 38 files changed, 1271 insertions(+), 260 deletions(-)"
+        )
+        XCTAssertEqual(stats.fileCount, 38)
+        XCTAssertEqual(stats.additions, 1271)
+        XCTAssertEqual(stats.deletions, 260)
+        let one = CommitChangeStats.parseShortStat(" 1 file changed, 1 insertion(+)")
+        XCTAssertEqual(one.fileCount, 1)
+        XCTAssertEqual(one.additions, 1)
+        XCTAssertEqual(one.deletions, 0)
+    }
+
+    func testRangeChangeStatsUsesTripleDotFileCounts() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-range-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+        try "base\n".write(to: root.appendingPathComponent("keep.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+        try await run(in: root, "/usr/bin/git", "checkout", "-b", "feature")
+        try "new\n".write(to: root.appendingPathComponent("added.txt"), atomically: true, encoding: .utf8)
+        try "base\nchanged\n".write(to: root.appendingPathComponent("keep.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "feature files")
+
+        let stats = try await GitService().rangeChangeStats(in: root, from: "main", to: "feature")
+        XCTAssertEqual(stats.fileCount, 2)
+        XCTAssertGreaterThan(stats.additions, 0)
     }
 
     func testListWorktreesKeepsMissingFoldersForPrune() async throws {
