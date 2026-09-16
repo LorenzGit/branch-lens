@@ -10,6 +10,13 @@ struct PendingEditDiscard: Identifiable {
     let onDiscard: () -> Void
 }
 
+struct PendingLocalDiscard: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+    let files: [ChangedFile]
+}
+
 private struct EditFileStamp: Equatable {
     var mtime: TimeInterval
     var size: UInt64
@@ -177,6 +184,7 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var editSessionNonce = 0
     /// Asked when leaving edit mode with unsaved changes.
     @Published var pendingEditDiscard: PendingEditDiscard?
+    @Published var pendingLocalDiscard: PendingLocalDiscard?
     /// File on disk changed while this edit session is open.
     @Published var editExternallyChanged = false
     private var editWatchedURL: URL?
@@ -400,6 +408,10 @@ final class RepoSession: ObservableObject, Identifiable {
 
     var selectedFilesUnstagable: [ChangedFile] {
         selectedFiles.filter(isStaged)
+    }
+
+    var selectedFilesDiscardable: [ChangedFile] {
+        selectedFiles.filter(canDiscard)
     }
 
     var stagedWorkingTreeFiles: [WorkingTreeFile] {
@@ -1117,6 +1129,65 @@ final class RepoSession: ObservableObject, Identifiable {
         if isUnstaged(file) { return .unstaged }
         if isStaged(file) { return .staged }
         return nil
+    }
+
+    func canDiscard(_ file: ChangedFile) -> Bool {
+        isUnstaged(file) || isStaged(file)
+    }
+
+    func requestDiscard(_ files: [ChangedFile]) {
+        let discardable = files.filter(canDiscard)
+        guard !discardable.isEmpty else { return }
+        if discardable.count == 1 {
+            let path = discardable[0].path
+            pendingLocalDiscard = PendingLocalDiscard(
+                title: "Discard \(path)?",
+                message: "Throw away local changes to this file. Untracked additions are deleted. This cannot be undone.",
+                files: discardable
+            )
+        } else {
+            pendingLocalDiscard = PendingLocalDiscard(
+                title: "Discard \(discardable.count) files?",
+                message: "Throw away local changes to these files. Untracked additions are deleted. This cannot be undone.",
+                files: discardable
+            )
+        }
+    }
+
+    func requestDiscardAllUnstaged() {
+        requestDiscard(unstagedWorkingTreeFiles.map(\.asChangedFile))
+    }
+
+    func requestDiscardAllStaged() {
+        requestDiscard(stagedWorkingTreeFiles.map(\.asChangedFile))
+    }
+
+    func dismissLocalDiscard() {
+        pendingLocalDiscard = nil
+    }
+
+    func confirmLocalDiscard() async {
+        let files = pendingLocalDiscard?.files ?? []
+        pendingLocalDiscard = nil
+        await discardFiles(files)
+    }
+
+    func discardFiles(_ files: [ChangedFile]) async {
+        guard let repoPath else { return }
+        let discardable = files.filter(canDiscard)
+        let paths = Array(Set(discardable.flatMap { file -> [String] in
+            if let old = file.oldPath, old != file.path { return [file.path, old] }
+            return [file.path]
+        }))
+        guard !paths.isEmpty else { return }
+        do {
+            try await git.discardPaths(paths, in: repoPath)
+            await refreshAfterStaging(preferSelecting: discardable[0].path)
+            statusMessage = "Discarded \(discardable.count) file\(discardable.count == 1 ? "" : "s")."
+            clearStatusEventually(statusMessage)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     func stageFile(_ file: ChangedFile) async {
@@ -1844,6 +1915,28 @@ final class RepoSession: ObservableObject, Identifiable {
             guard !Task.isCancelled else { return }
             guard contained else {
                 mergedIntoCompare = nil
+                return
+            }
+
+            // Viewing develop vs origin/develop is in-sync, not “a merged feature PR”.
+            // `gh pr list --head develop` finds old release PRs and dumps their commits.
+            if !MergedCompareHistory.shouldLookupMergedPullRequest(viewing: branch, compare: compareLabel) {
+                if await git.revisionsEqual(branch, compareTip, in: repoPath) {
+                    mergedIntoCompare = MergedIntoCompareInfo(
+                        kind: .inSync,
+                        compareLabel: compareLabel,
+                        commits: [],
+                        pullRequest: nil
+                    )
+                } else {
+                    mergedIntoCompare = MergedIntoCompareInfo(
+                        kind: .contained,
+                        compareLabel: compareLabel,
+                        commits: [],
+                        pullRequest: nil
+                    )
+                }
+                notifyStateChange()
                 return
             }
 

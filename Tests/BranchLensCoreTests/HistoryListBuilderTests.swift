@@ -69,6 +69,13 @@ final class HistoryListBuilderTests: XCTestCase {
         XCTAssertEqual(items, [.commit(only)])
     }
 
+    func testDoesNotLookUpMergedPRWhenViewingTheCompareBranch() {
+        XCTAssertFalse(MergedCompareHistory.shouldLookupMergedPullRequest(viewing: "develop", compare: "develop"))
+        XCTAssertFalse(MergedCompareHistory.shouldLookupMergedPullRequest(viewing: "main", compare: "main"))
+        XCTAssertFalse(MergedCompareHistory.shouldLookupMergedPullRequest(viewing: "main", compare: "develop"))
+        XCTAssertTrue(MergedCompareHistory.shouldLookupMergedPullRequest(viewing: "feat/x", compare: "develop"))
+    }
+
     private func commit(_ hash: String, subject: String, parents: [String]) -> GitCommit {
         GitCommit(
             hash: hash,

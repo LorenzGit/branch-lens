@@ -131,6 +131,25 @@ private struct SessionContainer: View {
         .onChange(of: session.filesLayout) { _, _ in session.onStateChange?() }
         .onChange(of: session.fileViewMode) { _, _ in session.onStateChange?() }
         .onChange(of: session.fileNameQuery) { _, _ in session.onStateChange?() }
+        .confirmationDialog(
+            session.pendingLocalDiscard?.title ?? "Discard local changes?",
+            isPresented: Binding(
+                get: { session.pendingLocalDiscard != nil },
+                set: { if !$0 { session.dismissLocalDiscard() } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Discard", role: .destructive) {
+                Task { await session.confirmLocalDiscard() }
+            }
+            Button("Cancel", role: .cancel) {
+                session.dismissLocalDiscard()
+            }
+        } message: {
+            if let pending = session.pendingLocalDiscard {
+                Text(pending.message)
+            }
+        }
     }
 }
 
@@ -1947,9 +1966,14 @@ private struct CommitsPane: View {
                                     isSelected: model.changeScope == .unstaged,
                                     contextActions: model.unstagedWorkingTreeFiles.isEmpty
                                         ? []
-                                        : [LocalScopeContextAction(title: "Stage All") {
-                                            Task { await model.stageAllUnstaged() }
-                                        }]
+                                        : [
+                                            LocalScopeContextAction(title: "Stage All") {
+                                                Task { await model.stageAllUnstaged() }
+                                            },
+                                            LocalScopeContextAction(title: "Discard All") {
+                                                model.requestDiscardAllUnstaged()
+                                            },
+                                        ]
                                 ) {
                                     model.selectUnstaged()
                                 }
@@ -2212,6 +2236,9 @@ private struct CommitsPane: View {
             },
             LocalScopeContextAction(title: "Unstage All") {
                 Task { await model.unstageAllStaged() }
+            },
+            LocalScopeContextAction(title: "Discard All") {
+                model.requestDiscardAllStaged()
             },
         ]
     }
@@ -3072,6 +3099,13 @@ private struct FilesPane: View {
                         onUnstageSelected: model.selectedFilesUnstagable.isEmpty ? nil : {
                             Task { await model.unstageSelectedFiles() }
                         },
+                        canDiscard: { model.canDiscard($0) },
+                        onDiscard: { file in
+                            model.requestDiscard([file])
+                        },
+                        onDiscardSelected: model.selectedFilesDiscardable.isEmpty ? nil : {
+                            model.requestDiscard(model.selectedFilesDiscardable)
+                        },
                         multiSelectionCount: model.selectedFileIDs.count
                     )
                 }
@@ -3102,6 +3136,11 @@ private struct FilesPane: View {
             if !model.selectedFilesStagable.isEmpty || !model.selectedFilesUnstagable.isEmpty {
                 Divider()
             }
+            if !model.selectedFilesDiscardable.isEmpty {
+                Button("Discard Selected", role: .destructive) {
+                    model.requestDiscard(model.selectedFilesDiscardable)
+                }
+            }
         } else {
             if model.isUnstaged(file) {
                 Button("Stage File") {
@@ -3111,6 +3150,11 @@ private struct FilesPane: View {
             if model.isStaged(file) {
                 Button("Unstage File") {
                     Task { await model.unstageFile(file) }
+                }
+            }
+            if model.canDiscard(file) {
+                Button("Discard File", role: .destructive) {
+                    model.requestDiscard([file])
                 }
             }
             if model.isUnstaged(file) || model.isStaged(file) {
@@ -3195,6 +3239,9 @@ private struct FolderTreeRow: View {
     var onUnstage: ((ChangedFile) -> Void)? = nil
     var onStageSelected: (() -> Void)? = nil
     var onUnstageSelected: (() -> Void)? = nil
+    var canDiscard: (ChangedFile) -> Bool = { _ in false }
+    var onDiscard: ((ChangedFile) -> Void)? = nil
+    var onDiscardSelected: (() -> Void)? = nil
     var multiSelectionCount: Int = 0
 
     private var isExpanded: Bool {
@@ -3234,7 +3281,10 @@ private struct FolderTreeRow: View {
                     if let onUnstageSelected {
                         Button("Unstage Selected") { onUnstageSelected() }
                     }
-                    if onStageSelected != nil || onUnstageSelected != nil {
+                    if let onDiscardSelected {
+                        Button("Discard Selected", role: .destructive) { onDiscardSelected() }
+                    }
+                    if onStageSelected != nil || onUnstageSelected != nil || onDiscardSelected != nil {
                         Divider()
                     }
                 } else {
@@ -3244,7 +3294,10 @@ private struct FolderTreeRow: View {
                     if canUnstage(file), let onUnstage {
                         Button("Unstage File") { onUnstage(file) }
                     }
-                    if canStage(file) || canUnstage(file) {
+                    if canDiscard(file), let onDiscard {
+                        Button("Discard File", role: .destructive) { onDiscard(file) }
+                    }
+                    if canStage(file) || canUnstage(file) || canDiscard(file) {
                         Divider()
                     }
                 }
@@ -3597,9 +3650,17 @@ private struct FileInspectorView: View {
                     .controlSize(.large)
                     .help("Unstage \(model.selectedFilesUnstagable.count) selected file\(model.selectedFilesUnstagable.count == 1 ? "" : "s")")
                 }
+                if !model.selectedFilesDiscardable.isEmpty {
+                    Button("Discard Selected", role: .destructive) {
+                        model.requestDiscard(model.selectedFilesDiscardable)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .help("Discard local changes in \(model.selectedFilesDiscardable.count) selected file\(model.selectedFilesDiscardable.count == 1 ? "" : "s")")
+                }
             }
 
-            if model.selectedFilesStagable.isEmpty && model.selectedFilesUnstagable.isEmpty {
+            if model.selectedFilesStagable.isEmpty && model.selectedFilesUnstagable.isEmpty && model.selectedFilesDiscardable.isEmpty {
                 Text("Selected files are not in the working tree staging areas.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -3737,6 +3798,14 @@ private struct FileInspectorView: View {
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .help("Unstage this file from the index")
+                    }
+                    if let file = model.selectedFile, model.canDiscard(file) {
+                        Button("Discard", role: .destructive) {
+                            model.requestDiscard([file])
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Throw away local changes to this file. Untracked additions are deleted.")
                     }
                 }
 

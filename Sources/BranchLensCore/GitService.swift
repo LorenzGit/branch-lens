@@ -771,6 +771,48 @@ public actor GitService {
         _ = try await runGit(["restore", "--staged", "--"] + cleaned, in: repo)
     }
 
+    /// Throw away local work on these paths: restore tracked files to HEAD, delete untracked ones.
+    public func discardPaths(_ paths: [String], in repo: URL) async throws {
+        let cleaned = try validatedRepoRelativePaths(paths, in: repo)
+        guard !cleaned.isEmpty else { return }
+
+        var inIndex: [String] = []
+        var inHead: [String] = []
+        for path in cleaned {
+            let indexed = (try? await runGit(["ls-files", "--full-name", "--", path], in: repo))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !indexed.isEmpty { inIndex.append(path) }
+            let head = (try? await runGit(["ls-tree", "--name-only", "HEAD", "--", path], in: repo))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !head.isEmpty { inHead.append(path) }
+        }
+        if !inIndex.isEmpty {
+            _ = try await runGit(["restore", "--staged", "--"] + inIndex, in: repo)
+        }
+        if !inHead.isEmpty {
+            _ = try await runGit(["restore", "--source=HEAD", "--worktree", "--"] + inHead, in: repo)
+        }
+        // New files (never in HEAD) and leftovers after unstaging additions.
+        _ = try? await runGit(["clean", "-fd", "--"] + cleaned, in: repo)
+    }
+
+    private func validatedRepoRelativePaths(_ paths: [String], in repo: URL) throws -> [String] {
+        let repoPath = repo.standardizedFileURL.path
+        var cleaned: [String] = []
+        for path in paths {
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("/"), !trimmed.contains("\0") else {
+                throw GitError.commandFailed("Invalid path for discard.")
+            }
+            let url = repo.appendingPathComponent(trimmed).standardizedFileURL
+            guard url.path == repoPath || url.path.hasPrefix(repoPath + "/") else {
+                throw GitError.commandFailed("Refusing to discard outside the repository.")
+            }
+            cleaned.append(trimmed)
+        }
+        return cleaned
+    }
+
     /// Create a commit from the current index with the given message.
     public func commit(message: String, in repo: URL) async throws {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)

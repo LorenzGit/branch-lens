@@ -74,3 +74,17 @@ public enum HistoryListBuilder {
         return items
     }
 }
+
+/// Recap of a finished feature after it has no unique commits versus Compare.
+public enum MergedCompareHistory {
+    /// Look up a merged PR only for a feature branch. Viewing `develop`/`main` itself
+    /// matches old release PRs that used that long-lived name as `--head`.
+    public static func shouldLookupMergedPullRequest(viewing: String, compare: String) -> Bool {
+        let view = viewing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = compare.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !view.isEmpty else { return false }
+        if view == base { return false }
+        if GitBranch.isProtectedName(view) { return false }
+        return true
+    }
+}

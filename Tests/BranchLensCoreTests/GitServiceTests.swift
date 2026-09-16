@@ -548,6 +548,58 @@ final class GitServiceTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("new.txt").path))
     }
 
+    func testDiscardPathsRestoresTrackedAndDeletesUntracked() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-discard-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        try await run(in: root, "/usr/bin/git", "config", "user.name", "Test")
+        try await run(in: root, "/usr/bin/git", "config", "user.email", "test@example.com")
+
+        try "original\n".write(to: root.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", ".")
+        try await run(in: root, "/usr/bin/git", "commit", "-m", "initial")
+
+        try "dirty\n".write(to: root.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+        try "scratch\n".write(to: root.appendingPathComponent("new.txt"), atomically: true, encoding: .utf8)
+        try "staged new\n".write(to: root.appendingPathComponent("added.txt"), atomically: true, encoding: .utf8)
+        try await run(in: root, "/usr/bin/git", "add", "added.txt")
+
+        let git = GitService()
+        try await git.discardPaths(["tracked.txt", "new.txt", "added.txt"], in: root)
+
+        let restored = try String(contentsOf: root.appendingPathComponent("tracked.txt"), encoding: .utf8)
+        XCTAssertEqual(restored, "original\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("new.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("added.txt").path))
+        let leftover = try await git.workingTreeStatus(in: root)
+        XCTAssertTrue(leftover.isEmpty)
+    }
+
+    func testDiscardPathsRejectsAbsoluteAndEscapingPaths() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-discard-safe-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init", "-b", "main")
+        let git = GitService()
+        do {
+            try await git.discardPaths(["/tmp/evil"], in: root)
+            XCTFail("Expected absolute path to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Invalid path"))
+        }
+        do {
+            try await git.discardPaths(["../outside.txt"], in: root)
+            XCTFail("Expected escaping path to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Refusing to discard"))
+        }
+    }
+
     private func runCapture(in directory: URL, _ executable: String, _ args: String...) async throws -> String {
         let result = try await ProcessRunner.run(
             executable: URL(fileURLWithPath: executable),
