@@ -377,7 +377,17 @@ struct DiffScrollView: NSViewRepresentable {
             height: CGFloat.greatestFiniteMagnitude
         )
         if !allowsScrolling, let scroll = coordinator.scrollView {
-            scroll.fittingHeight = entry.height
+            // Font metrics are only an estimate: AppKit rounds line fragments,
+            // which can otherwise clip the last lines of a fully expanded hunk.
+            if let layoutManager = textView.layoutManager, let container = textView.textContainer {
+                layoutManager.ensureLayout(for: container)
+                let height = max(layoutManager.usedRect(for: container).height + textView.textContainerInset.height * 2, 40)
+                textView.minSize.height = height
+                textView.setFrameSize(NSSize(width: entry.width, height: height))
+                scroll.fittingHeight = height
+            } else {
+                scroll.fittingHeight = entry.height
+            }
         }
         if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let full = entry.attributed.string as NSString

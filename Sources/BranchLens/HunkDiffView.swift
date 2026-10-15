@@ -21,8 +21,6 @@ struct HunkDiffView: View, Equatable {
     /// (common for large PR / All-changes files and a frequent hang source).
     private static let maxHunkCardsForReview = 28
     private static let maxDiffLinesForReviewCards = 2_000
-    /// Hunks taller than this get an internal scroller instead of expanding the outer stack.
-    private static let maxHunkBodyLinesExpanded = 140
 
     var body: some View {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -56,7 +54,6 @@ struct HunkDiffView: View, Equatable {
                                 path: path,
                                 searchQuery: searchQuery,
                                 actionTitle: actionTitle,
-                                expandBodyLines: Self.maxHunkBodyLinesExpanded,
                                 onAction: onHunkAction.map { action in
                                     { action(hunk) }
                                 }
@@ -91,11 +88,7 @@ private struct HunkCard: View {
     let path: String
     let searchQuery: String
     let actionTitle: String?
-    let expandBodyLines: Int
     let onAction: (() -> Void)?
-
-    private var bodyLineCount: Int { max(hunk.body.count, 1) }
-    private var usesInnerScroll: Bool { bodyLineCount > expandBodyLines }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -133,12 +126,12 @@ private struct HunkCard: View {
                 text: hunkDisplayText,
                 path: path,
                 searchQuery: searchQuery,
-                allowsScrolling: usesInnerScroll,
+                allowsScrolling: false,
                 omitHunkHeaders: true
             )
             .frame(maxWidth: .infinity, alignment: .topLeading)
-            .frame(maxHeight: usesInnerScroll ? 320 : nil)
-            .fixedSize(horizontal: false, vertical: !usesInnerScroll)
+            // Every hunk expands to its content; the outer pane scrolls vertically.
+            .fixedSize(horizontal: false, vertical: true)
         }
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
