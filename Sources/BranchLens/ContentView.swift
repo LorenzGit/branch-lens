@@ -124,15 +124,16 @@ private struct SessionContainer: View {
             CommitSheet(model: session)
         }
         .alert(
-            "Couldn’t update staging",
+            session.localChangeFailure?.title ?? "Local changes failed",
             isPresented: Binding(
-                get: { session.stagingFailureMessage != nil },
-                set: { if !$0 { session.stagingFailureMessage = nil } }
-            )
-        ) {
-            Button("OK", role: .cancel) { session.stagingFailureMessage = nil }
-        } message: {
-            Text(session.stagingFailureMessage ?? "")
+                get: { session.localChangeFailure != nil },
+                set: { if !$0 { session.localChangeFailure = nil } }
+            ),
+            presenting: session.localChangeFailure
+        ) { _ in
+            Button("OK", role: .cancel) { session.localChangeFailure = nil }
+        } message: { failure in
+            Text(failure.message)
         }
         .onChange(of: session.searchFocusNonce) { _, _ in
             focusedSearch = session.searchFocusTarget
@@ -148,18 +149,17 @@ private struct SessionContainer: View {
                 get: { session.pendingLocalDiscard != nil },
                 set: { if !$0 { session.dismissLocalDiscard() } }
             ),
-            titleVisibility: .visible
-        ) {
+            titleVisibility: .visible,
+            presenting: session.pendingLocalDiscard
+        ) { pending in
             Button("Discard", role: .destructive) {
-                Task { await session.confirmLocalDiscard() }
+                Task { await session.confirmLocalDiscard(pending) }
             }
             Button("Cancel", role: .cancel) {
                 session.dismissLocalDiscard()
             }
-        } message: {
-            if let pending = session.pendingLocalDiscard {
-                Text(pending.message)
-            }
+        } message: { pending in
+            Text(pending.message)
         }
     }
 }

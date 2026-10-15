@@ -27,5 +27,10 @@ let package = Package(
             dependencies: ["BranchLensCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .testTarget(
+            name: "BranchLensTests",
+            dependencies: ["BranchLens", "BranchLensCore"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )

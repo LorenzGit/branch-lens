@@ -17,6 +17,11 @@ struct PendingLocalDiscard: Identifiable {
     let files: [ChangedFile]
 }
 
+struct LocalChangeFailure {
+    let title: String
+    let message: String
+}
+
 private struct EditFileStamp: Equatable {
     var mtime: TimeInterval
     var size: UInt64
@@ -227,7 +232,7 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var isLoadingFile = false
     @Published var isUpdatingFromCompare = false
     @Published var errorMessage: String?
-    @Published var stagingFailureMessage: String?
+    @Published var localChangeFailure: LocalChangeFailure?
     @Published var statusMessage: String?
     @Published var searchFocusTarget: SearchFocusTarget = .content
     /// Bumped to force the matching search field to become first responder (⌘F).
@@ -1167,10 +1172,11 @@ final class RepoSession: ObservableObject, Identifiable {
         pendingLocalDiscard = nil
     }
 
-    func confirmLocalDiscard() async {
-        let files = pendingLocalDiscard?.files ?? []
+    func confirmLocalDiscard(_ confirmed: PendingLocalDiscard) async {
         pendingLocalDiscard = nil
-        await discardFiles(files)
+        // SwiftUI clears pendingLocalDiscard when dismissing the dialog, before
+        // its button's Task may run. Use the selection captured by the dialog.
+        await discardFiles(confirmed.files)
     }
 
     func discardFiles(_ files: [ChangedFile]) async {
@@ -1181,13 +1187,14 @@ final class RepoSession: ObservableObject, Identifiable {
             return [file.path]
         }))
         guard !paths.isEmpty else { return }
+        errorMessage = nil
         do {
             try await git.discardPaths(paths, in: repoPath)
             await refreshAfterStaging(preferSelecting: discardable[0].path)
             statusMessage = "Discarded \(discardable.count) file\(discardable.count == 1 ? "" : "s")."
             clearStatusEventually(statusMessage)
         } catch {
-            errorMessage = error.localizedDescription
+            reportLocalChangeFailure(error, title: "Couldn’t discard changes")
         }
     }
 
@@ -1259,9 +1266,13 @@ final class RepoSession: ObservableObject, Identifiable {
     }
 
     private func reportStagingFailure(_ error: Error) {
+        reportLocalChangeFailure(error, title: "Couldn’t update staging")
+    }
+
+    private func reportLocalChangeFailure(_ error: Error, title: String) {
         statusMessage = nil
         errorMessage = error.localizedDescription
-        stagingFailureMessage = error.localizedDescription
+        localChangeFailure = LocalChangeFailure(title: title, message: error.localizedDescription)
     }
 
     func openCommitSheet() {
