@@ -227,6 +227,7 @@ final class RepoSession: ObservableObject, Identifiable {
     @Published var isLoadingFile = false
     @Published var isUpdatingFromCompare = false
     @Published var errorMessage: String?
+    @Published var stagingFailureMessage: String?
     @Published var statusMessage: String?
     @Published var searchFocusTarget: SearchFocusTarget = .content
     /// Bumped to force the matching search field to become first responder (⌘F).
@@ -1198,7 +1199,7 @@ final class RepoSession: ObservableObject, Identifiable {
             try await git.stagePaths(paths, in: repoPath)
             await refreshAfterStaging(preferSelecting: file.path)
         } catch {
-            errorMessage = error.localizedDescription
+            reportStagingFailure(error)
         }
     }
 
@@ -1210,24 +1211,33 @@ final class RepoSession: ObservableObject, Identifiable {
             try await git.unstagePaths(paths, in: repoPath)
             await refreshAfterStaging(preferSelecting: file.path)
         } catch {
-            errorMessage = error.localizedDescription
+            reportStagingFailure(error)
         }
     }
 
     func stageAllUnstaged() async {
         guard let repoPath else { return }
+        errorMessage = nil
         let paths = Array(Set(unstagedWorkingTreeFiles.flatMap { file -> [String] in
             if let old = file.oldPath, old != file.path { return [file.path, old] }
             return [file.path]
         }))
-        guard !paths.isEmpty else { return }
+        guard !paths.isEmpty else {
+            if let workingTreeError {
+                reportStagingFailure(GitError.commandFailed(workingTreeError))
+                return
+            }
+            statusMessage = "No unstaged changes to stage."
+            clearStatusEventually(statusMessage)
+            return
+        }
         do {
             try await git.stagePaths(paths, in: repoPath)
             await refreshAfterStaging(preferSelecting: selectedFile?.path ?? paths[0])
             statusMessage = "Staged \(paths.count) path\(paths.count == 1 ? "" : "s")."
             clearStatusEventually(statusMessage)
         } catch {
-            errorMessage = error.localizedDescription
+            reportStagingFailure(error)
         }
     }
 
@@ -1244,8 +1254,14 @@ final class RepoSession: ObservableObject, Identifiable {
             statusMessage = "Unstaged \(paths.count) path\(paths.count == 1 ? "" : "s")."
             clearStatusEventually(statusMessage)
         } catch {
-            errorMessage = error.localizedDescription
+            reportStagingFailure(error)
         }
+    }
+
+    private func reportStagingFailure(_ error: Error) {
+        statusMessage = nil
+        errorMessage = error.localizedDescription
+        stagingFailureMessage = error.localizedDescription
     }
 
     func openCommitSheet() {
@@ -1329,7 +1345,7 @@ final class RepoSession: ObservableObject, Identifiable {
             statusMessage = "Staged \(files.count) file\(files.count == 1 ? "" : "s")."
             clearStatusEventually(statusMessage)
         } catch {
-            errorMessage = error.localizedDescription
+            reportStagingFailure(error)
         }
     }
 
@@ -1346,7 +1362,7 @@ final class RepoSession: ObservableObject, Identifiable {
             statusMessage = "Unstaged \(files.count) file\(files.count == 1 ? "" : "s")."
             clearStatusEventually(statusMessage)
         } catch {
-            errorMessage = error.localizedDescription
+            reportStagingFailure(error)
         }
     }
 
@@ -1373,14 +1389,14 @@ final class RepoSession: ObservableObject, Identifiable {
             oldPath: file.oldPath,
             originalDiff: fileDiff
         ) else {
-            errorMessage = "Could not build a patch for this hunk."
+            reportStagingFailure(GitError.commandFailed("Could not build a patch for this hunk."))
             return
         }
         do {
             try await git.applyPatchToIndex(patch, in: repoPath, reverse: reverse)
             await refreshAfterStaging(preferSelecting: file.path)
         } catch {
-            errorMessage = error.localizedDescription
+            reportStagingFailure(error)
         }
     }
 

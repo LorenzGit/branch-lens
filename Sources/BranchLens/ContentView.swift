@@ -123,6 +123,17 @@ private struct SessionContainer: View {
         .sheet(isPresented: $session.isCommitSheetPresented) {
             CommitSheet(model: session)
         }
+        .alert(
+            "Couldn’t update staging",
+            isPresented: Binding(
+                get: { session.stagingFailureMessage != nil },
+                set: { if !$0 { session.stagingFailureMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { session.stagingFailureMessage = nil }
+        } message: {
+            Text(session.stagingFailureMessage ?? "")
+        }
         .onChange(of: session.searchFocusNonce) { _, _ in
             focusedSearch = session.searchFocusTarget
         }

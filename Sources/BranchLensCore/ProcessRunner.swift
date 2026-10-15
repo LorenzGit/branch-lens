@@ -19,7 +19,8 @@ public enum ProcessRunner {
     public static func run(
         executable: URL,
         arguments: [String],
-        currentDirectory: URL? = nil
+        currentDirectory: URL? = nil,
+        environment: [String: String]? = nil
     ) async throws -> ProcessResult {
         if let currentDirectory {
             let path = currentDirectory.path
@@ -32,6 +33,7 @@ public enum ProcessRunner {
             let process = Process()
             process.executableURL = executable
             process.arguments = arguments
+            process.environment = subprocessEnvironment(environment ?? ProcessInfo.processInfo.environment)
             if let currentDirectory {
                 process.currentDirectoryURL = currentDirectory
             }
@@ -83,6 +85,19 @@ public enum ProcessRunner {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    /// Desktop launches often omit Homebrew from PATH. Git's filters and hooks
+    /// need it too, even when Git itself is launched by an absolute path.
+    static func subprocessEnvironment(_ inherited: [String: String]) -> [String: String] {
+        var environment = inherited
+        var paths = (environment["PATH"] ?? "").split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        if environment["PATH"] == nil { paths = [] }
+        for path in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+            if !paths.contains(path) { paths.append(path) }
+        }
+        environment["PATH"] = paths.joined(separator: ":")
+        return environment
     }
 
     private final class OutputState: @unchecked Sendable {

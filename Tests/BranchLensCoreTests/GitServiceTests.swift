@@ -3,6 +3,29 @@ import Foundation
 import XCTest
 
 final class GitServiceTests: XCTestCase {
+    func testStagePathsReportsRequiredLFSFilterFailure() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("branch-lens-lfs-failure-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try await run(in: root, "/usr/bin/git", "init")
+        let missingCommand = "branch-lens-missing-git-lfs-\(UUID().uuidString)"
+        try await run(in: root, "/usr/bin/git", "config", "filter.lfs.process", missingCommand)
+        try await run(in: root, "/usr/bin/git", "config", "filter.lfs.required", "true")
+        try "*.mp4 filter=lfs -text\n".write(to: root.appendingPathComponent(".gitattributes"), atomically: true, encoding: .utf8)
+        try "video\n".write(to: root.appendingPathComponent("clip.mp4"), atomically: true, encoding: .utf8)
+
+        do {
+            try await GitService().stagePaths(["clip.mp4"], in: root)
+            XCTFail("Staging must fail when the required filter cannot run")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains(missingCommand), error.localizedDescription)
+        }
+        let stagedPaths = try await runCapture(in: root, "/usr/bin/git", "ls-files")
+        XCTAssertEqual(stagedPaths, "", "A failed LFS filter must not stage the raw asset")
+    }
+
     func testBranchSnapshotShowsOnlyUniqueCommitsAndAggregatedFiles() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("branch-lens-test-\(UUID().uuidString)", isDirectory: true)
